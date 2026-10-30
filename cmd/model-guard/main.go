@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/mos/magpie-model-guard/internal/check"
 )
@@ -39,9 +38,4 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-}
-
-func init() {
-	// Keep the binary self-locating for future use without filepath walking.
-	_ = filepath.Separator
 }
