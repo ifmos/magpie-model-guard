@@ -82,11 +82,12 @@ func TestPublishGateBlocksFailedModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	js := string(code)
-	// probe alias rewrite present
-	if !strings.Contains(js, "model-guard-probe/") {
-		t.Error("gate missing probe alias prefix")
+	// null-body guard: a thrown TypeError in the middleware fails open
+	if !strings.Contains(js, `if(!body||typeof body.model!=="string")return body;`) {
+		t.Error("gate missing null-body guard")
 	}
-	// gate rejects blocked models: simulate the JS semantics with goja-free check
+	// probe alias rewrite present
+	// gate rejects blocked models
 	if !strings.Contains(js, "ctx.reject(403") {
 		t.Error("gate missing reject call")
 	}

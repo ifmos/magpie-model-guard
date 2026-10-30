@@ -198,7 +198,7 @@ func (s *Service) publishGate() error {
 const targets=%s;
 const alias=%s;
 export function onRequest(body,ctx){
- if(typeof body.model!=="string")return body;
+ if(!body||typeof body.model!=="string")return body;
  const prefix="model-guard-probe/"+alias+"/";
  if(body.model.startsWith(prefix)){body.model=body.model.slice(prefix.length);return body;}
  const t=targets[body.model];if(!t||!t.enabled)return body;
