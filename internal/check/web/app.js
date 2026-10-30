@@ -184,8 +184,8 @@
       var routing = state.routing || {};
       routingEl.classList.toggle("routing-error", !!routing.error);
       routingEl.textContent = routing.error ? routing.error + "；直连门禁仍生效，后台将重试路由同步。请根据上述原因检查。" :
-        routing.enabled ? "路由组同步已启用 · 当前管理 " + (routing.managed_groups || 0) + " 个组 · 禁用成员退出业务路由，检测探针保持可用。" :
-        "路由组同步未启用：当前仅对完整模型 ID 的直接请求执行门禁。";
+        routing.enabled ? "路由组同步正常 · 已管理 " + (routing.managed_groups || 0) + " 个组 · 检测探针保持可用。" :
+        "路由组同步未启用 · 仅拦截完整模型 ID 的直接请求。";
     }
 
     var healthy = !state.health;
@@ -243,9 +243,9 @@
     var isInherit = !mode;
     var effMode = isInherit ? globalMode : mode;
     var policyBadgeClass = effMode === "staged" ? "policy-staged" : "policy-fixed";
-    var policyLabel = effMode === "staged" ? "阶梯" : "固定";
-    var inheritHtml = isInherit ? "<span class='policy-sub' title='继承全局配置 (" + esc(globalMode === "staged" ? "阶梯" : "固定") + ")'>继承</span>" : "";
-    var customHtml = t.timing_policy ? "<span class='badge-custom' title='自定义 6 项间隔'>覆盖</span>" : "";
+    var policyLabel = effMode === "staged" ? "分阶段" : "固定间隔";
+    var inheritHtml = isInherit ? "<span class='policy-sub'>继承全局</span>" : "";
+    var customHtml = t.timing_policy ? "<span class='badge-custom' title='此模型使用独立的分阶段间隔'>单独配置</span>" : "";
     return "<div class='policy-cell'><span class='policy-badge " + policyBadgeClass + "'>" + esc(policyLabel) + "</span>" + inheritHtml + customHtml + "</div>";
   }
 
@@ -256,7 +256,7 @@
 
     if (stage === "recovery") {
       // The first recovery pass must keep production traffic blocked.
-      return "<span class='stage-badge stage-recovery' title='首测通过保持阻断，按设定的恢复确认间隔复测，第 2 次连续通过才恢复'><i></i>确认中(1/2过·阻断)</span>";
+      return "<span class='stage-badge stage-recovery' title='首测通过保持阻断，按设定的恢复确认间隔复测，第 2 次连续通过才恢复'><i></i>恢复确认 1/2</span>";
     } else if (stage === "retry") {
       return "<span class='stage-badge stage-retry' title='快速复测原失败题中，满 3 轮才阻断隔离（当前第 " + esc(streak) + " 次）'><i></i>重试中(" + esc(streak) + "/3)</span>";
     } else if (stage === "isolated") {
@@ -266,11 +266,11 @@
     } else if (stage === "unavailable") {
       return "<span class='stage-badge stage-unavailable' title='接口不可用，冷却中'><i></i>不可用冷冻</span>";
     } else if (stage === "normal") {
-      return "<span class='stage-badge stage-normal' title='按正常周期等待检测'><i></i>正常</span>";
+      return "<span class='stage-badge stage-normal' title='按正常周期等待检测'><i></i>常规周期</span>";
     }
 
     if (effMode === "staged") {
-      return "<span class='stage-badge stage-normal' title='分阶段常规探测'><i></i>正常</span>";
+      return "<span class='stage-badge stage-normal' title='分阶段常规探测'><i></i>常规周期</span>";
     }
     return "<span class='stage-badge stage-fixed' title='固定间隔模式'>固定</span>";
   }
@@ -279,7 +279,34 @@
     var tbody = document.querySelector("#target-table tbody");
     if (!tbody) return;
 
-    tbody.innerHTML = state.targets.map(function (t) {
+    // Preserve open disclosures and keyboard position across background refreshes.
+    var active = document.activeElement;
+    var focusedRow = tbody.contains(active) ? active.closest("tr[data-model]") : null;
+    var focusedModel = focusedRow ? focusedRow.dataset.model : "";
+    var focusedAction = focusedRow ? active.dataset.action : "";
+    var focusedDetails = focusedRow ? active.closest("details[data-kind]") : null;
+    var focusedKind = focusedDetails ? focusedDetails.dataset.kind : "actions";
+    var openDetails = new Set();
+    tbody.querySelectorAll("tr[data-model] details[open]").forEach(function (detail) {
+      openDetails.add(detail.closest("tr").dataset.model + "\n" + detail.dataset.kind);
+    });
+    var search = document.getElementById("target-search");
+    var filter = document.getElementById("target-filter");
+    var query = search ? search.value.trim().toLowerCase() : "";
+    var filterValue = filter ? filter.value : "all";
+    var visible = state.targets.filter(function (t) {
+      if (query && (t.model + " " + (t.reason || "")).toLowerCase().indexOf(query) === -1) return false;
+      if (filterValue === "blocked") return isBlocked(t);
+      if (filterValue === "passed") return t.enabled && !isBlocked(t) && t.state === "passed" && t.schedule_stage !== "retry";
+      if (filterValue === "attention") return t.state === "failed" || t.state === "unavailable" || t.schedule_stage === "retry" || t.schedule_stage === "recovery";
+      if (filterValue === "paused") return !t.enabled;
+      return true;
+    });
+    var count = document.getElementById("target-visible-count");
+    var countText = "显示 " + visible.length + " / 共 " + state.targets.length + " 个";
+    if (count && count.textContent !== countText) count.textContent = countText;
+
+    tbody.innerHTML = visible.map(function (t) {
       var blocked = isBlocked(t);
       var isTempAllow = t.allow_until && new Date(t.allow_until) > new Date();
 
@@ -297,7 +324,7 @@
       var stateBadgeClass = "status-" + esc(t.state);
       if (t.schedule_stage === "recovery") {
         // A recovery confirmation has not released the model yet.
-        stateLabel = "首测通过(待二次确认)";
+        stateLabel = "首次复测通过";
         stateBadgeClass = "status-recovery-pending";
       } else if (t.schedule_stage === "retry") {
         stateLabel = "答错，等待复测";
@@ -325,8 +352,6 @@
         ops.push("<button class='btn-action btn-allow' data-model='" + esc(t.model) + "' data-action='allow' title='临时放行业务请求 15 分钟'>放行 15 分</button>");
       }
 
-      // 2. Policy edit button
-      ops.push("<button class='btn-action btn-policy' data-model='" + esc(t.model) + "' data-action='policy' title='编辑该模型的调度策略与检测间隔'>策略</button>");
 
       // 3. Monitoring schedule control (monitor-off / monitor-on)
       if (t.enabled) {
@@ -335,29 +360,54 @@
         ops.push("<button class='btn-action btn-monitor-on' data-model='" + esc(t.model) + "' data-action='monitor-on' title='恢复该模型的自动定时检测'>恢复检测</button>");
       }
 
-      // 4. Immediate recheck
-      ops.push("<button class='btn-action primary-mini' data-model='" + esc(t.model) + "' data-action='recheck' title='立即触发一次探针检测'>重测</button>");
 
       // 5. Delete target
       ops.push("<button class='btn-action danger-button' data-model='" + esc(t.model) + "' data-action='delete' title='删除该监测目标'>删除</button>");
 
-      return "<tr>" +
-        "<td><div class='model-cell'><span class='model-dot'></span><strong title='" + esc(t.model) + "'>" + esc(t.model) + "</strong></div></td>" +
-        "<td>" + gateBadge + "</td>" +
-        "<td>" + stateHtml + "</td>" +
-        "<td>" + policyHtml + "</td>" +
-        "<td>" + stageHtml + "</td>" +
-        "<td class='time-cell'>" + fmtTime(t.checked_at) + "</td>" +
-        "<td class='time-cell'>" + fmtTime(t.next_check_at) + "</td>" +
-        "<td class='reason' title='" + esc(t.reason || "") + "'>" + esc(t.reason || "—") + "</td>" +
-        "<td class='actions-cell'>" + ops.join("") + "</td>" +
+      var slash = t.model.indexOf("/");
+      var provider = slash < 0 ? "自定义模型" : t.model.slice(0, slash);
+      var modelName = slash < 0 ? t.model : t.model.slice(slash + 1);
+      var reason = t.reason || "";
+      var reasonHtml = reason ? "<span class='reason-text'>" + esc(reason) + "</span>" : "<span class='cell-muted'>—</span>";
+      if (reason.length > 50 || reason.indexOf("\n") !== -1) {
+        reasonHtml = "<details class='reason-details' data-kind='reason'><summary aria-label='查看完整原因'><span class='reason-preview'>" + esc(reason) + "</span><span class='reason-toggle' aria-hidden='true'></span></summary><p>" + esc(reason) + "</p></details>";
+      }
+      var primaryActions = "<button class='btn-action primary-mini' data-model='" + esc(t.model) + "' data-action='recheck'>重测</button>" +
+        "<button class='btn-action btn-policy' data-model='" + esc(t.model) + "' data-action='policy'>策略</button>";
+
+      return "<tr data-model='" + esc(t.model) + "'>" +
+        "<td class='target-model-cell' data-label='模型'><div class='model-identity'><strong title='" + esc(t.model) + "'>" + esc(modelName) + "</strong><span class='model-provider'>" + esc(provider) + "</span></div></td>" +
+        "<td data-label='路由与检测'><div class='cell-stack'>" + gateBadge + stateHtml + "</div></td>" +
+        "<td data-label='检测策略'><div class='cell-stack'>" + policyHtml + stageHtml + "</div></td>" +
+        "<td class='target-time-cell' data-label='检测时间'><div class='time-next'><span>" + (t.enabled ? "下次" : "暂停 · 原计划") + "</span><time datetime='" + esc(t.next_check_at || "") + "'>" + esc(fmtTime(t.next_check_at)) + "</time></div><div class='time-previous'><span>上次</span><time datetime='" + esc(t.checked_at || "") + "'>" + esc(fmtTime(t.checked_at)) + "</time></div></td>" +
+        "<td class='target-reason-cell' data-label='最近原因'>" + reasonHtml + "</td>" +
+        "<td class='target-actions-cell' data-label='操作'><div class='row-primary-actions'>" + primaryActions + "</div><details class='row-menu' data-kind='actions'><summary>更多操作</summary><div class='row-menu-actions'>" + ops.join("") + "</div></details></td>" +
         "</tr>";
     }).join("");
 
     var emptyEl = document.getElementById("target-empty");
-    if (emptyEl) emptyEl.classList.toggle("hidden", state.targets.length > 0);
+    if (emptyEl) {
+      emptyEl.classList.toggle("hidden", visible.length > 0);
+      emptyEl.querySelector("strong").textContent = state.targets.length ? "没有匹配的监测目标" : "还没有监测目标";
+      emptyEl.querySelector(":scope > span").textContent = state.targets.length ? "调整搜索内容或状态筛选，再试一次。" : "展开上方「添加监测目标」，开始建立检测计划。";
+    }
     var tableEl = document.getElementById("target-table");
-    if (tableEl) tableEl.classList.toggle("hidden", state.targets.length === 0);
+    if (tableEl) tableEl.classList.toggle("hidden", visible.length === 0);
+
+    tbody.querySelectorAll("tr[data-model] details").forEach(function (detail) {
+      detail.open = openDetails.has(detail.closest("tr").dataset.model + "\n" + detail.dataset.kind);
+    });
+
+    if (focusedModel) {
+      tbody.querySelectorAll("tr[data-model]").forEach(function (row) {
+        if (row.dataset.model !== focusedModel) return;
+        var focusTarget = Array.from(row.querySelectorAll("button[data-action]")).find(function (button) {
+          return focusedAction && button.dataset.action === focusedAction;
+        });
+        if (!focusTarget) focusTarget = row.querySelector("details[data-kind='" + focusedKind + "'] > summary");
+        if (focusTarget) focusTarget.focus({ preventScroll: true });
+      });
+    }
 
     tbody.querySelectorAll("button[data-action]").forEach(function (btn) {
       btn.addEventListener("click", function () {
@@ -397,6 +447,11 @@
     });
   }
 
+  var targetSearch = document.getElementById("target-search");
+  if (targetSearch) targetSearch.addEventListener("input", renderTargets);
+  var targetFilter = document.getElementById("target-filter");
+  if (targetFilter) targetFilter.addEventListener("change", renderTargets);
+
   // ---- searchable model picker ----
   function renderModelPicker() {
     var optionsContainer = document.getElementById("model-options-list");
@@ -425,13 +480,15 @@
       optionsContainer.innerHTML = filtered.map(function (m) {
         var isSelected = selectedModelIds.has(m.id);
         return "<div class='model-option-item " + (isSelected ? "is-selected" : "") + "' data-id='" + esc(m.id) + "'>" +
-          "<input type='checkbox' class='model-checkbox' " + (isSelected ? "checked" : "") + " tabindex='-1'>" +
+          "<input type='checkbox' class='model-checkbox' aria-label='选择 " + esc(m.id) + "' " + (isSelected ? "checked" : "") + ">" +
           "<span class='model-id-label' title='" + esc(m.id) + "'>" + esc(m.id) + "</span>" +
           "</div>";
       }).join("");
 
       optionsContainer.querySelectorAll(".model-option-item").forEach(function (item) {
         item.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          var keepFocus = item.contains(document.activeElement);
           var id = item.dataset.id;
           if (selectedModelIds.has(id)) {
             selectedModelIds.delete(id);
@@ -439,6 +496,11 @@
             selectedModelIds.add(id);
           }
           renderModelPicker();
+          if (keepFocus) {
+            optionsContainer.querySelectorAll(".model-option-item").forEach(function (option) {
+              if (option.dataset.id === id) option.querySelector("input").focus({ preventScroll: true });
+            });
+          }
           updateSelectedPreview();
         });
       });
@@ -648,6 +710,8 @@
           toast("已添加 " + done + " 个目标，失败 " + errors.length + " 个: " + errors[0]);
         } else {
           toast("已成功添加 " + done + " 个监测目标");
+          var addPanel = document.getElementById("target-add-panel");
+          if (addPanel) addPanel.open = false;
         }
         loadState();
       }).then(function () {
@@ -977,6 +1041,11 @@
       if (sel.dataset.prompt) savedRunSelections[sel.dataset.prompt] = sel.value;
     });
 
+    var openPromptDetails = new Set();
+    tbody.querySelectorAll("tr[data-prompt] details[open]").forEach(function (detail) {
+      openPromptDetails.add(detail.closest("tr").dataset.prompt);
+    });
+
     tbody.innerHTML = state.prompts.map(function (p) {
       var gLabel = graderName[p.grader] || p.grader;
       var gClass = "type-" + (p.grader || "none");
@@ -989,9 +1058,9 @@
           return "<option value='" + esc(t.model) + "'" + selAttr + ">" + esc(t.model) + "</option>";
         }).join("");
         var isRunning = inFlightTests[p.id];
-        runSel = "<select class='run-prompt' data-prompt='" + esc(p.id) + "'>" + options + "</select>" +
+        runSel = "<div class='prompt-test-controls'><select class='run-prompt' aria-label='为 " + esc(p.name) + " 选择测试模型' data-prompt='" + esc(p.id) + "'>" + options + "</select>" +
           "<button class='run-btn primary-mini' data-prompt='" + esc(p.id) + "' " + (isRunning ? "disabled" : "") + ">" +
-          (isRunning ? "测试中…" : "测试") + "</button>";
+          (isRunning ? "测试中…" : "测试") + "</button></div>";
       }
 
       // Contract: all prompts can be edited with full fields; builtin only prohibits deletion
@@ -1000,15 +1069,22 @@
 
       var builtinBadge = p.builtin ? "<span class='builtin-badge'>内置</span>" : "";
 
-      return "<tr>" +
-        "<td><code>" + esc(p.id) + "</code>" + builtinBadge + "</td>" +
-        "<td><strong>" + esc(p.name) + "</strong></td>" +
-        "<td><span class='type-pill " + esc(gClass) + "'>" + esc(gLabel) + "</span></td>" +
-        "<td><code>" + esc(p.expect || "—") + "</code></td>" +
-        "<td><span class='boolean-pill " + (p.automatic ? "yes" : "") + "'>" + (p.automatic ? "自动" : "人工") + "</span></td>" +
-        "<td class='actions-cell'>" + runSel + editBtn + delBtn + "</td>" +
+      var expectHtml = p.expect ? "<code class='expected-answer'>" + esc(p.expect) + "</code>" : "<span class='cell-muted'>人工查看回答</span>";
+      if ((p.expect || "").length > 70) {
+        expectHtml = "<details class='reason-details'><summary aria-label='查看完整期望答案'><span class='reason-preview'><code>" + esc(p.expect) + "</code></span><span class='reason-toggle' aria-hidden='true'></span></summary><p><code>" + esc(p.expect) + "</code></p></details>";
+      }
+      return "<tr data-prompt='" + esc(p.id) + "'>" +
+        "<td class='prompt-title-cell' data-label='题目'><div class='prompt-identity'><strong>" + esc(p.name) + "</strong><span><code>" + esc(p.id) + "</code>" + builtinBadge + "</span></div></td>" +
+        "<td data-label='判分与期望答案'><div class='cell-stack'><span class='type-pill " + esc(gClass) + "'>" + esc(gLabel) + "</span>" + expectHtml + "</div></td>" +
+        "<td data-label='检测方式'><span class='boolean-pill " + (p.automatic ? "yes" : "") + "'>" + (p.automatic ? "参与自动检测" : "仅手动测试") + "</span></td>" +
+        "<td class='prompt-test-cell' data-label='测试模型'>" + (runSel || "<span class='cell-muted'>先添加监测目标</span>") + "</td>" +
+        "<td class='prompt-manage-cell' data-label='管理'><div class='row-primary-actions'>" + editBtn + delBtn + "</div></td>" +
         "</tr>";
     }).join("");
+
+    tbody.querySelectorAll("tr[data-prompt] details").forEach(function (detail) {
+      detail.open = openPromptDetails.has(detail.closest("tr").dataset.prompt);
+    });
 
     var emptyEl = document.getElementById("prompt-empty");
     if (emptyEl) emptyEl.classList.toggle("hidden", state.prompts.length > 0);

@@ -23,7 +23,7 @@
     </nav>
     <div class="sidebar-footer">
       <div class="mini-status"><i id="sidebar-status-dot"></i><span id="sidebar-status">后台连接中</span></div>
-      <span class="version-label">MAGPIE PLUGIN · 0.3.1</span>
+      <span class="version-label">MAGPIE PLUGIN · 0.3.2</span>
     </div>
   </aside>
 
@@ -59,9 +59,10 @@
           <div class="summary-card is-muted"><span class="summary-label">检测不可用</span><strong id="stat-unavailable">0</strong><small>等待冷却重试</small></div>
         </div>
 
-        <div class="content-grid target-grid">
-          <section class="panel setup-panel">
-            <div class="panel-heading"><div><span class="eyebrow">ADD TARGET</span><h2>添加监测目标</h2></div><span class="panel-number">01</span></div>
+        <details class="panel target-add-panel" id="target-add-panel">
+          <summary class="target-add-summary"><strong>添加监测目标</strong><span>搜索模型，批量加入检测计划</span><i aria-hidden="true">＋</i></summary>
+          <section class="setup-panel">
+            <div class="panel-heading"><div><span class="eyebrow">ADD TARGET</span><h2>选择模型与检测策略</h2></div></div>
             <p class="panel-description">从 Magpie 网关读取模型列表，选择后加入自动检测计划。</p>
             <button id="refresh-models" class="secondary-button full-button"><span>↻</span> 刷新模型列表</button>
             <div class="model-picker-wrap">
@@ -148,18 +149,22 @@
             <button id="add-target" class="primary-button full-button">添加到监测计划 <span>→</span></button>
             <div class="helper-note"><span>i</span><span>支持批量添加。分阶段模式下，同题连续 3 轮答错后隔离，隔离后连续 2 次通过才恢复。</span></div>
           </section>
+        </details>
 
-          <section class="panel table-panel">
-            <div class="panel-heading table-heading"><div><span class="eyebrow">ACTIVE TARGETS</span><h2>当前监测计划</h2></div><span class="panel-number">02</span></div>
-            <div class="table-wrap">
+        <section class="panel table-panel targets-panel">
+          <div class="panel-heading table-heading"><div><span class="eyebrow">ACTIVE TARGETS</span><h2>当前监测计划</h2></div><span id="target-visible-count" class="panel-caption" aria-live="polite"></span></div>
+          <div class="table-toolbar">
+            <label class="table-search"><span>搜索目标</span><input id="target-search" type="search" placeholder="搜索模型、供应商或原因" autocomplete="off"></label>
+            <label class="table-filter"><span>显示状态</span><select id="target-filter"><option value="all">全部状态</option><option value="blocked">已阻断</option><option value="passed">检测通过</option><option value="attention">等待复测 / 不可用</option><option value="paused">检测已暂停</option></select></label>
+          </div>
+          <div class="table-wrap targets-table-wrap">
               <table id="target-table">
-                <thead><tr><th>模型</th><th>门禁路由</th><th>检测状态</th><th>调度策略</th><th>调度阶段</th><th>上次检测</th><th>下次检测</th><th>原因</th><th>操作</th></tr></thead>
+                <thead><tr><th scope="col">模型</th><th scope="col">路由与检测</th><th scope="col">检测策略</th><th scope="col">检测时间</th><th scope="col">最近原因</th><th scope="col">操作</th></tr></thead>
                 <tbody></tbody>
               </table>
-              <div class="empty-state" id="target-empty"><div class="empty-icon">⌁</div><strong>还没有监测目标</strong><span>从左侧选择模型，开始建立你的监测计划。</span></div>
+              <div class="empty-state" id="target-empty"><div class="empty-icon">⌁</div><strong>还没有监测目标</strong><span>展开上方「添加监测目标」，开始建立检测计划。</span></div>
             </div>
           </section>
-        </div>
 
         <dialog id="target-policy-dialog" class="modal-dialog" aria-labelledby="target-policy-title">
           <form id="target-policy-form" method="dialog">
@@ -258,7 +263,13 @@
 
       <section id="page-prompts" class="page">
         <div class="page-intro"><div><span class="eyebrow">PROBE LIBRARY</span><h1>检测题库</h1><p>用客观题观察模型表现，也可以创建适合自己业务的自定义探针。</p></div><button id="new-prompt" class="primary-button">新建题目 <span>＋</span></button></div>
-        <section class="panel table-panel"><div class="panel-heading table-heading"><div><span class="eyebrow">QUESTION BANK</span><h2>题目列表</h2></div><span class="panel-caption">自动题参与状态判断 · 人工题仅保存回答</span></div><div class="table-wrap"><table id="prompt-table"><thead><tr><th>ID</th><th>名称</th><th>判分规则</th><th>期望答案</th><th>门禁</th><th>操作</th></tr></thead><tbody></tbody></table><div class="empty-state" id="prompt-empty"><div class="empty-icon">✦</div><strong>题库为空</strong><span>创建第一道自定义检测题。</span></div></div></section>
+        <section class="panel table-panel prompts-panel">
+          <div class="panel-heading table-heading"><div><span class="eyebrow">QUESTION BANK</span><h2>题目列表</h2></div><span class="panel-caption">自动题参与状态判断 · 人工题仅保存回答</span></div>
+          <div class="table-wrap">
+            <table id="prompt-table"><thead><tr><th scope="col">题目</th><th scope="col">判分与期望答案</th><th scope="col">检测方式</th><th scope="col">测试模型</th><th scope="col">管理</th></tr></thead><tbody></tbody></table>
+            <div class="empty-state" id="prompt-empty"><div class="empty-icon">✦</div><strong>题库为空</strong><span>创建第一道自定义检测题。</span></div>
+          </div>
+        </section>
         <dialog id="prompt-dialog" class="modal-dialog" aria-labelledby="prompt-form-title">
           <form id="prompt-form" method="dialog">
             <input type="hidden" id="pf-id">
