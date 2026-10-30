@@ -56,6 +56,7 @@ function stopBackend() {
   child?.kill();
 }
 process.once('exit', stopBackend);
+// Magpie's readline RPC loop drains stdin; observe lifecycle without consuming RPC bytes.
 process.stdin.once('end', stopBackend);
 process.stdin.once('close', stopBackend);
 

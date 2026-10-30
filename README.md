@@ -59,6 +59,8 @@ Windows AMD64 五个平台的预编译后台，运行机器不需要安装 Go �
 
 路由发现子进程现在只跳过 Model Guard 自身的后台启动，保留其它供应商和账号插件；CLI 查询在文件锁外执行。插件后台随宿主管道关闭而退出，避免插件宿主异常结束后留下调度进程。
 
+Magpie 的 RPC 宿主使用 `readline` 持续读取共享 stdin；插件仅监听其结束和关闭事件，不主动调用 `resume()` 或读取协议字节。
+
 
 ### 从源码构建
 
@@ -168,7 +170,7 @@ sh scripts/build.sh
 
 ## 验证
 
-`go test ./...` 覆盖状态转换、配置迁移、恢复账本、锁竞争恢复与并发提交；`node --test tests/*.test.mjs` 检查门禁、无需 Go 的安装启动及宿主管道断开后的退出。
+`go test ./...` 覆盖状态转换、配置迁移、恢复账本、锁竞争恢复与并发提交；`node --test tests/*.test.mjs` 检查门禁、无需 Go 的安装启动，以及 Go 后台与完整插件宿主两层的管道退出行为。插件宿主测试在输入结束后保持宿主进程存活，验证后台确实被插件关闭；可设置 `MAGPIE_BUN_TEST_BINARY` 同时使用 Magpie 的 Bun 运行该场景。
 构建后运行 `node scripts/verify-auto-routing.mjs`，可使用真实 Magpie、完整插件包和两个本地测试上游验证显式组、自动组、直接请求门禁、探针、全组禁用与重启恢复。脚本使用独立临时 XDG 目录，完成后清理进程和数据；可用 `MAGPIE_TEST_BINARY` 指定 Magpie 可执行文件。
 
 ## 致谢
