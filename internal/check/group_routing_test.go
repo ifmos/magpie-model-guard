@@ -11,6 +11,9 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/gofrs/flock"
 )
 
 func setupTestEnv(t *testing.T) (*Store, string, *groupController) {
@@ -1118,19 +1121,17 @@ func TestCLIEnvPassesXDGConfigHome(t *testing.T) {
 		t.Fatalf("expected XDG_CONFIG_HOME=%s in buildCLIEnv, not found in %v", expectedXDG, env)
 	}
 
-	// The caller's environment is inherited as-is: nothing is stripped or
-	// hardcoded, so subscription models stay visible to the CLI.
-	countMagpie := func(list []string) int {
-		n := 0
-		for _, e := range list {
-			if strings.HasPrefix(e, "MAGPIE_") {
-				n++
-			}
+	// The caller's environment is inherited: nothing unrelated is stripped,
+	// and MAGPIE_MODEL_GUARD_DISCOVERY=1 is set for CLI sub-processes.
+	foundDiscovery := false
+	for _, e := range env {
+		if e == "MAGPIE_MODEL_GUARD_DISCOVERY=1" {
+			foundDiscovery = true
+			break
 		}
-		return n
 	}
-	if countMagpie(env) != countMagpie(os.Environ()) {
-		t.Fatalf("buildCLIEnv must not add MAGPIE_* variables")
+	if !foundDiscovery {
+		t.Fatalf("expected MAGPIE_MODEL_GUARD_DISCOVERY=1 in buildCLIEnv, not found in %v", env)
 	}
 
 	// A config dir that cannot be mapped to an XDG home must not probe.
@@ -1142,5 +1143,206 @@ func TestCLIEnvPassesXDGConfigHome(t *testing.T) {
 	}
 	if _, err := odd.discoverAutoGroups(context.Background()); err == nil {
 		t.Fatalf("expected discovery to refuse an unmappable config dir")
+	}
+}
+
+// 24. discover/fetch callbacks can independently acquire sidecar lock (lock held area excludes CLI)
+func TestDiscoverFetchCanAcquireSidecarLock(t *testing.T) {
+	store, configDir, ctrl := setupTestEnv(t)
+	defer store.Close()
+
+	initial := map[string]any{
+		"groups": []any{
+			map[string]any{
+				"id":      "grp1",
+				"members": []any{"vendor/m1", "vendor/m2"},
+			},
+		},
+	}
+	writeProvidersJSON(t, configDir, initial)
+
+	discoverLockAcquired := false
+	fetchLockAcquired := false
+
+	ctrl.discoverAuto = func(ctx context.Context, magpiePath string) ([]autoGroupSummary, error) {
+		// Attempt to acquire the sidecar lock from an independent flock during discovery
+		lock, err := acquireSidecarLock(ctx, configDir)
+		if err != nil {
+			t.Errorf("expected to acquire sidecar lock during discoverAuto, got: %v", err)
+		} else {
+			discoverLockAcquired = true
+			_ = lock.Unlock()
+		}
+		return []autoGroupSummary{
+			{
+				Ref:     "auto/claude-sonnet-4-5",
+				Name:    "Claude Sonnet 4.5",
+				Routing: "smart",
+			},
+		}, nil
+	}
+
+	ctrl.fetchMembers = func(ctx context.Context, magpiePath, ref string) ([]string, error) {
+		// Attempt to acquire the sidecar lock from an independent flock during member fetch
+		lock, err := acquireSidecarLock(ctx, configDir)
+		if err != nil {
+			t.Errorf("expected to acquire sidecar lock during fetchMembers, got: %v", err)
+		} else {
+			fetchLockAcquired = true
+			_ = lock.Unlock()
+		}
+		return []string{"anthropic/claude-sonnet-4-5"}, nil
+	}
+
+	ctx := context.Background()
+	status, err := ctrl.sync(ctx, []string{"anthropic/claude-sonnet-4-5"})
+	if err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if !discoverLockAcquired {
+		t.Fatalf("discoverAuto did not acquire sidecar lock")
+	}
+	if !fetchLockAcquired {
+		t.Fatalf("fetchMembers did not acquire sidecar lock")
+	}
+	if status.ManagedGroups != 1 {
+		t.Fatalf("expected 1 managed group, got %d", status.ManagedGroups)
+	}
+}
+
+// 25. Lock contention timeout gives actionable error and next sync recovers after lock release
+func TestLockContentionReleaseAndRecovery(t *testing.T) {
+	store, configDir, ctrl := setupTestEnv(t)
+	defer store.Close()
+
+	initial := map[string]any{
+		"groups": []any{
+			map[string]any{
+				"id":      "grp1",
+				"members": []any{"vendor/m1", "vendor/m2"},
+			},
+		},
+	}
+	writeProvidersJSON(t, configDir, initial)
+
+	// Hold the sidecar lock with an external flock
+	lockPath := filepath.Join(configDir, ".model-guard-routing.lock")
+	externalLock := flock.New(lockPath)
+	locked, err := externalLock.TryLock()
+	if err != nil || !locked {
+		t.Fatalf("failed to acquire external lock: %v", err)
+	}
+
+	// sync with short context timeout to verify lock contention failure
+	tCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	status, err := ctrl.sync(tCtx, []string{"vendor/m1"})
+	if err == nil {
+		t.Fatalf("expected sync to fail when sidecar lock is held, got nil")
+	}
+	if !strings.Contains(err.Error(), "路由侧车锁") {
+		t.Fatalf("expected lock error mentioning 路由侧车锁, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "配置冲突") {
+		t.Fatalf("lock timeout must not report config conflict, got: %v", err)
+	}
+	if status.Error == "" {
+		t.Fatalf("expected status.Error to be populated")
+	}
+
+	// Release the external lock
+	_ = externalLock.Unlock()
+
+	// Next sync call should succeed and recover/reconcile properly
+	status, err = ctrl.sync(context.Background(), []string{"vendor/m1"})
+	if err != nil {
+		t.Fatalf("sync after lock release failed: %v", err)
+	}
+	if status.ManagedGroups != 1 {
+		t.Fatalf("expected ManagedGroups=1 after lock release, got %d", status.ManagedGroups)
+	}
+
+	data := readProvidersJSON(t, configDir)
+	groups := data["groups"].([]any)
+	grp := getGroup(groups, "grp1")
+	off := toStringSlice(grp["off"])
+	if !reflect.DeepEqual(off, []string{"vendor/m1"}) {
+		t.Fatalf("expected off [vendor/m1], got %v", off)
+	}
+}
+
+// 26. Concurrent ledger changes made before lock acquisition are respected and not overwritten
+func TestConcurrentLedgerChangeRespected(t *testing.T) {
+	store, configDir, ctrl := setupTestEnv(t)
+	defer store.Close()
+
+	initial := map[string]any{
+		"groups": []any{
+			map[string]any{
+				"id":      "normal-grp",
+				"members": []any{"vendor/m1", "vendor/m2"},
+			},
+			map[string]any{
+				"id":      "concurrent-grp",
+				"members": []any{"other/m1", "other/m2"},
+				"off":     []any{"other/m2", "other/m1"},
+			},
+		},
+	}
+	writeProvidersJSON(t, configDir, initial)
+
+	absProvidersPath, _ := filepath.Abs(filepath.Join(configDir, "providers.json"))
+
+	// Hook into discoverAuto to simulate a concurrent process updating the ledger
+	// before ctrl acquires the file lock.
+	ctrl.discoverAuto = func(ctx context.Context, magpiePath string) ([]autoGroupSummary, error) {
+		concurrentLedger := groupLedger{
+			ProvidersPath: absProvidersPath,
+			Groups: map[string]*groupLedgerEntry{
+				"concurrent-grp": {
+					GroupID: "concurrent-grp",
+					Before:  managedFields{HasOff: true, Off: []string{"other/m2"}},
+					After:   managedFields{HasOff: true, Off: []string{"other/m2", "other/m1"}},
+				},
+			},
+		}
+		if err := store.setKV(groupRoutingLedgerKey, concurrentLedger); err != nil {
+			t.Fatalf("failed to set concurrent ledger: %v", err)
+		}
+		return nil, nil
+	}
+
+	ctx := context.Background()
+	status, err := ctrl.sync(ctx, []string{"vendor/m1", "other/m1"})
+	if err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+
+	var savedLedger groupLedger
+	hasLedger, err := store.getKV(groupRoutingLedgerKey, &savedLedger)
+	if err != nil || !hasLedger {
+		t.Fatalf("failed to read ledger: %v", err)
+	}
+
+	if _, exists := savedLedger.Groups["concurrent-grp"]; !exists {
+		t.Fatalf("expected concurrent-grp to be preserved in ledger, but was lost! Groups: %+v", savedLedger.Groups)
+	}
+	if _, exists := savedLedger.Groups["normal-grp"]; !exists {
+		t.Fatalf("expected normal-grp to be managed in ledger, but was missing! Groups: %+v", savedLedger.Groups)
+	}
+	if status.ManagedGroups != 2 {
+		t.Fatalf("expected 2 managed groups (normal-grp + concurrent-grp), got %d", status.ManagedGroups)
+	}
+
+	// Releasing the concurrent exclusion must retain its user's original off entry.
+	ctrl.discoverAuto = func(context.Context, string) ([]autoGroupSummary, error) { return nil, nil }
+	if _, err := ctrl.sync(ctx, []string{"vendor/m1"}); err != nil {
+		t.Fatal(err)
+	}
+	live := readProvidersJSON(t, configDir)
+	other := getGroup(live["groups"].([]any), "concurrent-grp")
+	if got := toStringSlice(other["off"]); !reflect.DeepEqual(got, []string{"other/m2"}) {
+		t.Fatalf("concurrent ownership baseline lost during recovery: %v", got)
 	}
 }

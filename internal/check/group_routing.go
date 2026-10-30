@@ -124,6 +124,53 @@ func (c *groupController) sync(ctx context.Context, blocked []string) (GroupRout
 	providersPath := filepath.Clean(filepath.Join(c.configDir, "providers.json"))
 	absProvidersPath, _ := filepath.Abs(providersPath)
 
+	var preLedger groupLedger
+	hasPreLedger, err := c.store.getKV(groupRoutingLedgerKey, &preLedger)
+	if err != nil {
+		status.Error = fmt.Sprintf("读取路由账本失败: %v", err)
+		return status, err
+	}
+	if hasPreLedger && preLedger.ProvidersPath != "" && preLedger.ProvidersPath != absProvidersPath && len(preLedger.Groups) > 0 {
+		err := fmt.Errorf("配置路径不匹配: ledger路径 %s 与当前路径 %s 不一致", preLedger.ProvidersPath, absProvidersPath)
+		status.Error = err.Error()
+		return status, err
+	}
+
+	// Optimization: If no targets are blocked and no managed ledger entries exist (and no pending WAL), no-op.
+	if len(blocked) == 0 && (!hasPreLedger || len(preLedger.Groups) == 0) && preLedger.Pending == nil {
+		return status, nil
+	}
+
+	// If blocked or ledger entries exist, providers.json MUST exist and be readable.
+	if _, statErr := os.Stat(providersPath); statErr != nil {
+		err := fmt.Errorf("providers.json 不可读: %w", statErr)
+		status.Error = err.Error()
+		return status, err
+	}
+
+	// Outside file lock: collect auto groups catalog via CLI when models are blocked.
+	var (
+		discoveredCatalog []autoGroupCatalogItem
+		autoErrs          []error
+	)
+	if len(blocked) > 0 {
+		// Leave time in the service deadline for the short commit critical section.
+		catalogCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		discoveredCatalog, autoErrs = c.collectAutoGroupsCatalog(catalogCtx, providersPath)
+		cancel()
+	}
+	if err := ctx.Err(); err != nil {
+		return status, fmt.Errorf("路由信息读取已取消或超时，尚未尝试获取侧车锁: %w", err)
+	}
+
+	fileLock, lockErr := acquireSidecarLock(ctx, c.configDir)
+	if lockErr != nil {
+		status.Error = fmt.Sprintf("获取路由侧车锁失败: %v", lockErr)
+		return status, lockErr
+	}
+	defer fileLock.Unlock()
+
+	// Inside lock: re-read ledger from SQLite so concurrent commits are respected.
 	var ledger groupLedger
 	hasLedger, err := c.store.getKV(groupRoutingLedgerKey, &ledger)
 	if err != nil {
@@ -141,25 +188,6 @@ func (c *groupController) sync(ctx context.Context, blocked []string) (GroupRout
 		return status, err
 	}
 	ledger.ProvidersPath = absProvidersPath
-
-	// Optimization: If no targets are blocked and no managed ledger entries exist (and no pending WAL), no-op.
-	if len(blocked) == 0 && len(ledger.Groups) == 0 && ledger.Pending == nil {
-		return status, nil
-	}
-
-	// If blocked or ledger entries exist, providers.json MUST exist and be readable.
-	if _, statErr := os.Stat(providersPath); statErr != nil {
-		err := fmt.Errorf("providers.json 不可读: %w", statErr)
-		status.Error = err.Error()
-		return status, err
-	}
-
-	fileLock, lockErr := acquireSidecarLock(ctx, c.configDir)
-	if lockErr != nil {
-		status.Error = fmt.Sprintf("获取路由侧车锁失败: %v", lockErr)
-		return status, lockErr
-	}
-	defer fileLock.Unlock()
 
 	origBytes, err := os.ReadFile(providersPath)
 	if err != nil {
@@ -266,10 +294,9 @@ func (c *groupController) sync(ctx context.Context, blocked []string) (GroupRout
 		}
 	}
 
-	// Discover and materialize auto groups if models are blocked.
-	var autoErrs []error
+	// Materialize auto groups from pre-collected catalog if models are blocked.
 	if len(blocked) > 0 {
-		autoErrs = c.probeAndMaterializeAutoGroups(ctx, blocked, groupMap, &groups, targetGroups, conflictedGroups)
+		materializeAutoGroups(discoveredCatalog, blocked, groupMap, &groups, targetGroups, conflictedGroups)
 		for id, entry := range targetGroups {
 			if _, ok := beforePlan[id]; !ok {
 				beforePlan[id] = &groupLedgerEntry{GroupID: id, After: entry.Before, Removed: true}
@@ -607,26 +634,55 @@ func reconcileGroup(g map[string]any, entry *groupLedgerEntry, blocked []string)
 	return changed
 }
 
-func (c *groupController) probeAndMaterializeAutoGroups(
+type autoGroupCatalogItem struct {
+	GroupID string
+	Ref     string
+	Name    string
+	Routing string
+	Members []string
+}
+
+func (c *groupController) collectAutoGroupsCatalog(
 	ctx context.Context,
-	blocked []string,
-	groupMap map[string]map[string]any,
-	groups *[]map[string]any,
-	targetGroups map[string]*groupLedgerEntry,
-	conflictedGroups map[string]bool,
-) []error {
-	var errs []error
+	providersPath string,
+) ([]autoGroupCatalogItem, []error) {
 	if c.magpiePath == "" && c.discoverAuto == nil {
-		return []error{errors.New("缺少 magpie 命令路径，无法探测自动路由组")}
+		return nil, []error{errors.New("缺少 magpie 命令路径，无法探测自动路由组")}
 	}
 
 	summaries, err := c.discoverAutoGroups(ctx)
 	if err != nil {
-		return []error{fmt.Errorf("探测自动路由组失败: %w", err)}
+		return nil, []error{fmt.Errorf("探测自动路由组失败: %w", err)}
 	}
 	if len(summaries) == 0 {
-		return nil
+		return nil, nil
 	}
+
+	// Read snapshot of providers.json to optimize by skipping existing groups
+	snapshotExistingIDs := make(map[string]bool)
+	if snapBytes, err := os.ReadFile(providersPath); err == nil {
+		var snapRoot map[string]json.RawMessage
+		if err := json.Unmarshal(snapBytes, &snapRoot); err == nil {
+			if rawGroups, ok := snapRoot["groups"]; ok && len(rawGroups) > 0 && string(rawGroups) != "null" {
+				var snapGroups []map[string]any
+				dec := json.NewDecoder(bytes.NewReader(rawGroups))
+				dec.UseNumber()
+				if err := dec.Decode(&snapGroups); err == nil {
+					for _, g := range snapGroups {
+						if id, ok := g["id"].(string); ok && id != "" {
+							snapshotExistingIDs[id] = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	var (
+		catalog []autoGroupCatalogItem
+		errs    []error
+		seen    = make(map[string]bool)
+	)
 
 	for _, sum := range summaries {
 		slug := autoRefSlug(sum.Ref)
@@ -638,25 +694,56 @@ func (c *groupController) probeAndMaterializeAutoGroups(
 		}
 		groupID := "auto-" + slug
 
-		// If group is already in providers.json, it's handled as an existing group
-		if _, exists := groupMap[groupID]; exists {
+		if seen[groupID] {
 			continue
 		}
-		if conflictedGroups[groupID] {
+		seen[groupID] = true
+
+		if snapshotExistingIDs[groupID] {
 			continue
 		}
 
 		members, err := c.getGroupMembers(ctx, sum.Ref)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("读取自动组 %s 成员失败: %w", sum.Ref, err))
+			if ctx.Err() != nil {
+				break
+			}
 			continue
 		}
 		if len(members) == 0 {
 			continue
 		}
 
+		catalog = append(catalog, autoGroupCatalogItem{
+			GroupID: groupID,
+			Ref:     sum.Ref,
+			Name:    sum.Name,
+			Routing: sum.Routing,
+			Members: members,
+		})
+	}
+	return catalog, errs
+}
+
+func materializeAutoGroups(
+	catalog []autoGroupCatalogItem,
+	blocked []string,
+	groupMap map[string]map[string]any,
+	groups *[]map[string]any,
+	targetGroups map[string]*groupLedgerEntry,
+	conflictedGroups map[string]bool,
+) {
+	for _, item := range catalog {
+		if _, exists := groupMap[item.GroupID]; exists {
+			continue
+		}
+		if conflictedGroups[item.GroupID] {
+			continue
+		}
+
 		hasBlocked := false
-		for _, m := range members {
+		for _, m := range item.Members {
 			for _, b := range blocked {
 				if memberMatchesBlocked(m, b) {
 					hasBlocked = true
@@ -669,20 +756,20 @@ func (c *groupController) probeAndMaterializeAutoGroups(
 		}
 
 		if hasBlocked {
-			r := sum.Routing
+			r := item.Routing
 			if r == "" {
 				r = "smart"
 			}
 			matGroup := map[string]any{
-				"id":      groupID,
-				"name":    sum.Name,
-				"members": members,
+				"id":      item.GroupID,
+				"name":    item.Name,
+				"members": item.Members,
 				"routing": r,
 			}
 
 			raw, _ := json.Marshal(matGroup)
 			entry := &groupLedgerEntry{
-				GroupID:      groupID,
+				GroupID:      item.GroupID,
 				IsAuto:       true,
 				OriginalJSON: raw,
 				Before: managedFields{
@@ -693,15 +780,15 @@ func (c *groupController) probeAndMaterializeAutoGroups(
 			}
 
 			*groups = append(*groups, matGroup)
-			groupMap[groupID] = matGroup
-			targetGroups[groupID] = entry
+			groupMap[item.GroupID] = matGroup
+			targetGroups[item.GroupID] = entry
 		}
 	}
-	return errs
 }
 
 func (c *groupController) buildCLIEnv() []string {
 	env := os.Environ()
+	env = setEnvKV(env, "MAGPIE_MODEL_GUARD_DISCOVERY", "1")
 	if c.configDir == "" {
 		return env
 	}
@@ -1262,10 +1349,13 @@ func acquireSidecarLock(ctx context.Context, dir string) (*flock.Flock, error) {
 
 	locked, err := fileLock.TryLockContext(tCtx, 40*time.Millisecond)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(tCtx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("等待路由侧车锁超时（3s），可能有并发同步进程占用锁: %w", err)
+		}
 		return nil, fmt.Errorf("获取路由侧车锁失败: %w", err)
 	}
 	if !locked {
-		return nil, errors.New("等待路由侧车锁超时")
+		return nil, errors.New("等待路由侧车锁超时（3s），可能有并发同步进程占用锁")
 	}
 	return fileLock, nil
 }

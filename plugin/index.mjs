@@ -49,7 +49,15 @@ function start(options = {}) {
   });
   return ready;
 }
-process.once('exit', () => child?.kill());
+// A CLI host can lose its parent pipe without exiting while child handles remain.
+function stopBackend() {
+  stopDiscovery?.();
+  stopDiscovery = undefined;
+  child?.kill();
+}
+process.once('exit', stopBackend);
+process.stdin.once('end', stopBackend);
+process.stdin.once('close', stopBackend);
 
 // Discover the local magpie gateway (settings.json port / MAGPIE_ADDR).
 async function discoverGateway(options = {}, env = process.env, fetcher = fetch) {
@@ -115,7 +123,10 @@ function startGatewayDiscovery(service, options = {}) {
 
 export default {
   id: 'magpie-model-guard',
-  server: async (_input, options = {}) => ({
+  server: async (_input, options = {}) => {
+    // Catalog subprocesses must not start another guard while enumerating plugins.
+    if (process.env.MAGPIE_MODEL_GUARD_DISCOVERY === '1') return {};
+    return {
     auth: {
       provider: 'magpie-model-guard',
       methods: [{
@@ -141,5 +152,6 @@ export default {
       cfg.provider ??= {};
       cfg.provider['magpie-model-guard'] = { name: 'Model Guard', models: {} };
     },
-  }),
+    };
+  },
 };

@@ -183,7 +183,7 @@
     if (routingEl) {
       var routing = state.routing || {};
       routingEl.classList.toggle("routing-error", !!routing.error);
-      routingEl.textContent = routing.error ? routing.error + "；直连门禁仍生效，请先处理路由组配置冲突。" :
+      routingEl.textContent = routing.error ? routing.error + "；直连门禁仍生效，后台将重试路由同步。请根据上述原因检查。" :
         routing.enabled ? "路由组同步已启用 · 当前管理 " + (routing.managed_groups || 0) + " 个组 · 禁用成员退出业务路由，检测探针保持可用。" :
         "路由组同步未启用：当前仅对完整模型 ID 的直接请求执行门禁。";
     }

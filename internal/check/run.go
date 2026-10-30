@@ -3,9 +3,11 @@
 package check
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -34,6 +36,15 @@ type StartupInfo struct {
 // Run starts the backend and blocks until the process is interrupted or the
 // HTTP server fails. It is the single entry point used by cmd/model-guard.
 func Run(o Options) error {
+	ownerCtx, ownerCancel := context.WithCancel(context.Background())
+	defer ownerCancel()
+	if o.PluginOwned {
+		// The host owns this stdin pipe; EOF also covers a host killed without cleanup.
+		go func() {
+			_, _ = io.Copy(io.Discard, os.Stdin)
+			ownerCancel()
+		}()
+	}
 	if err := os.MkdirAll(o.DataDir, 0o700); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
 	}
@@ -48,6 +59,8 @@ func Run(o Options) error {
 		return err
 	}
 	defer svc.Close()
+	stopOwner := context.AfterFunc(ownerCtx, svc.cancel)
+	defer stopOwner()
 	if o.MagpieConfig != "" {
 		svc.mu.Lock()
 		svc.routes = newGroupController(store, o.MagpieConfig, o.MagpiePath)
@@ -78,6 +91,8 @@ func Run(o Options) error {
 	}
 
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	stopHTTP := context.AfterFunc(ownerCtx, func() { _ = srv.Close() })
+	defer stopHTTP()
 	err = srv.Serve(ln)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil

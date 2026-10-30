@@ -15,7 +15,7 @@
 import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
 import { constants } from 'node:fs';
-import { access, mkdir, copyFile, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, copyFile, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
@@ -247,6 +247,79 @@ function stopChild(child) {
   });
 }
 
+async function cleanupProcesses(tempDir, rootPids = []) {
+  if (!tempDir && (!rootPids || rootPids.length === 0)) return;
+
+  // 1. Terminate all descendant processes of known parents (e.g. magpie serve, guard backend)
+  for (const rootPid of rootPids) {
+    if (!rootPid) continue;
+    try {
+      const { stdout } = await execFileAsync('ps', ['-ax', '-o', 'pid,ppid']);
+      const parentMap = new Map();
+      for (const line of stdout.split('\n')) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length >= 2) {
+          const pid = parseInt(parts[0], 10);
+          const ppid = parseInt(parts[1], 10);
+          if (!isNaN(pid) && !isNaN(ppid)) {
+            if (!parentMap.has(ppid)) parentMap.set(ppid, []);
+            parentMap.get(ppid).push(pid);
+          }
+        }
+      }
+      const queue = [rootPid];
+      const descendants = [];
+      while (queue.length > 0) {
+        const curr = queue.shift();
+        const children = parentMap.get(curr) || [];
+        for (const ch of children) {
+          if (ch !== process.pid && ch !== process.ppid && !descendants.includes(ch)) {
+            descendants.push(ch);
+            queue.push(ch);
+          }
+        }
+      }
+      for (const pid of descendants) {
+        try { process.kill(pid, 'SIGTERM'); } catch {}
+      }
+      if (descendants.length > 0) {
+        await sleep(150);
+        for (const pid of descendants) {
+          try { process.kill(pid, 'SIGKILL'); } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  // 2. Terminate any lingering process whose command line references tempDir (including CLI-derived hosts)
+  if (tempDir) {
+    try {
+      const { stdout } = await execFileAsync('ps', ['-ax', '-o', 'pid,command']);
+      const toKill = [];
+      for (const line of stdout.split('\n')) {
+        const trimmed = line.trim();
+        const match = trimmed.match(/^(\d+)\s+(.*)$/);
+        if (match) {
+          const pid = parseInt(match[1], 10);
+          const cmd = match[2];
+          if (pid !== process.pid && pid !== process.ppid && cmd.includes(tempDir)) {
+            toKill.push(pid);
+          }
+        }
+      }
+      for (const pid of toKill) {
+        try { process.kill(pid, 'SIGTERM'); } catch {}
+      }
+      if (toKill.length > 0) {
+        await sleep(150);
+        for (const pid of toKill) {
+          try { process.kill(pid, 'SIGKILL'); } catch {}
+        }
+      }
+    } catch {}
+  }
+}
+
 function normalizeGroups(groups) {
   return (groups || [])
     .map(group => ({
@@ -303,6 +376,8 @@ let configHome;
 let stateHome;
 let providersPath;
 let gatePath;
+let pluginPkgDir;
+let guardHostCreated = false;
 let bad;
 let good;
 let magpieChild;
@@ -363,15 +438,44 @@ async function magpie(args, { timeout = 60000 } = {}) {
 }
 
 async function startGuard() {
-  const child = spawn(guardBinary, [
-    '-data', path.join(tempRoot, 'guard'),
-    '-gate', gatePath,
-    '-owned',
-    '-magpie-config', path.join(configHome, 'magpie'),
-    '-magpie', magpieBinary,
+  const hostScriptPath = path.join(tempRoot, 'guard-host-runner.mjs');
+  if (!guardHostCreated) {
+    const scriptCode = `import { pathToFileURL } from 'node:url';
+const pluginIndexPath = process.argv[2];
+const options = JSON.parse(process.argv[3]);
+const { default: plugin } = await import(pathToFileURL(pluginIndexPath).href);
+const hooks = await plugin.server({}, options);
+await hooks.config({});
+const entry = await hooks.auth.methods[0].authorize();
+const url = new URL(entry.url);
+const token = new URLSearchParams(url.hash.slice(1)).get('token');
+console.log(JSON.stringify({ origin: url.origin, control: token }));
+process.stdin.resume();
+process.stdin.on('end', () => process.exit(0));
+`;
+    await writeFile(hostScriptPath, scriptCode, 'utf8');
+    guardHostCreated = true;
+  }
+
+  const hostEnv = { ...baseEnv };
+  delete hostEnv.MAGPIE_MODEL_GUARD_DISCOVERY;
+
+  const pluginIndexPath = path.join(pluginPkgDir, 'plugin', 'index.mjs');
+  const hostOptions = {
+    dataDir: path.join(tempRoot, 'guard'),
+    magpieConfigDir: path.join(configHome, 'magpie'),
+    gatewayURL: gatewayUrl,
+    magpiePath: magpieBinary,
+    binaryPath: guardBinary,
+  };
+
+  const child = spawn(process.execPath, [
+    hostScriptPath,
+    pluginIndexPath,
+    JSON.stringify(hostOptions),
   ], {
     cwd: root,
-    env: baseEnv,
+    env: hostEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   child.stdin.on('error', () => {});
@@ -414,7 +518,7 @@ async function startGuard() {
 function startMagpieServe() {
   magpieChild = spawn(magpieBinary, ['serve'], {
     cwd: root,
-    env: { ...baseEnv, MAGPIE_ADDR: `127.0.0.1:${gatewayPort}` },
+    env: { ...baseEnv, MAGPIE_ADDR: `127.0.0.1:${gatewayPort}`, MAGPIE_MODEL_GUARD_DISCOVERY: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const capture = chunk => {
@@ -554,6 +658,7 @@ async function main() {
     XDG_CONFIG_HOME: configHome,
     XDG_STATE_HOME: stateHome,
     MAGPIE_NO_ACCOUNTS: '1',
+    MAGPIE_MODEL_GUARD_DISCOVERY: '1',
   };
   for (const key of ['MAGPIE_ADDR', 'MAGPIE_GATEWAY_KEY', 'MAGPIE_WEB_KEY', 'MAGPIE_WEB_URL', 'MAGPIE_PUBLIC_URL']) {
     delete baseEnv[key];
@@ -593,10 +698,50 @@ async function main() {
   seededGroup['x-verify-group'] = { keep: 'me' };
   await writeProviders(seeded);
 
-  gatePath = path.join(tempRoot, 'gate.middleware.js');
-  await copyFile(path.join(root, 'plugin', 'gate.middleware.js'), gatePath);
-  const pluginOut = await magpie(['plugin', 'add', gatePath]);
-  assert.match(pluginOut, /gateway middleware/i, 'gate file must be registered as gateway middleware only');
+  // Package a complete plugin installation under tempRoot:
+  // package.json + index.mjs + real Go binary + gate middleware.
+  pluginPkgDir = path.join(tempRoot, 'plugin-package');
+  const pluginBinDir = path.join(pluginPkgDir, 'bin');
+  const pluginSrcDir = path.join(pluginPkgDir, 'plugin');
+  await mkdir(pluginBinDir, { recursive: true });
+  await mkdir(pluginSrcDir, { recursive: true });
+
+  await copyFile(path.join(root, 'package.json'), path.join(pluginPkgDir, 'package.json'));
+  await copyFile(path.join(root, 'plugin', 'index.mjs'), path.join(pluginSrcDir, 'index.mjs'));
+  await copyFile(path.join(root, 'plugin', 'gate.middleware.js'), path.join(pluginSrcDir, 'gate.middleware.js'));
+
+  const platform = { win32: 'windows', darwin: 'darwin', linux: 'linux' }[process.platform] || process.platform;
+  const arch = { x64: 'amd64', arm64: 'arm64' }[process.arch] || process.arch;
+  const suffix = platform === 'windows' ? '.exe' : '';
+  const bundledName = `model-guard-${platform}-${arch}${suffix}`;
+  const fallbackName = `model-guard${suffix}`;
+
+  const targetBundled = path.join(pluginBinDir, bundledName);
+  const targetFallback = path.join(pluginBinDir, fallbackName);
+  await copyFile(guardBinary, targetBundled);
+  await copyFile(guardBinary, targetFallback);
+  if (process.platform !== 'win32') {
+    await chmod(targetBundled, 0o755);
+    await chmod(targetFallback, 0o755);
+  }
+
+  gatePath = path.join(pluginSrcDir, 'gate.middleware.js');
+
+  await magpie(['plugin', 'add', pluginPkgDir]);
+
+  // Explicitly configure isolated plugin options so host execution never touches user configuration.
+  const pluginOptions = {
+    dataDir: path.join(tempRoot, 'guard'),
+    magpieConfigDir: path.join(configHome, 'magpie'),
+    gatewayURL: gatewayUrl,
+    magpiePath: magpieBinary,
+  };
+  await magpie(['plugin', 'options', pluginPkgDir, JSON.stringify(pluginOptions)]);
+
+  // Verify magpie groups runs cleanly with full plugin installed without recursive spawn
+  const postInstallGroups = await magpie(['groups']);
+  assert.ok(postInstallGroups.includes(GROUP), `magpie groups after full plugin install must list ${GROUP}`);
+  assert.ok(postInstallGroups.includes(AUTO), `magpie groups after full plugin install must list ${AUTO}`);
 
   const initial = await readProviders();
   const originalGroups = normalizeGroups(initial.groups);
@@ -654,6 +799,12 @@ async function main() {
   assert.ok(managed.routing.managed_groups >= 1, 'managed_groups must count the synchronized groups');
   assertUserFields(await readProviders(), 'after the first guard rewrite');
   console.log(`PASS blocked member excluded from explicit and auto groups (managed ${managed.routing.managed_groups})`);
+
+  // Direct request to the blocked model ID must be rejected with 403 by gate middleware
+  const directBlocked = await chat(BAD_MODEL, 'direct blocked model request');
+  assert.equal(directBlocked.status, 403, `direct request to blocked model must return 403, got ${directBlocked.status}`);
+  assert.match(directBlocked.text, /MODEL_GUARD_BLOCKED/i, 'direct request must return MODEL_GUARD_BLOCKED');
+  console.log('PASS direct request to blocked model ID returns 403');
 
   await sleep(ROUTE_SETTLE_MS);
   const badBusinessBefore = bad.counts().business;
@@ -860,13 +1011,23 @@ async function main() {
 
 let failure;
 let summary;
+const VERIFY_TIMEOUT_MS = 240000;
 try {
-  summary = await main();
+  summary = await Promise.race([
+    main(),
+    new Promise((_, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`auto routing acceptance timed out after ${VERIFY_TIMEOUT_MS}ms`));
+      }, VERIFY_TIMEOUT_MS);
+      timer.unref?.();
+    }),
+  ]);
 } catch (error) {
   failure = error;
 } finally {
   await guard?.stop();
   await stopChild(magpieChild);
+  await cleanupProcesses(tempRoot, [magpieChild?.pid, guard?.child?.pid]);
   if (bad) await bad.close();
   if (good) await good.close();
   if (tempRoot) await rm(tempRoot, { recursive: true, force: true });
