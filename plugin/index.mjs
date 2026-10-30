@@ -25,7 +25,9 @@ function start(options = {}) {
       '-data', options.dataDir || path.join(os.homedir(), '.config', 'magpie-model-guard'),
       '-gate', path.join(root, 'plugin', 'gate.middleware.js'),
       '-owned',
+      '-magpie-config', options.magpieConfigDir || path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'magpie'),
     ];
+    if (options.magpiePath) args.push('-magpie', options.magpiePath);
     child = spawn(binary, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     child.stdin.on('error', () => {});
     let output = '';

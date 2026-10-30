@@ -108,3 +108,45 @@ func TestRecheckRunsWhileMonitoringPaused(t *testing.T) {
 	}
 	t.Fatal("paused target did not complete explicit recheck")
 }
+
+func TestScheduledProbeRecoversAutomaticallyBlockedModel(t *testing.T) {
+	gw := &fakeGateway{answer: "35"}
+	server := httptest.NewServer(http.HandlerFunc(gw.handler))
+	defer server.Close()
+	s, store, _ := newTestService(t, gw)
+	cfg := mustConfig(t, store)
+	cfg.GatewayURL, cfg.GatewayKey = server.URL, "fixture"
+	if err := s.Configure(cfg); err != nil {
+		t.Fatal(err)
+	}
+	target := &Target{Model: "vendor/model", Enabled: true, PromptIDs: []string{"candy"}}
+	if err := s.UpsertTarget(target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.runRound(tstCtx(), target, cfg, "scheduled"); err != nil {
+		t.Fatal(err)
+	}
+	target, err := store.Target(target.Model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.State != StateFailed || !target.Blocked || !target.Enabled || target.ManualHold {
+		t.Fatalf("failed probe must isolate while retaining monitoring: %+v", target)
+	}
+	target.NextCheckAt = time.Now().Add(-time.Minute)
+	if err := store.SaveTarget(target); err != nil {
+		t.Fatal(err)
+	}
+	gw.mu.Lock()
+	gw.answer = "21"
+	gw.mu.Unlock()
+	s.schedule()
+	s.wg.Wait()
+	target, err = store.Target(target.Model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.State != StatePassed || target.Blocked || !target.Enabled {
+		t.Fatalf("scheduled recovery did not restore model: %+v", target)
+	}
+}

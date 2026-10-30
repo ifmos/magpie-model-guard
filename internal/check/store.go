@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS targets (
   reason           TEXT NOT NULL DEFAULT '',
   checked_at       INTEGER NOT NULL DEFAULT 0,
   allow_until      INTEGER NOT NULL DEFAULT 0,
-  fail_streak      INTEGER NOT NULL DEFAULT 0
+  fail_streak      INTEGER NOT NULL DEFAULT 0,
+  schedule_json    TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS prompts (
   id        TEXT PRIMARY KEY,
@@ -88,8 +89,20 @@ CREATE INDEX IF NOT EXISTS idx_results_model ON results(model, created_at DESC);
 			return err
 		}
 		_, err = s.db.Exec(`UPDATE targets SET manual_hold=1 WHERE state='review'`)
+		if err != nil {
+			return err
+		}
 	}
-	return err
+	var sjExists int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('targets') WHERE name='schedule_json'`).Scan(&sjExists); err != nil {
+		return err
+	}
+	if sjExists == 0 {
+		if _, err := s.db.Exec(`ALTER TABLE targets ADD COLUMN schedule_json TEXT NOT NULL DEFAULT '{}'`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // KV helpers.
@@ -118,13 +131,15 @@ func (s *Store) setKV(key string, v any) error {
 
 // GuardConfig is the persisted service configuration.
 type GuardConfig struct {
-	GatewayURL         string `json:"gateway_url"`
-	GatewayKey         string `json:"gateway_key"`
-	DailyLimit         int    `json:"daily_limit"`          // probe requests per model per day
-	TimeoutSec         int    `json:"timeout_sec"`          // per probe request
-	CoolMin            int    `json:"cool_min"`             // unavailable cool-down minutes
-	DefaultIntervalMin int    `json:"default_interval_min"` // default scheduled interval
-	ProbeMaxTokens     int    `json:"probe_max_tokens"`
+	GatewayURL         string       `json:"gateway_url"`
+	GatewayKey         string       `json:"gateway_key"`
+	DailyLimit         int          `json:"daily_limit"`          // probe requests per model per day
+	TimeoutSec         int          `json:"timeout_sec"`          // per probe request
+	CoolMin            int          `json:"cool_min"`             // unavailable cool-down minutes
+	DefaultIntervalMin int          `json:"default_interval_min"` // default scheduled interval
+	ProbeMaxTokens     int          `json:"probe_max_tokens"`
+	ScheduleMode       string       `json:"schedule_mode"` // "fixed" | "staged", default "fixed"
+	TimingPolicy       TimingPolicy `json:"timing_policy"`
 }
 
 func defaultConfig() GuardConfig {
@@ -134,6 +149,8 @@ func defaultConfig() GuardConfig {
 		CoolMin:            15,
 		DefaultIntervalMin: 30,
 		ProbeMaxTokens:     8192,
+		ScheduleMode:       ScheduleModeFixed,
+		TimingPolicy:       DefaultTimingPolicy(),
 	}
 }
 
@@ -141,6 +158,10 @@ func defaultConfig() GuardConfig {
 func (s *Store) LoadConfig() (GuardConfig, error) {
 	c := defaultConfig()
 	_, err := s.getKV("config", &c)
+	if c.ScheduleMode == "" {
+		c.ScheduleMode = ScheduleModeFixed
+	}
+	c.TimingPolicy = ResolveTimingPolicy(nil, c.TimingPolicy)
 	return c, err
 }
 
@@ -179,6 +200,57 @@ type Target struct {
 	FailStreak     int       `json:"fail_streak"`
 	ManualHold     bool      `json:"manual_hold"`
 	Blocked        bool      `json:"blocked"`
+
+	// Staged schedule configuration and runtime fields:
+	ScheduleMode      string        `json:"schedule_mode"`
+	TimingPolicy      *TimingPolicy `json:"timing_policy,omitempty"`
+	ScheduleStage     string        `json:"schedule_stage"`
+	RecoveryPasses    int           `json:"recovery_passes"`
+	IsolationRechecks int           `json:"isolation_rechecks"`
+	RetryPromptID     string        `json:"retry_prompt_id"`
+}
+
+type targetSchedulePayload struct {
+	ScheduleMode      string        `json:"schedule_mode,omitempty"`
+	TimingPolicy      *TimingPolicy `json:"timing_policy,omitempty"`
+	ScheduleStage     string        `json:"schedule_stage,omitempty"`
+	RecoveryPasses    int           `json:"recovery_passes,omitempty"`
+	IsolationRechecks int           `json:"isolation_rechecks,omitempty"`
+	RetryPromptID     string        `json:"retry_prompt_id,omitempty"`
+}
+
+func marshalScheduleJSON(t *Target) string {
+	payload := targetSchedulePayload{
+		ScheduleMode:      t.ScheduleMode,
+		TimingPolicy:      t.TimingPolicy,
+		ScheduleStage:     t.ScheduleStage,
+		RecoveryPasses:    t.RecoveryPasses,
+		IsolationRechecks: t.IsolationRechecks,
+		RetryPromptID:     t.RetryPromptID,
+	}
+	b, _ := json.Marshal(payload)
+	return string(b)
+}
+
+func unmarshalScheduleJSON(t *Target, raw string) {
+	if raw == "" || raw == "{}" {
+		if t.ScheduleStage == "" {
+			t.ScheduleStage = DefaultStageForState(t.State)
+		}
+		return
+	}
+	var p targetSchedulePayload
+	if err := json.Unmarshal([]byte(raw), &p); err == nil {
+		t.ScheduleMode = p.ScheduleMode
+		t.TimingPolicy = p.TimingPolicy
+		t.ScheduleStage = p.ScheduleStage
+		t.RecoveryPasses = p.RecoveryPasses
+		t.IsolationRechecks = p.IsolationRechecks
+		t.RetryPromptID = p.RetryPromptID
+	}
+	if t.ScheduleStage == "" {
+		t.ScheduleStage = DefaultStageForState(t.State)
+	}
 }
 
 // blockedAt is independent of monitoring: stopping probes never releases a hold.
@@ -193,10 +265,11 @@ func scanTarget(row interface{ Scan(...any) error }) (*Target, error) {
 	var (
 		t                    Target
 		promptIDs            string
+		scheduleJSON         string
 		next, checked, allow int64
 	)
 	err := row.Scan(&t.Model, &t.Enabled, &promptIDs, &t.IntervalMin, &t.FailRecheckMin,
-		&next, &t.State, &t.Reason, &checked, &allow, &t.FailStreak, &t.ManualHold)
+		&next, &t.State, &t.Reason, &checked, &allow, &t.FailStreak, &t.ManualHold, &scheduleJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -205,10 +278,11 @@ func scanTarget(row interface{ Scan(...any) error }) (*Target, error) {
 	t.CheckedAt = time.Unix(checked, 0).UTC()
 	t.AllowUntil = time.Unix(allow, 0).UTC()
 	t.Blocked = t.blockedAt(time.Now())
+	unmarshalScheduleJSON(&t, scheduleJSON)
 	return &t, nil
 }
 
-const targetCols = `model,enabled,prompt_ids,interval_min,fail_recheck_min,next_check_at,state,reason,checked_at,allow_until,fail_streak,manual_hold`
+const targetCols = `model,enabled,prompt_ids,interval_min,fail_recheck_min,next_check_at,state,reason,checked_at,allow_until,fail_streak,manual_hold,schedule_json`
 
 // SaveTarget inserts or updates a target.
 func (s *Store) SaveTarget(t *Target) error {
@@ -216,15 +290,16 @@ func (s *Store) SaveTarget(t *Target) error {
 		t.PromptIDs = []string{}
 	}
 	ids, _ := json.Marshal(t.PromptIDs)
-	_, err := s.db.Exec(`INSERT INTO targets(`+targetCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+	sj := marshalScheduleJSON(t)
+	_, err := s.db.Exec(`INSERT INTO targets(`+targetCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
 	  ON CONFLICT(model) DO UPDATE SET
 	    enabled=excluded.enabled, prompt_ids=excluded.prompt_ids,
 	    interval_min=excluded.interval_min, fail_recheck_min=excluded.fail_recheck_min,
 	    next_check_at=excluded.next_check_at, state=excluded.state, reason=excluded.reason,
 	    checked_at=excluded.checked_at, allow_until=excluded.allow_until, fail_streak=excluded.fail_streak,
-	    manual_hold=excluded.manual_hold`,
+	    manual_hold=excluded.manual_hold, schedule_json=excluded.schedule_json`,
 		t.Model, t.Enabled, string(ids), t.IntervalMin, t.FailRecheckMin,
-		t.NextCheckAt.Unix(), t.State, t.Reason, t.CheckedAt.Unix(), t.AllowUntil.Unix(), t.FailStreak, t.ManualHold)
+		t.NextCheckAt.Unix(), t.State, t.Reason, t.CheckedAt.Unix(), t.AllowUntil.Unix(), t.FailStreak, t.ManualHold, sj)
 	t.Blocked = t.blockedAt(time.Now())
 	return err
 }

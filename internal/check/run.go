@@ -15,10 +15,12 @@ import (
 
 // Options configures the backend service.
 type Options struct {
-	DataDir     string
-	GatePath    string
-	Addr        string
-	PluginOwned bool
+	DataDir      string
+	GatePath     string
+	Addr         string
+	PluginOwned  bool
+	MagpieConfig string
+	MagpiePath   string
 }
 
 // StartupInfo is printed on stdout (one JSON line) when started by the plugin
@@ -46,6 +48,13 @@ func Run(o Options) error {
 		return err
 	}
 	defer svc.Close()
+	if o.MagpieConfig != "" {
+		svc.mu.Lock()
+		svc.routes = newGroupController(store, o.MagpieConfig, o.MagpiePath)
+		// Keep the console available when reconciliation needs operator attention.
+		_ = svc.publishGate()
+		svc.mu.Unlock()
+	}
 
 	mux := http.NewServeMux()
 	registerAPI(mux, svc)

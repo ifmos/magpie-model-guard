@@ -48,6 +48,8 @@ type Service struct {
 	consoleKey string
 	health     string
 	closing    bool
+	routes     *groupController
+	routing    GroupRoutingStatus
 }
 
 // NewService loads state, seeds builtins, publishes the gate and starts the
@@ -96,7 +98,7 @@ func (s *Service) Close() {
 func (s *Service) Health() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.health
+	return strings.TrimSpace(strings.Join([]string{s.health, s.routing.Error}, " "))
 }
 
 // NewConsoleToken rotates and returns the management token.
@@ -134,6 +136,14 @@ func (s *Service) schedule() {
 	defer s.mu.Unlock()
 	if s.closing {
 		return
+	}
+	if s.routes != nil {
+		targets, err := s.store.Targets()
+		if err != nil {
+			s.health = err.Error()
+		} else {
+			_ = s.syncGroupsLocked(targets)
+		}
 	}
 	cfg, err := s.store.LoadConfig()
 	if err != nil || cfg.GatewayURL == "" {
@@ -232,7 +242,29 @@ export function onRequest(body,ctx){
 		return err
 	}
 	s.health = ""
-	return nil
+	return s.syncGroupsLocked(targets)
+}
+
+// syncGroupsLocked reconciles production groups without blocking probe access.
+func (s *Service) syncGroupsLocked(targets []*Target) error {
+	if s.routes == nil {
+		return nil
+	}
+	var blocked []string
+	now := time.Now()
+	for _, t := range targets {
+		if t.blockedAt(now) {
+			blocked = append(blocked, t.Model)
+		}
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 12*time.Second)
+	defer cancel()
+	status, err := s.routes.sync(ctx, blocked)
+	if err != nil {
+		status.Error = "路由组同步失败：" + err.Error()
+	}
+	s.routing = status
+	return err
 }
 
 // atomicWrite replaces a file atomically via temp+rename.
@@ -262,26 +294,190 @@ func atomicWrite(name string, data []byte) error {
 
 // ---- probe round ----
 
-// runRound runs one detection round for a target: every automatic prompt of
-// the target once; any failed prompt marks the round failed (with an
-// independent retry, mirroring intelligence-check's candy re-probe).
+// runRound runs one detection round for a target:
+// In staged mode, it handles single-round retries, retesting failed prompts without false passes.
+// In fixed mode, it retains immediate independent secondary retry.
 func (s *Service) runRound(ctx context.Context, t *Target, cfg GuardConfig, source string) (*Result, error) {
 	prompts, err := s.store.Prompts()
 	if err != nil {
 		return nil, err
 	}
+	var byID = map[string]*Prompt{}
+	for _, p := range prompts {
+		byID[p.ID] = p
+	}
+
+	mode := EffectiveScheduleMode(t.ScheduleMode, cfg.ScheduleMode)
+	now := time.Now().UTC()
+
+	if mode == ScheduleModeStaged {
+		if t.RetryPromptID != "" {
+			p, ok := byID[t.RetryPromptID]
+			if !ok || !p.Automatic {
+				// A deleted or non-automatic retry prompt must never fake a pass.
+				verdict := VerdictUnavailable
+				detail := fmt.Sprintf("复测题目 %s 已被删除或非自动题目，无法判定通过", t.RetryPromptID)
+				final := &Result{
+					ID:        randomHex(8),
+					Model:     t.Model,
+					PromptID:  t.RetryPromptID,
+					Answer:    "",
+					Verdict:   verdict,
+					Detail:    detail,
+					Tokens:    0,
+					CreatedAt: now,
+					Source:    source,
+				}
+				if err := s.store.AppendResult(final); err != nil {
+					return final, err
+				}
+				s.applyRoundResult(t, verdict, detail, cfg, now, t.RetryPromptID)
+				return final, nil
+			}
+
+			res, err := s.probeOnce(ctx, t, p, cfg, source)
+			now = time.Now().UTC()
+			tokens := 0
+			answer := ""
+			if res != nil {
+				tokens = res.Tokens
+				answer = res.Answer
+			}
+			var verdict string
+			var detail string
+			if err != nil || res == nil || (res.Verdict != VerdictPassed && res.Verdict != VerdictFailed) {
+				verdict = VerdictUnavailable
+				if res != nil && res.Detail != "" {
+					detail = "复测不可用：" + res.Detail
+				} else {
+					detail = "复测不可用：" + errReason(err)
+				}
+			} else if res.Verdict == VerdictFailed {
+				verdict = VerdictFailed
+				detail = fmt.Sprintf("复测题目 %s 未通过", p.Name)
+			} else {
+				verdict = VerdictPassed
+				detail = fmt.Sprintf("复测题目 %s 判分通过", p.Name)
+			}
+
+			final := &Result{
+				ID:        randomHex(8),
+				Model:     t.Model,
+				PromptID:  p.ID,
+				Answer:    answer,
+				Verdict:   verdict,
+				Detail:    detail,
+				Tokens:    tokens,
+				CreatedAt: now,
+				Source:    source,
+			}
+			if err := s.store.AppendResult(final); err != nil {
+				return final, err
+			}
+			s.applyRoundResult(t, verdict, detail, cfg, now, t.RetryPromptID)
+			return final, nil
+		}
+
+		// RetryPromptID is empty: normal prompt selection
+		promptIDs := t.PromptIDs
+		if len(promptIDs) == 0 {
+			for _, p := range prompts {
+				if p.Automatic {
+					promptIDs = append(promptIDs, p.ID)
+				}
+			}
+		}
+		var automaticPrompts []*Prompt
+		for _, id := range promptIDs {
+			p, ok := byID[id]
+			if ok && p.Automatic {
+				automaticPrompts = append(automaticPrompts, p)
+			}
+		}
+		if len(automaticPrompts) == 0 {
+			verdict := VerdictUnavailable
+			detail := "目标未配置自动判分题目"
+			final := &Result{
+				ID:        randomHex(8),
+				Model:     t.Model,
+				PromptID:  strings.Join(promptIDs, "+"),
+				Answer:    "",
+				Verdict:   verdict,
+				Detail:    detail,
+				Tokens:    0,
+				CreatedAt: now,
+				Source:    source,
+			}
+			if err := s.store.AppendResult(final); err != nil {
+				return final, err
+			}
+			s.applyRoundResult(t, verdict, detail, cfg, now)
+			return final, nil
+		}
+
+		var (
+			verdict        = VerdictPassed
+			detail         = "所有自动题目检测通过"
+			tokens         int
+			firstRes       *Result
+			failedPromptID string
+		)
+		for _, p := range automaticPrompts {
+			res, err := s.probeOnce(ctx, t, p, cfg, source)
+			if res != nil && firstRes == nil {
+				firstRes = res
+			}
+			if res != nil {
+				tokens += res.Tokens
+			}
+			if err != nil || res == nil || (res.Verdict != VerdictPassed && res.Verdict != VerdictFailed) {
+				verdict = VerdictUnavailable
+				if res != nil && res.Detail != "" {
+					detail = "检测不可用：" + res.Detail
+				} else {
+					detail = "检测不可用：" + errReason(err)
+				}
+				failedPromptID = p.ID
+				break
+			}
+			if res.Verdict == VerdictFailed {
+				verdict = VerdictFailed
+				detail = fmt.Sprintf("题目 %s 未通过", p.Name)
+				failedPromptID = p.ID
+				break
+			}
+		}
+		now = time.Now().UTC()
+		final := &Result{
+			ID:        randomHex(8),
+			Model:     t.Model,
+			PromptID:  strings.Join(promptIDs, "+"),
+			Answer:    "",
+			Verdict:   verdict,
+			Detail:    detail,
+			Tokens:    tokens,
+			CreatedAt: now,
+			Source:    source,
+		}
+		if firstRes != nil {
+			final.Answer = firstRes.Answer
+			final.PromptID = firstRes.PromptID
+		}
+		if err := s.store.AppendResult(final); err != nil {
+			return final, err
+		}
+		s.applyRoundResult(t, verdict, detail, cfg, now, failedPromptID)
+		return final, nil
+	}
+
+	// Mode is ScheduleModeFixed
 	promptIDs := t.PromptIDs
 	if len(promptIDs) == 0 {
-		// default: all automatic prompts
 		for _, p := range prompts {
 			if p.Automatic {
 				promptIDs = append(promptIDs, p.ID)
 			}
 		}
-	}
-	var byID = map[string]*Prompt{}
-	for _, p := range prompts {
-		byID[p.ID] = p
 	}
 	var (
 		verdict  = VerdictPassed
@@ -301,18 +497,26 @@ func (s *Service) runRound(ctx context.Context, t *Target, cfg GuardConfig, sour
 		if res != nil && firstRes == nil {
 			firstRes = res
 		}
-		if err != nil || res == nil {
+		if err != nil || res == nil || (res.Verdict != VerdictPassed && res.Verdict != VerdictFailed) {
 			verdict = VerdictUnavailable
-			detail = "检测不可用：" + errReason(err)
+			if res != nil && res.Detail != "" {
+				detail = "检测不可用：" + res.Detail
+			} else {
+				detail = "检测不可用：" + errReason(err)
+			}
 			break
 		}
 		tokens += res.Tokens
 		if res.Verdict == VerdictFailed {
 			// Independent retry once, like intelligence-check's milk re-probe.
 			retry, rerr := s.probeOnce(ctx, t, p, cfg, source)
-			if rerr != nil || retry == nil {
+			if rerr != nil || retry == nil || (retry.Verdict != VerdictPassed && retry.Verdict != VerdictFailed) {
 				verdict = VerdictUnavailable
-				detail = "复测不可用：" + errReason(rerr)
+				if retry != nil && retry.Detail != "" {
+					detail = "复测不可用：" + retry.Detail
+				} else {
+					detail = "复测不可用：" + errReason(rerr)
+				}
 				break
 			}
 			tokens += retry.Tokens
@@ -328,7 +532,6 @@ func (s *Service) runRound(ctx context.Context, t *Target, cfg GuardConfig, sour
 		verdict = VerdictUnavailable
 		detail = "目标未配置自动判分题目"
 	}
-	now := time.Now().UTC()
 	final := &Result{
 		ID:        randomHex(8),
 		Model:     t.Model,
@@ -352,7 +555,7 @@ func (s *Service) runRound(ctx context.Context, t *Target, cfg GuardConfig, sour
 }
 
 // applyRoundResult updates the target state machine and publishes the gate.
-func (s *Service) applyRoundResult(t *Target, verdict, detail string, cfg GuardConfig, now time.Time) {
+func (s *Service) applyRoundResult(t *Target, verdict, detail string, cfg GuardConfig, now time.Time, failedPromptID ...string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	latest, err := s.store.Target(t.Model)
@@ -363,28 +566,95 @@ func (s *Service) applyRoundResult(t *Target, verdict, detail string, cfg GuardC
 	if latest == nil {
 		return // A completed probe must not recreate a deleted target.
 	}
+
+	currentCfg, err := s.store.LoadConfig()
+	if err != nil {
+		s.health = err.Error()
+		return
+	}
+
+	startMode := EffectiveScheduleMode(t.ScheduleMode, cfg.ScheduleMode)
+	currentMode := EffectiveScheduleMode(latest.ScheduleMode, currentCfg.ScheduleMode)
+
+	if startMode != currentMode {
+		// Mode changed while probe was in flight! Discard state writeback to avoid
+		// applying mismatched mode transitions (e.g. single error in staged being treated as fixed).
+		// Still record CheckedAt so target reflects recent probe activity without corrupting stage/state.
+		latest.CheckedAt = now
+		if err := s.store.SaveTarget(latest); err != nil {
+			s.health = err.Error()
+		}
+		return
+	}
+
 	nt := *latest
 	nt.CheckedAt = now
 	nt.Reason = detail
-	switch verdict {
-	case VerdictPassed:
-		nt.State = StatePassed
-		nt.FailStreak = 0
-		nt.NextCheckAt = now.Add(time.Duration(nt.IntervalMin) * time.Minute)
-	case VerdictFailed:
-		nt.State = StateFailed
-		nt.FailStreak++
-		wait := nt.FailRecheckMin
-		if wait <= 0 {
-			wait = 60 // default failed recheck: 1 hour
+
+	if currentMode == ScheduleModeStaged {
+		failedID := ""
+		if len(failedPromptID) > 0 {
+			failedID = failedPromptID[0]
 		}
-		nt.NextCheckAt = now.Add(time.Duration(wait) * time.Minute)
-	case VerdictUnavailable:
-		nt.State = StateUnavailable
-		nt.NextCheckAt = now.Add(time.Duration(cfg.CoolMin) * time.Minute)
-	default:
-		return
+		policy := ResolveTimingPolicy(nt.TimingPolicy, currentCfg.TimingPolicy)
+		out := ApplyStagedTransition(StagedTransitionInput{
+			CurrentStage:      nt.ScheduleStage,
+			CurrentState:      nt.State,
+			FailStreak:        nt.FailStreak,
+			RecoveryPasses:    nt.RecoveryPasses,
+			IsolationRechecks: nt.IsolationRechecks,
+			RetryPromptID:     nt.RetryPromptID,
+			FailedPromptID:    failedID,
+			Verdict:           verdict,
+			Detail:            detail,
+			Policy:            policy,
+			Now:               now,
+		})
+		nt.ScheduleStage = out.NextStage
+		nt.State = out.NextState
+		nt.FailStreak = out.FailStreak
+		nt.RecoveryPasses = out.RecoveryPasses
+		nt.IsolationRechecks = out.IsolationRechecks
+		nt.RetryPromptID = out.RetryPromptID
+		nt.NextCheckAt = out.NextCheckAt
+		// Concurrent user edit / manual hold takes priority!
+		nt.ManualHold = latest.ManualHold
+		nt.AllowUntil = latest.AllowUntil
+	} else {
+		nt.ScheduleStage = DefaultStageForState(nt.State)
+		nt.RecoveryPasses = 0
+		nt.IsolationRechecks = 0
+		nt.RetryPromptID = ""
+		switch verdict {
+		case VerdictPassed:
+			nt.State = StatePassed
+			nt.FailStreak = 0
+			nt.ScheduleStage = ScheduleStageNormal
+			nt.NextCheckAt = now.Add(time.Duration(nt.IntervalMin) * time.Minute)
+		case VerdictFailed:
+			nt.State = StateFailed
+			nt.FailStreak++
+			nt.ScheduleStage = ScheduleStageIsolated
+			wait := nt.FailRecheckMin
+			if wait <= 0 {
+				wait = 60 // default failed recheck: 1 hour
+			}
+			nt.NextCheckAt = now.Add(time.Duration(wait) * time.Minute)
+		case VerdictUnavailable:
+			nt.State = StateUnavailable
+			nt.ScheduleStage = ScheduleStageUnavailable
+			cool := currentCfg.CoolMin
+			if cool <= 0 {
+				cool = 15
+			}
+			nt.NextCheckAt = now.Add(time.Duration(cool) * time.Minute)
+		default:
+			return
+		}
+		nt.ManualHold = latest.ManualHold
+		nt.AllowUntil = latest.AllowUntil
 	}
+
 	if err := s.store.SaveTarget(&nt); err != nil {
 		s.health = err.Error()
 		return
@@ -475,31 +745,95 @@ func (s *Service) Snapshot() (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.mu.Lock()
+	routing := s.routing
+	s.mu.Unlock()
 	return map[string]any{
 		"config":  cfg,
 		"targets": targets,
 		"prompts": prompts,
 		"health":  s.Health(),
+		"routing": routing,
 	}, nil
+}
+
+// targetIntervalMin calculates the scheduled interval in minutes.
+func (s *Service) targetIntervalMin(t *Target, cfg GuardConfig) int {
+	mode := EffectiveScheduleMode(t.ScheduleMode, cfg.ScheduleMode)
+	if mode == ScheduleModeStaged {
+		policy := ResolveTimingPolicy(t.TimingPolicy, cfg.TimingPolicy)
+		stage := t.ScheduleStage
+		if stage == "" {
+			stage = DefaultStageForState(t.State)
+		}
+		switch stage {
+		case ScheduleStageNormal:
+			return policy.NormalMin
+		case ScheduleStageRetry:
+			return policy.ErrorRetryMin
+		case ScheduleStageIsolated:
+			if t.IsolationRechecks > 0 {
+				return policy.IsolationLaterMin
+			}
+			return policy.IsolationFirstMin
+		case ScheduleStageRecovery:
+			return policy.RecoveryConfirmMin
+		case ScheduleStageUnavailable:
+			return policy.UnavailableMin
+		default:
+			return policy.NormalMin
+		}
+	}
+	switch t.State {
+	case StateFailed:
+		if t.FailRecheckMin > 0 {
+			return t.FailRecheckMin
+		}
+		return 60
+	case StateUnavailable:
+		if cfg.CoolMin > 0 {
+			return cfg.CoolMin
+		}
+		return 15
+	default:
+		if t.IntervalMin > 0 {
+			return t.IntervalMin
+		}
+		if cfg.DefaultIntervalMin > 0 {
+			return cfg.DefaultIntervalMin
+		}
+		return 30
+	}
 }
 
 // UpsertTarget validates and saves a target, then publishes the gate.
 func (s *Service) UpsertTarget(t *Target) error {
+	return s.UpsertTargetOpt(t, false)
+}
+
+// UpsertTargetOpt validates and saves a target with optional recalculation of schedule.
+func (s *Service) UpsertTargetOpt(t *Target, recalculate bool) error {
 	t.Model = strings.TrimSpace(t.Model)
 	if t.Model == "" || len(t.Model) > 512 || strings.ContainsAny(t.Model, "\r\n") || strings.HasPrefix(t.Model, ProbeAliasPrefix) {
 		return errors.New("无效模型 ID")
 	}
+	if err := ValidateScheduleMode(t.ScheduleMode, true); err != nil {
+		return err
+	}
+	if err := ValidateTargetTimingPolicy(t.TimingPolicy); err != nil {
+		return err
+	}
 	if t.IntervalMin <= 0 {
 		t.IntervalMin = 30
 	}
-	if t.IntervalMin > 10080 {
-		t.IntervalMin = 10080
+	if t.IntervalMin > MaxScheduleMin {
+		t.IntervalMin = MaxScheduleMin
 	}
 	if t.FailRecheckMin < 0 {
 		t.FailRecheckMin = 0
 	}
-	if t.FailRecheckMin > 10080 {
-		t.FailRecheckMin = 10080
+	if t.FailRecheckMin > MaxScheduleMin {
+		t.FailRecheckMin = MaxScheduleMin
 	}
 	for _, id := range t.PromptIDs {
 		if strings.ContainsAny(id, "\r\n") || len(id) > 128 {
@@ -508,25 +842,80 @@ func (s *Service) UpsertTarget(t *Target) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	cfg, err := s.store.LoadConfig()
+	if err != nil {
+		return err
+	}
 	existing, err := s.store.Target(t.Model)
 	if err != nil {
 		return err
 	}
 	if existing != nil {
-		// preserve runtime state on re-save
-		t.State = existing.State
-		t.CheckedAt = existing.CheckedAt
-		t.AllowUntil = existing.AllowUntil
-		t.FailStreak = existing.FailStreak
-		t.NextCheckAt = existing.NextCheckAt
-		t.ManualHold = existing.ManualHold
-		t.Reason = existing.Reason
-		if t.State == StateUnknown && existing.State != "" {
+		oldMode := EffectiveScheduleMode(existing.ScheduleMode, cfg.ScheduleMode)
+		newMode := EffectiveScheduleMode(t.ScheduleMode, cfg.ScheduleMode)
+		if oldMode != newMode {
+			// Mode switch resets counters but cannot release existing block
+			t.FailStreak = 0
+			t.RecoveryPasses = 0
+			t.IsolationRechecks = 0
+			t.RetryPromptID = ""
+			t.ManualHold = existing.ManualHold
+			t.AllowUntil = existing.AllowUntil
+			t.CheckedAt = existing.CheckedAt
+			t.Reason = existing.Reason
 			t.State = existing.State
+			if newMode == ScheduleModeStaged {
+				if existing.State == StateFailed || existing.State == StateReview {
+					t.ScheduleStage = ScheduleStageIsolated
+				} else if existing.State == StateUnavailable {
+					t.ScheduleStage = ScheduleStageUnavailable
+				} else {
+					t.ScheduleStage = ScheduleStageNormal
+				}
+			} else {
+				t.ScheduleStage = DefaultStageForState(existing.State)
+			}
+		} else {
+			// preserve runtime state on re-save
+			t.State = existing.State
+			t.CheckedAt = existing.CheckedAt
+			t.AllowUntil = existing.AllowUntil
+			t.FailStreak = existing.FailStreak
+			t.ManualHold = existing.ManualHold
+			t.Reason = existing.Reason
+			t.ScheduleStage = existing.ScheduleStage
+			t.RecoveryPasses = existing.RecoveryPasses
+			t.IsolationRechecks = existing.IsolationRechecks
+			t.RetryPromptID = existing.RetryPromptID
+			if t.ScheduleStage == "" {
+				t.ScheduleStage = DefaultStageForState(t.State)
+			}
 		}
-	} else if t.State == "" {
-		t.State = StateUnknown
-		t.NextCheckAt = time.Now().UTC()
+		if !recalculate {
+			t.NextCheckAt = existing.NextCheckAt
+		} else {
+			if _, busy := s.running[t.Model]; busy {
+				t.NextCheckAt = existing.NextCheckAt
+			} else {
+				interval := s.targetIntervalMin(t, cfg)
+				t.NextCheckAt = time.Now().UTC().Add(time.Duration(interval) * time.Minute)
+			}
+		}
+	} else {
+		if t.State == "" {
+			t.State = StateUnknown
+		}
+		if t.ScheduleStage == "" {
+			t.ScheduleStage = DefaultStageForState(t.State)
+		}
+		if t.NextCheckAt.IsZero() {
+			t.NextCheckAt = time.Now().UTC()
+		} else if recalculate {
+			if _, busy := s.running[t.Model]; !busy {
+				interval := s.targetIntervalMin(t, cfg)
+				t.NextCheckAt = time.Now().UTC().Add(time.Duration(interval) * time.Minute)
+			}
+		}
 	}
 	if err := s.store.SaveTarget(t); err != nil {
 		return err
@@ -564,6 +953,10 @@ func (s *Service) TargetAction(model, action string) error {
 		t.Reason = ""
 		t.FailStreak = 0
 		t.AllowUntil = time.Time{}
+		t.ScheduleStage = ScheduleStageNormal
+		t.RecoveryPasses = 0
+		t.IsolationRechecks = 0
+		t.RetryPromptID = ""
 	case "monitor-off":
 		t.Enabled = false
 	case "monitor-on":
@@ -597,6 +990,11 @@ func (s *Service) TargetAction(model, action string) error {
 // Configure validates and saves gateway config. Zero-valued fields keep the
 // saved value so partial updates from the console stay valid.
 func (s *Service) Configure(c GuardConfig) error {
+	return s.ConfigureOpt(c, false)
+}
+
+// ConfigureOpt validates and saves config with optional schedule recalculation.
+func (s *Service) ConfigureOpt(c GuardConfig, recalculate bool) error {
 	old, _ := s.store.LoadConfig()
 	if c.GatewayKey == "" {
 		c.GatewayKey = old.GatewayKey
@@ -613,17 +1011,35 @@ func (s *Service) Configure(c GuardConfig) error {
 	if c.DefaultIntervalMin == 0 {
 		c.DefaultIntervalMin = old.DefaultIntervalMin
 	}
+	if c.ScheduleMode == "" {
+		c.ScheduleMode = old.ScheduleMode
+	}
+	if c.ScheduleMode == "" {
+		c.ScheduleMode = ScheduleModeFixed
+	}
+	if err := ValidateScheduleMode(c.ScheduleMode, false); err != nil {
+		return err
+	}
+	// Validate explicitly provided non-zero timing values BEFORE merging,
+	// so out-of-range/negative values are rejected rather than silently replaced.
+	if err := ValidateTargetTimingPolicy(&c.TimingPolicy); err != nil {
+		return err
+	}
+	c.TimingPolicy = ResolveTimingPolicy(&c.TimingPolicy, old.TimingPolicy)
+	if err := ValidateGlobalTimingPolicy(c.TimingPolicy); err != nil {
+		return err
+	}
 	if c.DailyLimit < 1 || c.DailyLimit > 10000 {
 		return errors.New("每日预算须为 1–10000 次")
 	}
 	if c.TimeoutSec < 10 || c.TimeoutSec > 600 {
 		return errors.New("单次超时须为 10–600 秒")
 	}
-	if c.CoolMin < 1 || c.CoolMin > 1440 {
-		return errors.New("冷却时间须为 1–1440 分钟")
+	if c.CoolMin < 1 || c.CoolMin > MaxScheduleMin {
+		return fmt.Errorf("冷却时间须为 1–%d 分钟", MaxScheduleMin)
 	}
-	if c.DefaultIntervalMin < 5 || c.DefaultIntervalMin > 10080 {
-		return errors.New("默认检测间隔须为 5–10080 分钟")
+	if c.DefaultIntervalMin < 1 || c.DefaultIntervalMin > MaxScheduleMin {
+		return fmt.Errorf("默认检测间隔须为 1–%d 分钟", MaxScheduleMin)
 	}
 	if err := ValidateGateway(c.GatewayURL); err != nil {
 		return err
@@ -631,7 +1047,51 @@ func (s *Service) Configure(c GuardConfig) error {
 	if c.GatewayKey == "" {
 		return errors.New("请输入网关 Key；本机默认 Key 为 magpie")
 	}
-	return s.store.SaveConfig(c)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.store.SaveConfig(c); err != nil {
+		return err
+	}
+	targets, err := s.store.Targets()
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for _, tgt := range targets {
+		oldMode := EffectiveScheduleMode(tgt.ScheduleMode, old.ScheduleMode)
+		newMode := EffectiveScheduleMode(tgt.ScheduleMode, c.ScheduleMode)
+		modeChanged := oldMode != newMode
+		if modeChanged {
+			// Mode switch always resets counters/stage, preserving block and NextCheckAt.
+			tgt.FailStreak = 0
+			tgt.RecoveryPasses = 0
+			tgt.IsolationRechecks = 0
+			tgt.RetryPromptID = ""
+			if newMode == ScheduleModeStaged {
+				if tgt.State == StateFailed || tgt.State == StateReview {
+					tgt.ScheduleStage = ScheduleStageIsolated
+				} else if tgt.State == StateUnavailable {
+					tgt.ScheduleStage = ScheduleStageUnavailable
+				} else {
+					tgt.ScheduleStage = ScheduleStageNormal
+				}
+			} else {
+				tgt.ScheduleStage = DefaultStageForState(tgt.State)
+			}
+		}
+		_, busy := s.running[tgt.Model]
+		rescheduled := recalculate && !busy
+		if rescheduled {
+			interval := s.targetIntervalMin(tgt, c)
+			tgt.NextCheckAt = now.Add(time.Duration(interval) * time.Minute)
+		}
+		if modeChanged || rescheduled {
+			if err := s.store.SaveTarget(tgt); err != nil {
+				return err
+			}
+		}
+	}
+	return s.publishGate()
 }
 
 // ConfigureInitial only fills config when empty (auto-discovery).

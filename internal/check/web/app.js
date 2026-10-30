@@ -25,6 +25,37 @@
     regex: "正则匹配"
   };
 
+  var defaultTimingPolicy = {
+    normal_min: 30,
+    error_retry_min: 2,
+    isolation_first_min: 360,
+    isolation_later_min: 1440,
+    recovery_confirm_min: 2,
+    unavailable_min: 30
+  };
+
+  function parseTimingPolicy(getVal) {
+    var fields = [
+      { key: "normal_min", id: "normal", label: "正常间隔" },
+      { key: "error_retry_min", id: "retry", label: "错误重试" },
+      { key: "isolation_first_min", id: "iso-first", label: "首次隔离" },
+      { key: "isolation_later_min", id: "iso-later", label: "后续隔离" },
+      { key: "recovery_confirm_min", id: "rec-confirm", label: "恢复确认" },
+      { key: "unavailable_min", id: "unavail", label: "不可用冷却" }
+    ];
+    var res = {};
+    for (var i = 0; i < fields.length; i++) {
+      var f = fields[i];
+      var raw = getVal(f);
+      var val = Number(raw);
+      if (!Number.isInteger(val) || val < 1 || val > 43200) {
+        throw new Error(f.label + "必须为 1 到 43200 之间的整数分钟");
+      }
+      res[f.key] = val;
+    }
+    return res;
+  }
+
   (function readToken() {
     var m = location.hash.match(/token=([A-Za-z0-9]+)/);
     if (m) token = m[1];
@@ -99,7 +130,7 @@
   function updateOverview() {
     var targets = state.targets || [];
     var totalEnabled = targets.filter(function (t) { return t.enabled; }).length;
-    var passedCount = targets.filter(function (t) { return t.enabled && !isBlocked(t) && t.state === "passed"; }).length;
+    var passedCount = targets.filter(function (t) { return t.enabled && !isBlocked(t) && t.state === "passed" && t.schedule_stage !== "retry"; }).length;
     var blockedCount = targets.filter(function (t) { return isBlocked(t); }).length;
     var unavailCount = targets.filter(function (t) { return t.enabled && t.state === "unavailable"; }).length;
 
@@ -148,6 +179,15 @@
       }
     }
 
+    var routingEl = document.getElementById("routing-status");
+    if (routingEl) {
+      var routing = state.routing || {};
+      routingEl.classList.toggle("routing-error", !!routing.error);
+      routingEl.textContent = routing.error ? routing.error + "；直连门禁仍生效，请先处理路由组配置冲突。" :
+        routing.enabled ? "路由组同步已启用 · 当前管理 " + (routing.managed_groups || 0) + " 个组 · 禁用成员退出业务路由，检测探针保持可用。" :
+        "路由组同步未启用：当前仅对完整模型 ID 的直接请求执行门禁。";
+    }
+
     var healthy = !state.health;
     setConnectionStatus(healthy ? "online" : "warning", healthy ? "后台连接正常" : "后台需要检查");
   }
@@ -185,6 +225,7 @@
       state.targets = snap.targets || [];
       state.prompts = snap.prompts || [];
       state.health = snap.health || "";
+      state.routing = snap.routing || {};
       renderTargets();
       renderPrompts();
       renderSettings();
@@ -194,6 +235,44 @@
     }).catch(function (e) {
       toast("加载状态失败：" + e.message);
     });
+  }
+
+  function getPolicyHtml(t) {
+    var globalMode = (state.config && state.config.schedule_mode) || "fixed";
+    var mode = t.schedule_mode;
+    var isInherit = !mode;
+    var effMode = isInherit ? globalMode : mode;
+    var policyBadgeClass = effMode === "staged" ? "policy-staged" : "policy-fixed";
+    var policyLabel = effMode === "staged" ? "阶梯" : "固定";
+    var inheritHtml = isInherit ? "<span class='policy-sub' title='继承全局配置 (" + esc(globalMode === "staged" ? "阶梯" : "固定") + ")'>继承</span>" : "";
+    var customHtml = t.timing_policy ? "<span class='badge-custom' title='自定义 6 项间隔'>覆盖</span>" : "";
+    return "<div class='policy-cell'><span class='policy-badge " + policyBadgeClass + "'>" + esc(policyLabel) + "</span>" + inheritHtml + customHtml + "</div>";
+  }
+
+  function getStageBadge(t, effMode) {
+    var stage = t.schedule_stage;
+    var streak = t.fail_streak || 1;
+    var rechecks = t.isolation_rechecks || 0;
+
+    if (stage === "recovery") {
+      // The first recovery pass must keep production traffic blocked.
+      return "<span class='stage-badge stage-recovery' title='首测通过保持阻断，按设定的恢复确认间隔复测，第 2 次连续通过才恢复'><i></i>确认中(1/2过·阻断)</span>";
+    } else if (stage === "retry") {
+      return "<span class='stage-badge stage-retry' title='快速复测原失败题中，满 3 轮才阻断隔离（当前第 " + esc(streak) + " 次）'><i></i>重试中(" + esc(streak) + "/3)</span>";
+    } else if (stage === "isolated") {
+      var isoTitle = rechecks > 0 ? ("再次失败延长隔离期（" + rechecks + "次续期）") : "首次隔离冷冻期，等待期满复测原失败题";
+      var isoLabel = rechecks > 0 ? "已隔离(续期)" : "已隔离";
+      return "<span class='stage-badge stage-isolated' title='" + esc(isoTitle) + "'><i></i>" + esc(isoLabel) + "</span>";
+    } else if (stage === "unavailable") {
+      return "<span class='stage-badge stage-unavailable' title='接口不可用，冷却中'><i></i>不可用冷冻</span>";
+    } else if (stage === "normal") {
+      return "<span class='stage-badge stage-normal' title='按正常周期等待检测'><i></i>正常</span>";
+    }
+
+    if (effMode === "staged") {
+      return "<span class='stage-badge stage-normal' title='分阶段常规探测'><i></i>正常</span>";
+    }
+    return "<span class='stage-badge stage-fixed' title='固定间隔模式'>固定</span>";
   }
 
   function renderTargets() {
@@ -215,11 +294,24 @@
       }
 
       var stateLabel = stateName[t.state] || t.state;
-      var stateHtml = "<span class='status-badge status-" + esc(t.state) + "'><i></i>" + esc(stateLabel) + "</span>";
+      var stateBadgeClass = "status-" + esc(t.state);
+      if (t.schedule_stage === "recovery") {
+        // A recovery confirmation has not released the model yet.
+        stateLabel = "首测通过(待二次确认)";
+        stateBadgeClass = "status-recovery-pending";
+      } else if (t.schedule_stage === "retry") {
+        stateLabel = "答错，等待复测";
+        stateBadgeClass = "status-recovery-pending";
+      }
+      var stateHtml = "<span class='status-badge " + stateBadgeClass + "'><i></i>" + esc(stateLabel) + "</span>";
       if (!t.enabled) {
         // Contract: "暂停检测不显示解封"
         stateHtml += "<span class='badge-paused' title='自动探针检测已暂停'>已暂停检测</span>";
       }
+
+      var effMode = t.schedule_mode || (state.config && state.config.schedule_mode) || "fixed";
+      var policyHtml = getPolicyHtml(t);
+      var stageHtml = getStageBadge(t, effMode);
 
       // Action buttons: clear distinction between disabling model and pausing detection
       var ops = [];
@@ -233,23 +325,28 @@
         ops.push("<button class='btn-action btn-allow' data-model='" + esc(t.model) + "' data-action='allow' title='临时放行业务请求 15 分钟'>放行 15 分</button>");
       }
 
-      // 2. Monitoring schedule control (monitor-off / monitor-on)
+      // 2. Policy edit button
+      ops.push("<button class='btn-action btn-policy' data-model='" + esc(t.model) + "' data-action='policy' title='编辑该模型的调度策略与检测间隔'>策略</button>");
+
+      // 3. Monitoring schedule control (monitor-off / monitor-on)
       if (t.enabled) {
         ops.push("<button class='btn-action btn-monitor-off' data-model='" + esc(t.model) + "' data-action='monitor-off' title='暂停该模型的自动定时检测（不会解封）'>暂停检测</button>");
       } else {
         ops.push("<button class='btn-action btn-monitor-on' data-model='" + esc(t.model) + "' data-action='monitor-on' title='恢复该模型的自动定时检测'>恢复检测</button>");
       }
 
-      // 3. Immediate recheck
+      // 4. Immediate recheck
       ops.push("<button class='btn-action primary-mini' data-model='" + esc(t.model) + "' data-action='recheck' title='立即触发一次探针检测'>重测</button>");
 
-      // 4. Delete target
+      // 5. Delete target
       ops.push("<button class='btn-action danger-button' data-model='" + esc(t.model) + "' data-action='delete' title='删除该监测目标'>删除</button>");
 
       return "<tr>" +
         "<td><div class='model-cell'><span class='model-dot'></span><strong title='" + esc(t.model) + "'>" + esc(t.model) + "</strong></div></td>" +
         "<td>" + gateBadge + "</td>" +
         "<td>" + stateHtml + "</td>" +
+        "<td>" + policyHtml + "</td>" +
+        "<td>" + stageHtml + "</td>" +
         "<td class='time-cell'>" + fmtTime(t.checked_at) + "</td>" +
         "<td class='time-cell'>" + fmtTime(t.next_check_at) + "</td>" +
         "<td class='reason' title='" + esc(t.reason || "") + "'>" + esc(t.reason || "—") + "</td>" +
@@ -265,6 +362,10 @@
     tbody.querySelectorAll("button[data-action]").forEach(function (btn) {
       btn.addEventListener("click", function () {
         var model = btn.dataset.model, action = btn.dataset.action;
+        if (action === "policy") {
+          openTargetPolicyDialog(model);
+          return;
+        }
         if (action === "delete") {
           if (!confirm("删除对 " + model + " 的监测？门禁将不再拦截该模型。")) return;
           api("POST", "/api/targets/delete", { model: model }).then(function () {
@@ -485,6 +586,14 @@
     });
   }
 
+  var newCustomTpToggle = document.getElementById("new-enable-custom-tp");
+  if (newCustomTpToggle) {
+    newCustomTpToggle.addEventListener("change", function () {
+      var wrap = document.getElementById("new-tp-fields");
+      if (wrap) wrap.classList.toggle("hidden", !newCustomTpToggle.checked);
+    });
+  }
+
   // Add selected models to monitoring plan
   var addTargetBtn = document.getElementById("add-target");
   if (addTargetBtn) {
@@ -498,6 +607,20 @@
       }
       var interval = parseInt(document.getElementById("new-interval").value, 10) || 30;
       var failwait = parseInt(document.getElementById("new-failwait").value, 10) || 0;
+      var scheduleMode = document.getElementById("new-schedule-mode").value;
+      var isCustomTp = document.getElementById("new-enable-custom-tp").checked;
+      var timingPolicy = null;
+      if (isCustomTp) {
+        try {
+          timingPolicy = parseTimingPolicy(function (f) {
+            return document.getElementById("new-tp-" + f.id).value;
+          });
+        } catch (err) {
+          toast(err.message);
+          return;
+        }
+      }
+
       var done = 0;
       var errors = [];
       addTargetBtn.disabled = true;
@@ -508,6 +631,8 @@
           enabled: true,
           interval_min: interval,
           fail_recheck_min: failwait,
+          schedule_mode: scheduleMode,
+          timing_policy: timingPolicy,
           prompt_ids: [],
           state: "unknown"
         }).then(function () {
@@ -527,6 +652,169 @@
         loadState();
       }).then(function () {
         addTargetBtn.disabled = false;
+      });
+    });
+  }
+
+  // ---- Target Policy Dialog ----
+  var targetPolicyDialog = document.getElementById("target-policy-dialog");
+  var targetPolicyForm = document.getElementById("target-policy-form");
+
+  function openTargetPolicyDialog(model) {
+    if (!targetPolicyDialog) return;
+    lastFocusedElement = document.activeElement;
+
+    var t = (state.targets || []).find(function (item) { return item.model === model; });
+    if (!t) {
+      toast("未找到目标：" + model);
+      return;
+    }
+
+    document.getElementById("tpf-model").value = t.model;
+    document.getElementById("tpf-model-name").textContent = t.model;
+
+    var effMode = t.schedule_mode || (state.config && state.config.schedule_mode) || "fixed";
+    var stageEl = document.getElementById("tpf-current-stage");
+    if (stageEl) {
+      stageEl.innerHTML = getStageBadge(t, effMode);
+    }
+
+    document.getElementById("tpf-schedule-mode").value = t.schedule_mode || "";
+    document.getElementById("tpf-interval").value = t.interval_min || 30;
+    document.getElementById("tpf-failwait").value = t.fail_recheck_min != null ? t.fail_recheck_min : 0;
+    document.getElementById("tpf-recalculate-schedule").checked = false;
+
+    var overrideToggle = document.getElementById("tpf-override-toggle");
+    var fieldsWrap = document.getElementById("tpf-tp-fields");
+    var hasCustom = !!t.timing_policy;
+    if (overrideToggle) overrideToggle.checked = hasCustom;
+    if (fieldsWrap) fieldsWrap.classList.toggle("hidden", !hasCustom);
+
+    var tp = t.timing_policy || (state.config && state.config.timing_policy) || defaultTimingPolicy;
+    document.getElementById("tpf-tp-normal").value = tp.normal_min != null ? tp.normal_min : 30;
+    document.getElementById("tpf-tp-retry").value = tp.error_retry_min != null ? tp.error_retry_min : 2;
+    document.getElementById("tpf-tp-iso-first").value = tp.isolation_first_min != null ? tp.isolation_first_min : 360;
+    document.getElementById("tpf-tp-iso-later").value = tp.isolation_later_min != null ? tp.isolation_later_min : 1440;
+    document.getElementById("tpf-tp-rec-confirm").value = tp.recovery_confirm_min != null ? tp.recovery_confirm_min : 2;
+    document.getElementById("tpf-tp-unavail").value = tp.unavailable_min != null ? tp.unavailable_min : 30;
+
+    if (typeof targetPolicyDialog.showModal === "function") {
+      targetPolicyDialog.showModal();
+    } else {
+      targetPolicyDialog.classList.remove("hidden");
+    }
+  }
+
+  function closeTargetPolicyDialog() {
+    if (!targetPolicyDialog) return;
+    if (typeof targetPolicyDialog.close === "function" && targetPolicyDialog.open) {
+      targetPolicyDialog.close();
+    } else {
+      targetPolicyDialog.classList.add("hidden");
+    }
+    if (lastFocusedElement && typeof lastFocusedElement.focus === "function") {
+      lastFocusedElement.focus();
+    }
+  }
+
+  var tpfToggle = document.getElementById("tpf-override-toggle");
+  if (tpfToggle) {
+    tpfToggle.addEventListener("change", function () {
+      var wrap = document.getElementById("tpf-tp-fields");
+      if (wrap) wrap.classList.toggle("hidden", !tpfToggle.checked);
+    });
+  }
+
+  var tpfPresetBtn = document.getElementById("tpf-btn-preset-codex");
+  if (tpfPresetBtn) {
+    tpfPresetBtn.addEventListener("click", function () {
+      var tpfToggle = document.getElementById("tpf-override-toggle");
+      if (tpfToggle) {
+        tpfToggle.checked = true;
+        var wrap = document.getElementById("tpf-tp-fields");
+        if (wrap) wrap.classList.remove("hidden");
+      }
+      document.getElementById("tpf-tp-normal").value = 30;
+      document.getElementById("tpf-tp-retry").value = 2;
+      document.getElementById("tpf-tp-iso-first").value = 360;
+      document.getElementById("tpf-tp-iso-later").value = 1440;
+      document.getElementById("tpf-tp-rec-confirm").value = 2;
+      document.getElementById("tpf-tp-unavail").value = 30;
+      toast("已填入 codex-guard 推荐预设");
+    });
+  }
+
+  var tpfCloseBtn = document.getElementById("tpf-close");
+  if (tpfCloseBtn) tpfCloseBtn.addEventListener("click", closeTargetPolicyDialog);
+  var tpfCancelBtn = document.getElementById("tpf-cancel");
+  if (tpfCancelBtn) tpfCancelBtn.addEventListener("click", closeTargetPolicyDialog);
+
+  if (targetPolicyDialog) {
+    targetPolicyDialog.addEventListener("click", function (ev) {
+      if (ev.target === targetPolicyDialog) closeTargetPolicyDialog();
+    });
+    targetPolicyDialog.addEventListener("cancel", function (ev) {
+      ev.preventDefault();
+      closeTargetPolicyDialog();
+    });
+  }
+
+  if (targetPolicyForm) {
+    targetPolicyForm.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var model = document.getElementById("tpf-model").value;
+      var t = (state.targets || []).find(function (item) { return item.model === model; });
+      if (!t) { toast("目标不存在"); return; }
+
+      var intervalMin = Number(document.getElementById("tpf-interval").value);
+      if (!Number.isInteger(intervalMin) || intervalMin < 1 || intervalMin > 43200) {
+        toast("常规间隔必须为 1 到 43200 之间的整数分钟");
+        return;
+      }
+      var failRecheckMin = Number(document.getElementById("tpf-failwait").value);
+      if (!Number.isInteger(failRecheckMin) || failRecheckMin < 0 || failRecheckMin > 43200) {
+        toast("失败复检必须为 0 到 43200 之间的整数分钟");
+        return;
+      }
+
+      var scheduleMode = document.getElementById("tpf-schedule-mode").value;
+      var recalc = document.getElementById("tpf-recalculate-schedule").checked;
+
+      var timingPolicy = null;
+      var isOverride = document.getElementById("tpf-override-toggle").checked;
+      if (isOverride) {
+        try {
+          timingPolicy = parseTimingPolicy(function (f) {
+            return document.getElementById("tpf-tp-" + f.id).value;
+          });
+        } catch (err) {
+          toast(err.message);
+          return;
+        }
+      }
+
+      var payload = {
+        model: t.model,
+        enabled: t.enabled,
+        prompt_ids: t.prompt_ids || [],
+        interval_min: intervalMin,
+        fail_recheck_min: failRecheckMin,
+        schedule_mode: scheduleMode,
+        timing_policy: timingPolicy,
+        recalculate_schedule: recalc
+      };
+
+      var submitBtn = document.getElementById("tpf-submit");
+      if (submitBtn) submitBtn.disabled = true;
+
+      api("POST", "/api/targets", payload).then(function () {
+        closeTargetPolicyDialog();
+        toast("已更新 " + model + " 的调度策略");
+        loadState();
+      }).catch(function (e) {
+        toast("保存策略失败：" + e.message);
+      }).then(function () {
+        if (submitBtn) submitBtn.disabled = false;
       });
     });
   }
@@ -812,10 +1100,15 @@
 
   // ---- settings & real verification ----
   // Protect uncommitted drafts from being overwritten by 15s polling
-  ["cfg-url", "cfg-key", "cfg-limit", "cfg-timeout", "cfg-cool"].forEach(function (id) {
+  [
+    "cfg-url", "cfg-key", "cfg-limit", "cfg-timeout", "cfg-cool",
+    "cfg-schedule-mode", "cfg-recalculate-schedule",
+    "cfg-tp-normal", "cfg-tp-retry", "cfg-tp-iso-first", "cfg-tp-iso-later", "cfg-tp-rec-confirm", "cfg-tp-unavail"
+  ].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) {
-      el.addEventListener("input", function () {
+      var evt = (el.type === "checkbox" || el.tagName === "SELECT") ? "change" : "input";
+      el.addEventListener(evt, function () {
         configDirty = true;
         var msgEl = document.getElementById("config-msg");
         if (msgEl && !msgEl.textContent) {
@@ -825,6 +1118,27 @@
       });
     }
   });
+
+  var cfgPresetBtn = document.getElementById("cfg-btn-preset-codex");
+  if (cfgPresetBtn) {
+    cfgPresetBtn.addEventListener("click", function () {
+      var modeEl = document.getElementById("cfg-schedule-mode");
+      if (modeEl) modeEl.value = "staged";
+      document.getElementById("cfg-tp-normal").value = 30;
+      document.getElementById("cfg-tp-retry").value = 2;
+      document.getElementById("cfg-tp-iso-first").value = 360;
+      document.getElementById("cfg-tp-iso-later").value = 1440;
+      document.getElementById("cfg-tp-rec-confirm").value = 2;
+      document.getElementById("cfg-tp-unavail").value = 30;
+      configDirty = true;
+      var msgEl = document.getElementById("config-msg");
+      if (msgEl) {
+        msgEl.textContent = "已填入 codex-guard 阶梯推荐预设（3 错 2 过与 6 项间隔），请点击下方保存";
+        msgEl.className = "form-message is-warning";
+      }
+      toast("已填入 codex-guard 推荐预设参数");
+    });
+  }
 
   function renderSettings() {
     var c = state.config || {};
@@ -845,19 +1159,62 @@
     if (timeoutEl) timeoutEl.value = c.timeout_sec || 180;
     var coolEl = document.getElementById("cfg-cool");
     if (coolEl) coolEl.value = c.cool_min || 15;
+
+    var modeEl = document.getElementById("cfg-schedule-mode");
+    if (modeEl) modeEl.value = c.schedule_mode || "fixed";
+
+    var tp = c.timing_policy || defaultTimingPolicy;
+    var tpNormal = document.getElementById("cfg-tp-normal");
+    if (tpNormal) tpNormal.value = tp.normal_min != null ? tp.normal_min : 30;
+    var tpRetry = document.getElementById("cfg-tp-retry");
+    if (tpRetry) tpRetry.value = tp.error_retry_min != null ? tp.error_retry_min : 2;
+    var tpIsoFirst = document.getElementById("cfg-tp-iso-first");
+    if (tpIsoFirst) tpIsoFirst.value = tp.isolation_first_min != null ? tp.isolation_first_min : 360;
+    var tpIsoLater = document.getElementById("cfg-tp-iso-later");
+    if (tpIsoLater) tpIsoLater.value = tp.isolation_later_min != null ? tp.isolation_later_min : 1440;
+    var tpRecConfirm = document.getElementById("cfg-tp-rec-confirm");
+    if (tpRecConfirm) tpRecConfirm.value = tp.recovery_confirm_min != null ? tp.recovery_confirm_min : 2;
+    var tpUnavail = document.getElementById("cfg-tp-unavail");
+    if (tpUnavail) tpUnavail.value = tp.unavailable_min != null ? tp.unavailable_min : 30;
+
+    var recalcEl = document.getElementById("cfg-recalculate-schedule");
+    if (recalcEl) recalcEl.checked = false;
   }
 
   var saveConfigBtn = document.getElementById("save-config");
   if (saveConfigBtn) {
     saveConfigBtn.addEventListener("click", function () {
       var msgEl = document.getElementById("config-msg");
-      var c = {
+
+      var timingPolicy;
+      try {
+        timingPolicy = parseTimingPolicy(function (f) {
+          return document.getElementById("cfg-tp-" + f.id).value;
+        });
+      } catch (err) {
+        if (msgEl) {
+          msgEl.textContent = err.message;
+          msgEl.className = "form-message is-error";
+        }
+        toast(err.message);
+        return;
+      }
+
+      var recalcEl = document.getElementById("cfg-recalculate-schedule");
+      var recalc = recalcEl ? recalcEl.checked : false;
+
+      // Preserve all other config fields from state.config
+      var existingCfg = state.config || {};
+      var c = Object.assign({}, existingCfg, {
         gateway_url: document.getElementById("cfg-url").value.trim(),
         gateway_key: document.getElementById("cfg-key").value,
         daily_limit: parseInt(document.getElementById("cfg-limit").value, 10),
         timeout_sec: parseInt(document.getElementById("cfg-timeout").value, 10),
-        cool_min: parseInt(document.getElementById("cfg-cool").value, 10)
-      };
+        cool_min: parseInt(document.getElementById("cfg-cool").value, 10),
+        schedule_mode: document.getElementById("cfg-schedule-mode").value,
+        timing_policy: timingPolicy,
+        recalculate_schedule: recalc
+      });
 
       saveConfigBtn.disabled = true;
       if (msgEl) {
@@ -872,6 +1229,7 @@
           state.models = models || [];
           renderModelPicker();
           configDirty = false;
+          if (recalcEl) recalcEl.checked = false;
           if (msgEl) {
             msgEl.textContent = "✓ 配置已保存，网关连接验证成功（获取到 " + state.models.length + " 个模型）";
             msgEl.className = "form-message is-success";
@@ -880,6 +1238,7 @@
           loadState();
         }).catch(function (verifyErr) {
           configDirty = false;
+          if (recalcEl) recalcEl.checked = false;
           if (msgEl) {
             msgEl.textContent = "⚠ 配置已保存，但网关连接验证失败：" + verifyErr.message + "。请检查网关 URL 与 Key。";
             msgEl.className = "form-message is-warning";

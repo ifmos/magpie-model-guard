@@ -64,12 +64,16 @@ func (s *Service) apiModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) apiConfig(w http.ResponseWriter, r *http.Request) {
-	var c GuardConfig
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&c); err != nil {
+	var req struct {
+		GuardConfig
+		RecalculateSchedule bool `json:"recalculate_schedule"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
 		errJSON(w, 400, "请求体无效")
 		return
 	}
-	if err := s.Configure(c); err != nil {
+	recalc := req.RecalculateSchedule || r.URL.Query().Get("recalculate_schedule") == "true"
+	if err := s.ConfigureOpt(req.GuardConfig, recalc); err != nil {
 		errJSON(w, 400, err.Error())
 		return
 	}
@@ -78,12 +82,15 @@ func (s *Service) apiConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) apiConfigInitial(w http.ResponseWriter, r *http.Request) {
-	var c GuardConfig
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&c); err != nil {
+	var req struct {
+		GuardConfig
+		RecalculateSchedule bool `json:"recalculate_schedule"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
 		errJSON(w, 400, "请求体无效")
 		return
 	}
-	if err := s.ConfigureInitial(c); err != nil {
+	if err := s.ConfigureInitial(req.GuardConfig); err != nil {
 		errJSON(w, 400, err.Error())
 		return
 	}
@@ -100,16 +107,20 @@ func (s *Service) apiTargets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) apiTargetUpsert(w http.ResponseWriter, r *http.Request) {
-	var t Target
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&t); err != nil {
+	var req struct {
+		Target
+		RecalculateSchedule bool `json:"recalculate_schedule"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
 		errJSON(w, 400, "请求体无效")
 		return
 	}
-	if err := s.UpsertTarget(&t); err != nil {
+	recalc := req.RecalculateSchedule || r.URL.Query().Get("recalculate_schedule") == "true"
+	if err := s.UpsertTargetOpt(&req.Target, recalc); err != nil {
 		errJSON(w, 400, err.Error())
 		return
 	}
-	writeJSON(w, t)
+	writeJSON(w, req.Target)
 }
 
 func (s *Service) apiTargetDelete(w http.ResponseWriter, r *http.Request) {

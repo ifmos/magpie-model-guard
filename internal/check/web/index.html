@@ -23,7 +23,7 @@
     </nav>
     <div class="sidebar-footer">
       <div class="mini-status"><i id="sidebar-status-dot"></i><span id="sidebar-status">后台连接中</span></div>
-      <span class="version-label">MAGPIE PLUGIN · 0.1</span>
+      <span class="version-label">MAGPIE PLUGIN · 0.3.0</span>
     </div>
   </aside>
 
@@ -31,7 +31,7 @@
     <header class="topbar">
       <div>
         <div class="breadcrumb">MODEL GUARD <span>/</span> <strong id="current-section">监测目标</strong></div>
-        <p class="topbar-caption">持续验证模型表现，在异常发生前保护你的路由。</p>
+        <p class="topbar-caption">检测模型表现，隔离异常路由，保留恢复探针。</p>
       </div>
       <div class="topbar-actions">
         <span class="connection-pill"><i id="top-status-dot"></i><span id="top-status">正在连接</span></span>
@@ -49,6 +49,8 @@
           </div>
           <div class="intro-badge" id="scheduler-badge"><span class="pulse" id="scheduler-pulse"></span><span id="scheduler-badge-text">调度状态检测中...</span></div>
         </div>
+
+        <p id="routing-status" class="routing-status" role="status">正在读取路由组同步状态…</p>
 
         <div class="summary-grid" aria-label="监测摘要">
           <div class="summary-card"><span class="summary-label">监测中</span><strong id="stat-total">0</strong><small id="stat-total-desc">开启自动检测</small></div>
@@ -93,25 +95,165 @@
                 <div class="selected-summary"><span id="selected-count-badge">已选择 0 个模型</span> <button type="button" id="btn-clear-selected-tags" class="link-btn">清除全部</button></div>
               </div>
             </div>
-            <div class="form-row">
-              <div class="field"><label for="new-interval">检测间隔 <em>分钟</em></label><input id="new-interval" type="number" value="30" min="5" max="10080"></div>
-              <div class="field"><label for="new-failwait">失败复检 <em>分钟</em></label><input id="new-failwait" type="number" value="0" min="0" max="10080"></div>
+            <div class="field">
+              <label for="new-schedule-mode">调度模式</label>
+              <select id="new-schedule-mode">
+                <option value="">继承全局策略</option>
+                <option value="fixed">固定间隔模式</option>
+                <option value="staged">分阶段检测模式</option>
+              </select>
             </div>
+            <div class="form-row">
+              <div class="field"><label for="new-interval">常规间隔 <em>分钟</em></label><input id="new-interval" type="number" value="30" min="1" max="43200"></div>
+              <div class="field"><label for="new-failwait">失败复检 <em>分钟</em></label><input id="new-failwait" type="number" value="0" min="0" max="43200"></div>
+            </div>
+            <details class="policy-custom-details" id="new-custom-policy-details">
+              <summary class="policy-custom-summary">
+                <span>分阶段间隔覆盖 (可选)</span>
+                <small class="policy-custom-tag">默认继承全局</small>
+              </summary>
+              <div class="custom-policy-body">
+                <label class="check-row" style="margin-bottom:10px">
+                  <input type="checkbox" id="new-enable-custom-tp">
+                  <span>为所选模型单独覆盖 6 项分阶段间隔</span>
+                </label>
+                <div id="new-tp-fields" class="timing-policy-grid compact hidden">
+                  <div class="field">
+                    <label for="new-tp-normal">正常间隔 <em>分钟</em></label>
+                    <input id="new-tp-normal" type="number" min="1" max="43200" value="30">
+                  </div>
+                  <div class="field">
+                    <label for="new-tp-retry">错误重试 <em>分钟</em></label>
+                    <input id="new-tp-retry" type="number" min="1" max="43200" value="2">
+                  </div>
+                  <div class="field">
+                    <label for="new-tp-iso-first">首次隔离 <em>分钟</em></label>
+                    <input id="new-tp-iso-first" type="number" min="1" max="43200" value="360">
+                  </div>
+                  <div class="field">
+                    <label for="new-tp-iso-later">后续隔离 <em>分钟</em></label>
+                    <input id="new-tp-iso-later" type="number" min="1" max="43200" value="1440">
+                  </div>
+                  <div class="field">
+                    <label for="new-tp-rec-confirm">恢复确认 <em>分钟</em></label>
+                    <input id="new-tp-rec-confirm" type="number" min="1" max="43200" value="2">
+                  </div>
+                  <div class="field">
+                    <label for="new-tp-unavail">不可用冷却 <em>分钟</em></label>
+                    <input id="new-tp-unavail" type="number" min="1" max="43200" value="30">
+                  </div>
+                </div>
+              </div>
+            </details>
             <button id="add-target" class="primary-button full-button">添加到监测计划 <span>→</span></button>
-            <div class="helper-note"><span>i</span><span>支持选择多个模型批量添加。失败复检填 0 使用默认 60 分钟。</span></div>
+            <div class="helper-note"><span>i</span><span>支持批量添加。分阶段模式下，同题连续 3 轮答错后隔离，隔离后连续 2 次通过才恢复。</span></div>
           </section>
 
           <section class="panel table-panel">
             <div class="panel-heading table-heading"><div><span class="eyebrow">ACTIVE TARGETS</span><h2>当前监测计划</h2></div><span class="panel-number">02</span></div>
             <div class="table-wrap">
               <table id="target-table">
-                <thead><tr><th>模型</th><th>门禁路由</th><th>检测状态</th><th>上次检测</th><th>下次检测</th><th>原因</th><th>操作</th></tr></thead>
+                <thead><tr><th>模型</th><th>门禁路由</th><th>检测状态</th><th>调度策略</th><th>调度阶段</th><th>上次检测</th><th>下次检测</th><th>原因</th><th>操作</th></tr></thead>
                 <tbody></tbody>
               </table>
               <div class="empty-state" id="target-empty"><div class="empty-icon">⌁</div><strong>还没有监测目标</strong><span>从左侧选择模型，开始建立你的监测计划。</span></div>
             </div>
           </section>
         </div>
+
+        <dialog id="target-policy-dialog" class="modal-dialog" aria-labelledby="target-policy-title">
+          <form id="target-policy-form" method="dialog">
+            <input type="hidden" id="tpf-model">
+            <div class="modal-head">
+              <div>
+                <span class="eyebrow">TARGET SCHEDULE POLICY</span>
+                <h2 id="target-policy-title">编辑调度策略</h2>
+              </div>
+              <button type="button" id="tpf-close" class="close-button" aria-label="关闭">×</button>
+            </div>
+
+            <div class="target-meta-info" id="tpf-model-banner">
+              <div>
+                <strong class="model-badge-name" id="tpf-model-name"></strong>
+                <small class="meta-desc" id="tpf-model-desc">单模型独立检测调度</small>
+              </div>
+              <span class="stage-badge" id="tpf-current-stage"></span>
+            </div>
+
+            <div class="field">
+              <label for="tpf-schedule-mode">调度模式</label>
+              <select id="tpf-schedule-mode">
+                <option value="">继承全局策略</option>
+                <option value="fixed">固定间隔模式</option>
+                <option value="staged">分阶段检测模式</option>
+              </select>
+              <small class="field-hint" id="tpf-mode-hint">分阶段模式：同题连续 3 轮答错后隔离；隔离后连续 2 次通过才恢复，确认期间继续阻断。</small>
+            </div>
+
+            <div class="form-row">
+              <div class="field">
+                <label for="tpf-interval">固定常规间隔 <em>分钟</em></label>
+                <input id="tpf-interval" type="number" min="1" max="43200" value="30">
+                <small class="field-hint">固定模式或兼容间隔</small>
+              </div>
+              <div class="field">
+                <label for="tpf-failwait">固定失败复检 <em>分钟</em></label>
+                <input id="tpf-failwait" type="number" min="0" max="43200" value="0">
+                <small class="field-hint">0 表示使用默认</small>
+              </div>
+            </div>
+
+            <div class="policy-override-box">
+              <div class="override-header">
+                <label class="check-row">
+                  <input type="checkbox" id="tpf-override-toggle">
+                  <strong>自定义 6 项分阶段间隔（覆盖全局）</strong>
+                </label>
+                <button type="button" id="tpf-btn-preset-codex" class="secondary-button-sm">codex-guard 预设</button>
+              </div>
+              <div id="tpf-tp-fields" class="timing-policy-grid compact hidden">
+                <div class="field">
+                  <label for="tpf-tp-normal">正常间隔 <em>分钟</em></label>
+                  <input id="tpf-tp-normal" type="number" min="1" max="43200" value="30">
+                </div>
+                <div class="field">
+                  <label for="tpf-tp-retry">错误重试 <em>分钟</em></label>
+                  <input id="tpf-tp-retry" type="number" min="1" max="43200" value="2">
+                </div>
+                <div class="field">
+                  <label for="tpf-tp-iso-first">首次隔离 <em>分钟</em></label>
+                  <input id="tpf-tp-iso-first" type="number" min="1" max="43200" value="360">
+                </div>
+                <div class="field">
+                  <label for="tpf-tp-iso-later">后续隔离 <em>分钟</em></label>
+                  <input id="tpf-tp-iso-later" type="number" min="1" max="43200" value="1440">
+                </div>
+                <div class="field">
+                  <label for="tpf-tp-rec-confirm">恢复确认 <em>分钟</em></label>
+                  <input id="tpf-tp-rec-confirm" type="number" min="1" max="43200" value="2">
+                </div>
+                <div class="field">
+                  <label for="tpf-tp-unavail">不可用冷却 <em>分钟</em></label>
+                  <input id="tpf-tp-unavail" type="number" min="1" max="43200" value="30">
+                </div>
+              </div>
+              <small class="field-hint" id="tpf-override-hint">未勾选时继承全局的分阶段间隔。</small>
+            </div>
+
+            <div class="field">
+              <label class="check-row">
+                <input id="tpf-recalculate-schedule" type="checkbox">
+                <span>重新计算下次检测时间</span>
+              </label>
+              <small class="field-hint">默认不勾选（保留现有到期时间）；勾选后根据新策略立即重排该模型的下次检测时间（若目标正在运行则自动跳过）。</small>
+            </div>
+
+            <div class="actions">
+              <button type="button" id="tpf-cancel" class="secondary-button">取消</button>
+              <button type="submit" id="tpf-submit" class="primary-button">保存策略 <span>→</span></button>
+            </div>
+          </form>
+        </dialog>
       </section>
 
       <section id="page-prompts" class="page">
@@ -173,7 +315,7 @@
 
       <section id="page-settings" class="page">
         <div class="page-intro"><div><span class="eyebrow">SYSTEM CONFIGURATION</span><h1>连接设置</h1><p>配置 Model Guard 访问 Magpie 网关的方式和检测预算。</p></div></div>
-        <div class="content-grid settings-grid"><section class="panel settings-panel"><div class="panel-heading"><div><span class="eyebrow">GATEWAY</span><h2>网关连接</h2></div></div><div class="field"><label for="cfg-url">网关 URL</label><input id="cfg-url" placeholder="http://127.0.0.1:3425"></div><div class="field"><label for="cfg-key">网关 Key</label><input id="cfg-key" type="password" placeholder="magpie"></div><div class="settings-divider"></div><div class="panel-heading compact"><div><span class="eyebrow">PROBE POLICY</span><h2>探针策略</h2></div></div><div class="form-row"><div class="field"><label for="cfg-limit">每日预算 <em>次 / 模型</em></label><input id="cfg-limit" type="number" value="120" min="1" max="10000"></div><div class="field"><label for="cfg-timeout">单次超时 <em>秒</em></label><input id="cfg-timeout" type="number" value="180" min="10" max="600"></div></div><div class="field"><label for="cfg-cool">不可用冷却 <em>分钟</em></label><input id="cfg-cool" type="number" value="15" min="1" max="1440"></div><button id="save-config" class="primary-button">保存并验证 <span>→</span></button><p id="config-msg" class="form-message"></p></section><aside class="panel guide-panel"><div class="guide-icon">◎</div><span class="eyebrow">HOW IT WORKS</span><h2>保护你的模型路由</h2><p>Model Guard 会通过 Magpie 网关发送独立探针，不会读取或修改上游供应商凭据。</p><div class="guide-step"><b>01</b><span>按计划发送检测题</span></div><div class="guide-step"><b>02</b><span>自动判分并记录回答</span></div><div class="guide-step"><b>03</b><span>异常时阻断模型请求</span></div></aside></div>
+        <div class="content-grid settings-grid"><section class="panel settings-panel"><div class="panel-heading"><div><span class="eyebrow">GATEWAY</span><h2>网关连接</h2></div></div><div class="field"><label for="cfg-url">网关 URL</label><input id="cfg-url" placeholder="http://127.0.0.1:3425"></div><div class="field"><label for="cfg-key">网关 Key</label><input id="cfg-key" type="password" placeholder="magpie"></div><div class="settings-divider"></div><div class="panel-heading compact"><div><span class="eyebrow">PROBE POLICY</span><h2>探针策略</h2></div></div><div class="form-row"><div class="field"><label for="cfg-limit">每日预算 <em>次 / 模型</em></label><input id="cfg-limit" type="number" value="120" min="1" max="10000"></div><div class="field"><label for="cfg-timeout">单次超时 <em>秒</em></label><input id="cfg-timeout" type="number" value="180" min="10" max="600"></div></div><div class="field"><label for="cfg-cool">不可用冷却 <em>分钟</em></label><input id="cfg-cool" type="number" value="15" min="1" max="1440"></div><div class="settings-divider"></div><div class="panel-heading compact"><div><span class="eyebrow">SCHEDULE POLICY</span><h2>全局分阶段调度策略</h2></div><button type="button" id="cfg-btn-preset-codex" class="secondary-button-sm" title="一键填入 codex-guard 推荐预设参数">⚡ codex-guard 预设</button></div><div class="field"><label for="cfg-schedule-mode">全局调度模式</label><select id="cfg-schedule-mode"><option value="fixed">固定间隔模式</option><option value="staged">分阶段检测模式</option></select><small class="field-hint" id="cfg-schedule-mode-hint">分阶段模式：同题连续 3 轮答错后隔离；隔离后连续 2 次通过才恢复，确认期间继续阻断。</small></div><div class="timing-policy-grid" id="cfg-timing-policy-block"><div class="field"><label for="cfg-tp-normal">正常间隔 <em>分钟</em></label><input id="cfg-tp-normal" type="number" min="1" max="43200" value="30"><small class="field-hint">放行状态常规探测 (默认 30m)</small></div><div class="field"><label for="cfg-tp-retry">错误重试 <em>分钟</em></label><input id="cfg-tp-retry" type="number" min="1" max="43200" value="2"><small class="field-hint">1/3 与 2/3 轮快速复查 (默认 2m)</small></div><div class="field"><label for="cfg-tp-iso-first">首次隔离 <em>分钟</em></label><input id="cfg-tp-iso-first" type="number" min="1" max="43200" value="360"><small class="field-hint">首次隔离后复测（默认 6 小时）</small></div><div class="field"><label for="cfg-tp-iso-later">后续隔离 <em>分钟</em></label><input id="cfg-tp-iso-later" type="number" min="1" max="43200" value="1440"><small class="field-hint">后续隔离复测（默认 24 小时）</small></div><div class="field"><label for="cfg-tp-rec-confirm">恢复确认 <em>分钟</em></label><input id="cfg-tp-rec-confirm" type="number" min="1" max="43200" value="2"><small class="field-hint">第 1 过二次确认间隔 (默认 2m)</small></div><div class="field"><label for="cfg-tp-unavail">不可用冷却 <em>分钟</em></label><input id="cfg-tp-unavail" type="number" min="1" max="43200" value="30"><small class="field-hint">接口不可用隔离冷却 (默认 30m)</small></div></div><div class="field" style="margin-top:14px"><label class="check-row"><input id="cfg-recalculate-schedule" type="checkbox"><span>重新计算未运行目标的下次检测时间</span></label><small class="field-hint">默认不勾选（保留现有到期时间）；勾选后根据新策略重排未在运行目标的到期时间。</small></div><div class="policy-note-box"><div class="note-title">ℹ 调度机制说明（3 错 2 过）</div><ul class="note-list"><li><strong>3 错隔离：</strong>同一题目连续 3 轮检测失败才会触发门禁阻断与隔离，前两轮以 设定的错误复测间隔（默认 2 分钟）快速复核，避免偶发抖动误阻断。</li><li><strong>隔离冷冻：</strong>首次隔离时长为 设定的首次隔离间隔（默认 6 小时），后续若复测仍失败则延长为 设定的后续隔离间隔（默认 24 小时）。冷冻期满后复测原失败题。</li><li><strong>2 过恢复：</strong>隔离期复测需要连续 2 次通过。<strong>第 1 次通过保持门禁阻断</strong>并处于确认期，设定的恢复确认间隔（默认 2 分钟）后再次复测；<strong>第 2 次通过才正式放行</strong>并恢复正常间隔。</li><li><strong>不可用与人工优先：</strong>探针不可用立即隔离 并等待不可用冷却间隔（默认 30 分钟）并打断连续通过计数；人工禁用具有最高优先级。</li></ul></div><button id="save-config" class="primary-button">保存并验证 <span>→</span></button><p id="config-msg" class="form-message"></p></section><aside class="panel guide-panel"><div class="guide-icon">◎</div><span class="eyebrow">HOW IT WORKS</span><h2>保护你的模型路由</h2><p>Model Guard 会通过 Magpie 网关发送独立探针，不会读取或修改上游供应商凭据。</p><div class="guide-step"><b>01</b><span>按计划发送检测题</span></div><div class="guide-step"><b>02</b><span>自动判分并记录回答</span></div><div class="guide-step"><b>03</b><span>异常时阻断模型请求</span></div></aside></div>
       </section>
     </main>
     <footer class="app-footer"><span>Model Guard · Magpie plugin</span><span>本地运行 · 数据保存在本机</span></footer>

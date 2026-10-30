@@ -24,7 +24,7 @@ test('GitHub package starts its bundled backend and opens the console without Go
     const script = `
       import assert from 'node:assert/strict';
       import plugin from './plugin/index.mjs';
-      const hooks = await plugin.server({}, { dataDir: './state' });
+      const hooks = await plugin.server({}, { dataDir: './state', magpieConfigDir: './config/magpie' });
       const cfg = {};
       await hooks.config(cfg);
       const entry = await hooks.auth.methods[0].authorize();
