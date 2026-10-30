@@ -27,6 +27,26 @@ Magpie 插件：**模型级别**的降智检测与禁用。定时用可自动判
 
 ## 安装
 
+### 从 GitHub 安装（无需 Go）
+
+在 Magpie 的 GitHub 插件安装入口填写：
+
+```text
+github:ifmos/magpie-model-guard
+```
+
+也可通过 CLI 安装：
+
+```sh
+magpie plugin add github:ifmos/magpie-model-guard
+```
+
+从 `0.1.1` 起，仓库随附 macOS Intel / Apple Silicon、Linux AMD64 / ARM64、
+Windows AMD64 五个平台的预编译后台，运行机器不需要安装 Go 或自行构建。
+若旧版本提示“找不到 Go 后台二进制”，请更新插件；若安装缓存未刷新，移除后重新添加，
+再重启 Magpie 或关闭后重新启用插件。此修复不修改用户的数据目录。
+
+
 ### 从源码构建
 
 需要 Go 1.26+：

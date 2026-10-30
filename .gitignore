@@ -1,4 +1,9 @@
-bin/
+bin/*
+!bin/model-guard-darwin-amd64
+!bin/model-guard-darwin-arm64
+!bin/model-guard-linux-amd64
+!bin/model-guard-linux-arm64
+!bin/model-guard-windows-amd64.exe
 dist/
 *.test
 *.db

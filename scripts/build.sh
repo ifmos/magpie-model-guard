@@ -12,7 +12,7 @@ for target in \
   suffix=""
   [ "$GOOS" = "windows" ] && suffix=".exe"
   CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
-    go build -trimpath -o "bin/model-guard-${GOOS}-${GOARCH}${suffix}" ./cmd/model-guard
+    go build -trimpath -ldflags="-s -w" -o "bin/model-guard-${GOOS}-${GOARCH}${suffix}" ./cmd/model-guard
   echo "built bin/model-guard-${GOOS}-${GOARCH}${suffix}"
 done
 # current-platform convenience binary for plugin development

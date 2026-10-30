@@ -18,7 +18,7 @@ function start(options = {}) {
     const fallback = path.join(root, 'bin', `model-guard${suffix}`);
     const binary = options.binaryPath || (existsSync(bundled) ? bundled : existsSync(fallback) ? fallback : undefined);
     if (!binary) {
-      reject(new Error('找不到 Go 后台二进制：请先运行 go build -o bin/model-guard ./cmd/model-guard'));
+      reject(new Error(`安装包缺少 ${platform}/${arch} 的 Go 后台二进制。请更新或重新安装 github:ifmos/magpie-model-guard（0.1.1+）；源码开发可运行 sh scripts/build.sh。`));
       return;
     }
     const args = [
