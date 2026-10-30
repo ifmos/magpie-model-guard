@@ -40,6 +40,8 @@ const (
 	GraderExact GraderKind = "exact"
 	// GraderRegex passes when the answer matches the expected regex.
 	GraderRegex GraderKind = "regex"
+	// GraderNumber passes when the answer contains the expected standalone number.
+	GraderNumber GraderKind = "number"
 	// GraderNone means no automatic grading: manual review only.
 	GraderNone GraderKind = "none"
 )
@@ -55,6 +57,8 @@ type Prompt struct {
 	Automatic bool       `json:"automatic"`
 }
 
+var validNumberPattern = regexp.MustCompile(`^[+-]?(\d+(\.\d+)?|\.\d+)$`)
+
 // Validate checks prompt fields; name and text are required, and a grader
 // needs an expectation. Regex graders must compile.
 func (p *Prompt) Validate() error {
@@ -67,13 +71,19 @@ func (p *Prompt) Validate() error {
 		return fmt.Errorf("题目文本不能为空")
 	}
 	switch p.Grader {
-	case GraderContains, GraderExact, GraderRegex:
+	case GraderContains, GraderExact, GraderRegex, GraderNumber:
 		if strings.TrimSpace(p.Expect) == "" {
 			return fmt.Errorf("自动判分题目需要判分规则")
 		}
 		if p.Grader == GraderRegex {
 			if _, err := regexp.Compile(p.Expect); err != nil {
 				return fmt.Errorf("正则表达式无效: %v", err)
+			}
+		}
+		if p.Grader == GraderNumber {
+			p.Expect = strings.TrimSpace(p.Expect)
+			if !validNumberPattern.MatchString(p.Expect) {
+				return fmt.Errorf("数字判分期望值必须是有效数字")
 			}
 		}
 	case GraderNone:
@@ -95,37 +105,67 @@ func (p *Prompt) Validate() error {
 // Grade evaluates an answer for this prompt.
 // Returns (passed, humanReviewRequired, error).
 func (p *Prompt) Grade(answer string) (bool, bool, error) {
-	switch {
-	case p.ID == "candy":
-		return gradeCandy(answer), false, nil
-	case p.Grader == GraderContains:
+	switch p.Grader {
+	case GraderContains:
 		return strings.Contains(answer, p.Expect), false, nil
-	case p.Grader == GraderExact:
+	case GraderExact:
 		return strings.TrimSpace(answer) == strings.TrimSpace(p.Expect), false, nil
-	case p.Grader == GraderRegex:
+	case GraderRegex:
 		re, err := regexp.Compile(p.Expect)
 		if err != nil {
 			return false, true, err
 		}
 		return re.MatchString(answer), false, nil
+	case GraderNumber:
+		return gradeNumber(answer, p.Expect), false, nil
 	default:
 		return false, true, nil // manual review
 	}
 }
 
-// gradeCandy: the canonical answer is 21; the answer passes when it contains
-// "21" as a standalone number (no digit on either side), mirroring the
-// community grading regex (?<!\d)21(?!\d) which RE2 cannot express.
-func gradeCandy(answer string) bool {
-	for i := 0; i+2 <= len(answer); i++ {
-		if answer[i:i+2] != "21" {
+func gradeNumber(answer, expect string) bool {
+	target := strings.TrimSpace(expect)
+	if target == "" {
+		return false
+	}
+	tLen := len(target)
+	for i := 0; i+tLen <= len(answer); i++ {
+		if answer[i:i+tLen] != target {
 			continue
 		}
-		before := i > 0 && isDigitByte(answer[i-1])
-		after := i+2 < len(answer) && isDigitByte(answer[i+2])
-		if !before && !after {
-			return true
+		if i > 0 {
+			prev := answer[i-1]
+			if isDigitByte(prev) || prev == '+' || prev == '-' || prev == 'e' || prev == 'E' {
+				continue
+			}
+			if prev == '.' {
+				if i >= 2 && answer[i-2] == '.' {
+					// ellipsis, okay
+				} else {
+					continue
+				}
+			}
+			if prev == ',' && i >= 2 && isDigitByte(answer[i-2]) {
+				continue
+			}
 		}
+		if i+tLen < len(answer) {
+			next := answer[i+tLen]
+			if isDigitByte(next) || next == 'e' || next == 'E' {
+				continue
+			}
+			if next == '.' {
+				if i+tLen+1 < len(answer) && isDigitByte(answer[i+tLen+1]) {
+					continue
+				}
+			}
+			if next == ',' {
+				if i+tLen+1 < len(answer) && isDigitByte(answer[i+tLen+1]) {
+					continue
+				}
+			}
+		}
+		return true
 	}
 	return false
 }

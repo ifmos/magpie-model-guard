@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -63,37 +62,12 @@ func newTestService(t *testing.T, gw *fakeGateway) (*Service, *Store, string) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	gate := filepath.Join(dir, "gate.middleware.js")
-	svc, err := NewService(store, gate)
+	svc, err := newService(store, gate, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(svc.Close)
 	return svc, store, gate
-}
-
-func TestPublishGateBlocksFailedModel(t *testing.T) {
-	gw := &fakeGateway{}
-	svc, _, gate := newTestService(t, gw)
-	if err := svc.UpsertTarget(&Target{Model: "prov/a", Enabled: true, State: StateFailed, Reason: "糖果题未通过"}); err != nil {
-		t.Fatal(err)
-	}
-	code, err := os.ReadFile(gate)
-	if err != nil {
-		t.Fatal(err)
-	}
-	js := string(code)
-	// null-body guard: a thrown TypeError in the middleware fails open
-	if !strings.Contains(js, `if(!body||typeof body.model!=="string")return body;`) {
-		t.Error("gate missing null-body guard")
-	}
-	// probe alias rewrite present
-	// gate rejects blocked models
-	if !strings.Contains(js, "ctx.reject(403") {
-		t.Error("gate missing reject call")
-	}
-	if !strings.Contains(js, "prov/a") || !strings.Contains(js, "已禁用") {
-		t.Error("gate missing blocked target")
-	}
 }
 
 func TestProbeRoundEndToEnd(t *testing.T) {

@@ -3,80 +3,183 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>Model Guard 控制台</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<header>
-  <h1>Model Guard <span class="sub">模型级降智检测</span></h1>
-  <nav id="tabs">
-    <button data-tab="targets" class="active">监测目标</button>
-    <button data-tab="prompts">检测题库</button>
-    <button data-tab="results">检测记录</button>
-    <button data-tab="settings">连接设置</button>
-  </nav>
-</header>
-<main>
-  <section id="page-targets" class="page active">
-    <div class="toolbar">
-      <button id="refresh-models">刷新模型</button>
-      <select id="model-pick" size="6"></select>
-      <div class="field"><label>检测间隔(分)</label><input id="new-interval" type="number" value="30" min="5" max="10080"></div>
-      <div class="field"><label>失败复检(分,0=默认60)</label><input id="new-failwait" type="number" value="0" min="0" max="10080"></div>
-      <button id="add-target">添加监测</button>
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark"><span></span><span></span><span></span></div>
+      <div><strong>Model Guard</strong><small>模型质量控制台</small></div>
     </div>
-    <table id="target-table">
-      <thead><tr><th>模型</th><th>状态</th><th>上次检测</th><th>下次检测</th><th>原因</th><th>操作</th></tr></thead>
-      <tbody></tbody>
-    </table>
-  </section>
+    <div class="sidebar-label">工作区</div>
+    <nav id="tabs" class="side-nav" aria-label="控制台导航">
+      <button data-tab="targets" class="active"><span class="nav-icon">⌁</span><span>监测目标</span><span class="nav-count" id="nav-target-count">0</span></button>
+      <button data-tab="prompts"><span class="nav-icon">✦</span><span>检测题库</span></button>
+      <button data-tab="results"><span class="nav-icon">↗</span><span>检测记录</span></button>
+      <button data-tab="settings"><span class="nav-icon">⚙</span><span>连接设置</span></button>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="mini-status"><i id="sidebar-status-dot"></i><span id="sidebar-status">后台连接中</span></div>
+      <span class="version-label">MAGPIE PLUGIN · 0.1</span>
+    </div>
+  </aside>
 
-  <section id="page-prompts" class="page">
-    <div class="toolbar">
-      <button id="new-prompt">新建题目</button>
-    </div>
-    <table id="prompt-table">
-      <thead><tr><th>ID</th><th>名称</th><th>判分</th><th>期望</th><th>自动</th><th>操作</th></tr></thead>
-      <tbody></tbody>
-    </table>
-    <form id="prompt-form" class="modal hidden">
-      <h2 id="prompt-form-title">新建题目</h2>
-      <div class="field"><label>名称</label><input id="pf-name" required></div>
-      <div class="field"><label>题目文本</label><textarea id="pf-text" rows="8" required></textarea></div>
-      <div class="field"><label>判分类型</label>
-        <select id="pf-grader">
-          <option value="none">人工评价</option>
-          <option value="contains">包含关键字</option>
-          <option value="exact">精确匹配</option>
-          <option value="regex">正则匹配</option>
-        </select></div>
-      <div class="field"><label>期望答案/规则</label><input id="pf-expect"></div>
-      <div class="field"><label>参与自动门禁</label><input id="pf-automatic" type="checkbox"></div>
-      <div class="actions"><button type="submit">保存</button><button type="button" id="pf-cancel">取消</button></div>
-    </form>
-  </section>
+  <div class="main-shell">
+    <header class="topbar">
+      <div>
+        <div class="breadcrumb">MODEL GUARD <span>/</span> <strong id="current-section">监测目标</strong></div>
+        <p class="topbar-caption">持续验证模型表现，在异常发生前保护你的路由。</p>
+      </div>
+      <div class="topbar-actions">
+        <span class="connection-pill"><i id="top-status-dot"></i><span id="top-status">正在连接</span></span>
+        <button id="top-refresh" class="icon-button" title="刷新数据" aria-label="刷新数据">↻</button>
+      </div>
+    </header>
 
-  <section id="page-results" class="page">
-    <div class="toolbar">
-      <select id="result-model"></select>
-      <button id="refresh-results">刷新</button>
-    </div>
-    <div id="result-list"></div>
-  </section>
+    <main>
+      <section id="page-targets" class="page active">
+        <div class="page-intro">
+          <div>
+            <span class="eyebrow">MODEL MONITORING</span>
+            <h1>监测目标</h1>
+            <p>为模型设定探针计划。检测失败后，网关会自动阻断该模型的业务请求。</p>
+          </div>
+          <div class="intro-badge" id="scheduler-badge"><span class="pulse" id="scheduler-pulse"></span><span id="scheduler-badge-text">调度状态检测中...</span></div>
+        </div>
 
-  <section id="page-settings" class="page">
-    <div class="settings">
-      <div class="field"><label>网关 URL</label><input id="cfg-url" placeholder="http://127.0.0.1:3425"></div>
-      <div class="field"><label>网关 Key</label><input id="cfg-key" type="password" placeholder="magpie"></div>
-      <div class="field"><label>每日预算(次/模型)</label><input id="cfg-limit" type="number" value="120" min="1" max="10000"></div>
-      <div class="field"><label>单次超时(秒)</label><input id="cfg-timeout" type="number" value="180" min="10" max="600"></div>
-      <div class="field"><label>不可用冷却(分)</label><input id="cfg-cool" type="number" value="15" min="1" max="1440"></div>
-      <button id="save-config">保存并验证</button>
-      <p id="config-msg"></p>
-    </div>
-  </section>
-</main>
-<div id="toast" class="hidden"></div>
+        <div class="summary-grid" aria-label="监测摘要">
+          <div class="summary-card"><span class="summary-label">监测中</span><strong id="stat-total">0</strong><small id="stat-total-desc">开启自动检测</small></div>
+          <div class="summary-card is-good"><span class="summary-label">检测通过</span><strong id="stat-passed">0</strong><small>探针状态正常</small></div>
+          <div class="summary-card is-danger"><span class="summary-label">门禁阻断</span><strong id="stat-blocked">0</strong><small>已阻止业务路由</small></div>
+          <div class="summary-card is-muted"><span class="summary-label">检测不可用</span><strong id="stat-unavailable">0</strong><small>等待冷却重试</small></div>
+        </div>
+
+        <div class="content-grid target-grid">
+          <section class="panel setup-panel">
+            <div class="panel-heading"><div><span class="eyebrow">ADD TARGET</span><h2>添加监测目标</h2></div><span class="panel-number">01</span></div>
+            <p class="panel-description">从 Magpie 网关读取模型列表，选择后加入自动检测计划。</p>
+            <button id="refresh-models" class="secondary-button full-button"><span>↻</span> 刷新模型列表</button>
+            <div class="model-picker-wrap">
+              <div class="picker-header">
+                <label class="input-label" for="model-search-input">可用模型（可多选）</label>
+                <span class="picker-status" id="model-picker-status">点击上方刷新获取</span>
+              </div>
+              <div class="custom-combobox" id="model-combobox">
+                <div class="combobox-control">
+                  <span class="search-icon">🔍</span>
+                  <input id="model-search-input" type="text" placeholder="搜索模型 ID（支持长 ID，如 gpt, claude）..." autocomplete="off">
+                  <button type="button" id="model-search-clear" class="btn-clear-search hidden" title="清空搜索">✕</button>
+                  <button type="button" id="model-dropdown-btn" class="btn-dropdown-toggle" title="展开/收起列表">▾</button>
+                </div>
+                <div id="model-dropdown" class="combobox-dropdown hidden">
+                  <div class="dropdown-header">
+                    <span id="model-match-info">0 个模型</span>
+                    <div class="dropdown-quick-actions">
+                      <button type="button" id="btn-select-all" class="link-btn">全选结果</button>
+                      <span class="sep">·</span>
+                      <button type="button" id="btn-select-none" class="link-btn">清空已选</button>
+                    </div>
+                  </div>
+                  <div id="model-options-list" class="options-list">
+                    <div class="dropdown-empty">请先点击上方「刷新模型列表」</div>
+                  </div>
+                </div>
+              </div>
+              <div id="selected-models-preview" class="selected-models-bar hidden">
+                <div class="selected-tags" id="selected-tags-list"></div>
+                <div class="selected-summary"><span id="selected-count-badge">已选择 0 个模型</span> <button type="button" id="btn-clear-selected-tags" class="link-btn">清除全部</button></div>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="field"><label for="new-interval">检测间隔 <em>分钟</em></label><input id="new-interval" type="number" value="30" min="5" max="10080"></div>
+              <div class="field"><label for="new-failwait">失败复检 <em>分钟</em></label><input id="new-failwait" type="number" value="0" min="0" max="10080"></div>
+            </div>
+            <button id="add-target" class="primary-button full-button">添加到监测计划 <span>→</span></button>
+            <div class="helper-note"><span>i</span><span>支持选择多个模型批量添加。失败复检填 0 使用默认 60 分钟。</span></div>
+          </section>
+
+          <section class="panel table-panel">
+            <div class="panel-heading table-heading"><div><span class="eyebrow">ACTIVE TARGETS</span><h2>当前监测计划</h2></div><span class="panel-number">02</span></div>
+            <div class="table-wrap">
+              <table id="target-table">
+                <thead><tr><th>模型</th><th>门禁路由</th><th>检测状态</th><th>上次检测</th><th>下次检测</th><th>原因</th><th>操作</th></tr></thead>
+                <tbody></tbody>
+              </table>
+              <div class="empty-state" id="target-empty"><div class="empty-icon">⌁</div><strong>还没有监测目标</strong><span>从左侧选择模型，开始建立你的监测计划。</span></div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="page-prompts" class="page">
+        <div class="page-intro"><div><span class="eyebrow">PROBE LIBRARY</span><h1>检测题库</h1><p>用客观题观察模型表现，也可以创建适合自己业务的自定义探针。</p></div><button id="new-prompt" class="primary-button">新建题目 <span>＋</span></button></div>
+        <section class="panel table-panel"><div class="panel-heading table-heading"><div><span class="eyebrow">QUESTION BANK</span><h2>题目列表</h2></div><span class="panel-caption">自动题参与状态判断 · 人工题仅保存回答</span></div><div class="table-wrap"><table id="prompt-table"><thead><tr><th>ID</th><th>名称</th><th>判分规则</th><th>期望答案</th><th>门禁</th><th>操作</th></tr></thead><tbody></tbody></table><div class="empty-state" id="prompt-empty"><div class="empty-icon">✦</div><strong>题库为空</strong><span>创建第一道自定义检测题。</span></div></div></section>
+        <dialog id="prompt-dialog" class="modal-dialog" aria-labelledby="prompt-form-title">
+          <form id="prompt-form" method="dialog">
+            <input type="hidden" id="pf-id">
+            <input type="hidden" id="pf-builtin">
+            <div class="modal-head">
+              <div>
+                <span class="eyebrow" id="pf-eyebrow">CUSTOM PROBE</span>
+                <h2 id="prompt-form-title">新建题目</h2>
+              </div>
+              <button type="button" id="pf-close" class="close-button" aria-label="关闭">×</button>
+            </div>
+            <div class="field">
+              <label for="pf-name">题目名称 <span class="required-mark">*</span></label>
+              <input id="pf-name" required placeholder="例如：糖果推理 或 结构化输出">
+            </div>
+            <div class="field">
+              <label for="pf-text">题目文本 <span class="required-mark">*</span></label>
+              <textarea id="pf-text" rows="8" required placeholder="输入发送给模型的完整题目文本"></textarea>
+            </div>
+            <div class="form-row">
+              <div class="field">
+                <label for="pf-grader">判分类型</label>
+                <select id="pf-grader">
+                  <option value="none">人工评价 (none)</option>
+                  <option value="number">独立数字 (number)</option>
+                  <option value="contains">包含关键字 (contains)</option>
+                  <option value="exact">精确匹配 (exact)</option>
+                  <option value="regex">正则匹配 (regex)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="pf-expect" id="pf-expect-label">期望答案 / 规则</label>
+                <input id="pf-expect" placeholder="自动判分时必填">
+                <small class="field-hint" id="pf-expect-hint">人工评价无须期望规则</small>
+              </div>
+            </div>
+            <label class="check-row">
+              <input id="pf-automatic" type="checkbox">
+              <span>参与自动门禁</span>
+              <small>失败后会改变模型检测状态并阻断路由</small>
+            </label>
+            <div class="actions">
+              <button type="button" id="pf-cancel" class="secondary-button">取消</button>
+              <button type="submit" id="pf-submit" class="primary-button">保存题目</button>
+            </div>
+          </form>
+        </dialog>
+      </section>
+
+      <section id="page-results" class="page">
+        <div class="page-intro"><div><span class="eyebrow">AUDIT TRAIL</span><h1>检测记录</h1><p>查看探针回答、判定结果和模型状态变化。</p></div><button id="refresh-results" class="secondary-button">↻ 刷新记录</button></div>
+        <section class="panel results-panel"><div class="filter-bar"><div><span class="eyebrow">FILTER</span><strong>筛选检测结果</strong></div><select id="result-model" aria-label="按模型筛选"></select></div><div id="result-list" class="result-list"></div><div class="empty-state" id="result-empty"><div class="empty-icon">↗</div><strong>暂无检测记录</strong><span>手动测试或等待下一次定时检测。</span></div></section>
+      </section>
+
+      <section id="page-settings" class="page">
+        <div class="page-intro"><div><span class="eyebrow">SYSTEM CONFIGURATION</span><h1>连接设置</h1><p>配置 Model Guard 访问 Magpie 网关的方式和检测预算。</p></div></div>
+        <div class="content-grid settings-grid"><section class="panel settings-panel"><div class="panel-heading"><div><span class="eyebrow">GATEWAY</span><h2>网关连接</h2></div></div><div class="field"><label for="cfg-url">网关 URL</label><input id="cfg-url" placeholder="http://127.0.0.1:3425"></div><div class="field"><label for="cfg-key">网关 Key</label><input id="cfg-key" type="password" placeholder="magpie"></div><div class="settings-divider"></div><div class="panel-heading compact"><div><span class="eyebrow">PROBE POLICY</span><h2>探针策略</h2></div></div><div class="form-row"><div class="field"><label for="cfg-limit">每日预算 <em>次 / 模型</em></label><input id="cfg-limit" type="number" value="120" min="1" max="10000"></div><div class="field"><label for="cfg-timeout">单次超时 <em>秒</em></label><input id="cfg-timeout" type="number" value="180" min="10" max="600"></div></div><div class="field"><label for="cfg-cool">不可用冷却 <em>分钟</em></label><input id="cfg-cool" type="number" value="15" min="1" max="1440"></div><button id="save-config" class="primary-button">保存并验证 <span>→</span></button><p id="config-msg" class="form-message"></p></section><aside class="panel guide-panel"><div class="guide-icon">◎</div><span class="eyebrow">HOW IT WORKS</span><h2>保护你的模型路由</h2><p>Model Guard 会通过 Magpie 网关发送独立探针，不会读取或修改上游供应商凭据。</p><div class="guide-step"><b>01</b><span>按计划发送检测题</span></div><div class="guide-step"><b>02</b><span>自动判分并记录回答</span></div><div class="guide-step"><b>03</b><span>异常时阻断模型请求</span></div></aside></div>
+      </section>
+    </main>
+    <footer class="app-footer"><span>Model Guard · Magpie plugin</span><span>本地运行 · 数据保存在本机</span></footer>
+  </div>
+</div>
+<div id="toast" class="hidden" role="status"></div>
 <script src="/app.js"></script>
 </body>
 </html>

@@ -47,11 +47,17 @@ type Service struct {
 	consoleMu  sync.Mutex
 	consoleKey string
 	health     string
+	closing    bool
 }
 
 // NewService loads state, seeds builtins, publishes the gate and starts the
 // scheduler loop.
 func NewService(store *Store, gatePath string) (*Service, error) {
+	return newService(store, gatePath, true)
+}
+
+// newService permits deterministic lifecycle tests without starting a ticker.
+func newService(store *Store, gatePath string, scheduled bool) (*Service, error) {
 	if err := store.SeedBuiltins(); err != nil {
 		return nil, err
 	}
@@ -70,14 +76,19 @@ func NewService(store *Store, gatePath string) (*Service, error) {
 		cancel()
 		return nil, fmt.Errorf("publish gate: %w", err)
 	}
-	s.wg.Add(1)
-	go s.loop()
+	if scheduled {
+		s.wg.Add(1)
+		go s.loop()
+	}
 	return s, nil
 }
 
 // Close stops the scheduler and cancels running probes.
 func (s *Service) Close() {
+	s.mu.Lock()
+	s.closing = true
 	s.cancel()
+	s.mu.Unlock()
 	s.wg.Wait()
 }
 
@@ -119,36 +130,41 @@ func (s *Service) loop() {
 }
 
 func (s *Service) schedule() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		return
+	}
 	cfg, err := s.store.LoadConfig()
-	if err != nil {
+	if err != nil || cfg.GatewayURL == "" {
 		return
 	}
 	due, err := s.store.DueTargets(time.Now())
 	if err != nil {
+		s.health = err.Error()
 		return
 	}
 	for _, t := range due {
-		t := t
-		s.mu.Lock()
-		if _, busy := s.running[t.Model]; busy {
-			s.mu.Unlock()
-			continue
+		if _, busy := s.running[t.Model]; !busy {
+			s.launchRoundLocked(t, cfg, "scheduled")
 		}
-		runCtx, cancel := context.WithCancel(s.ctx)
-		s.running[t.Model] = cancel
-		s.mu.Unlock()
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					s.finishRun(t.Model, nil)
-				}
-			}()
-			_, _ = s.runRound(runCtx, t, cfg, "scheduled")
-			s.finishRun(t.Model, cancel)
-		}()
 	}
+}
+
+// launchRoundLocked starts one round while the caller owns s.mu.
+func (s *Service) launchRoundLocked(t *Target, cfg GuardConfig, source string) {
+	runCtx, cancel := context.WithCancel(s.ctx)
+	s.running[t.Model] = cancel
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer s.finishRun(t.Model, cancel)
+		if _, err := s.runRound(runCtx, t, cfg, source); err != nil {
+			s.mu.Lock()
+			s.health = err.Error()
+			s.mu.Unlock()
+		}
+	}()
 }
 
 func (s *Service) finishRun(model string, cancel context.CancelFunc) {
@@ -162,9 +178,8 @@ func (s *Service) finishRun(model string, cancel context.CancelFunc) {
 
 // gateTarget is the JSON published into the gate middleware.
 type gateTarget struct {
-	Enabled    bool   `json:"enabled"`
+	ManualHold bool   `json:"manual_hold"`
 	State      string `json:"state"`
-	CheckedAt  int64  `json:"checked_at"`
 	AllowUntil int64  `json:"allow_until"`
 	Reason     string `json:"reason"`
 }
@@ -183,10 +198,9 @@ func (s *Service) publishGate() error {
 	}
 	gate := map[string]gateTarget{}
 	for _, t := range targets {
-		gate[t.Model] = gateTarget{
-			Enabled:    t.Enabled,
+		gate[strings.ToLower(t.Model)] = gateTarget{
+			ManualHold: t.ManualHold,
 			State:      t.State,
-			CheckedAt:  t.CheckedAt.Unix(),
 			AllowUntil: t.AllowUntil.Unix(),
 			Reason:     t.Reason,
 		}
@@ -198,16 +212,19 @@ func (s *Service) publishGate() error {
 const targets=%s;
 const alias=%s;
 export function onRequest(body,ctx){
- if(!body||typeof body.model!=="string")return body;
+ const model=body&&typeof body.model==="string"?body.model:(ctx&&typeof ctx.model==="string"?ctx.model:"");
+ if(!model)return body;
  const prefix="model-guard-probe/"+alias+"/";
- if(body.model.startsWith(prefix)){body.model=body.model.slice(prefix.length);return body;}
- const t=targets[body.model];if(!t||!t.enabled)return body;
+ if(body&&model.startsWith(prefix)){body.model=model.slice(prefix.length);return body;}
+ const id=model.trim().replace(/^magpie\//,"").toLowerCase();
+ if(!Object.prototype.hasOwnProperty.call(targets,id))return body;
+ const t=targets[id];
  const now=Date.now();
  if(t.allow_until>0&&t.allow_until*1000>now)return body;
- const blocked=t.state==="failed"||t.state==="review"||t.state==="unavailable";
+ const blocked=t.manual_hold||t.state==="failed"||t.state==="review"||t.state==="unavailable";
  if(!blocked)return body;
- const reason=t.state==="review"?"人工暂停":t.state==="unavailable"?"检测不可用（探针请求失败），已保守禁用":"降智检测未通过，模型已禁用";
- return ctx.reject(403,"[MODEL_GUARD_BLOCKED] "+reason+"。目标："+body.model+"；详情："+(t.reason||"请到 model-guard 控制台查看或重测")+"。本次请求未发往上游。");
+ const reason=t.manual_hold||t.state==="review"?"人工禁用":t.state==="unavailable"?"检测不可用（探针请求失败），已保守禁用":"降智检测未通过，模型已禁用";
+ return ctx.reject(403,"[MODEL_GUARD_BLOCKED] "+reason+"。目标："+model+"；详情："+(t.reason||"请到 model-guard 控制台查看或重测")+"。本次请求未发往上游。");
 }
 `, string(b), string(a))
 	if err := atomicWrite(s.gate, []byte(code)); err != nil {
@@ -338,7 +355,15 @@ func (s *Service) runRound(ctx context.Context, t *Target, cfg GuardConfig, sour
 func (s *Service) applyRoundResult(t *Target, verdict, detail string, cfg GuardConfig, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	nt := *t
+	latest, err := s.store.Target(t.Model)
+	if err != nil {
+		s.health = err.Error()
+		return
+	}
+	if latest == nil {
+		return // A completed probe must not recreate a deleted target.
+	}
+	nt := *latest
 	nt.CheckedAt = now
 	nt.Reason = detail
 	switch verdict {
@@ -360,8 +385,13 @@ func (s *Service) applyRoundResult(t *Target, verdict, detail string, cfg GuardC
 	default:
 		return
 	}
-	_ = s.store.SaveTarget(&nt)
-	_ = s.publishGate()
+	if err := s.store.SaveTarget(&nt); err != nil {
+		s.health = err.Error()
+		return
+	}
+	if err := s.publishGate(); err != nil {
+		s.health = err.Error()
+	}
 }
 
 // probeOnce sends one probe request and grades it.
@@ -476,6 +506,8 @@ func (s *Service) UpsertTarget(t *Target) error {
 			return errors.New("无效题目 ID")
 		}
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	existing, err := s.store.Target(t.Model)
 	if err != nil {
 		return err
@@ -487,6 +519,8 @@ func (s *Service) UpsertTarget(t *Target) error {
 		t.AllowUntil = existing.AllowUntil
 		t.FailStreak = existing.FailStreak
 		t.NextCheckAt = existing.NextCheckAt
+		t.ManualHold = existing.ManualHold
+		t.Reason = existing.Reason
 		if t.State == StateUnknown && existing.State != "" {
 			t.State = existing.State
 		}
@@ -494,8 +528,6 @@ func (s *Service) UpsertTarget(t *Target) error {
 		t.State = StateUnknown
 		t.NextCheckAt = time.Now().UTC()
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := s.store.SaveTarget(t); err != nil {
 		return err
 	}
@@ -514,25 +546,45 @@ func (s *Service) DeleteTarget(model string) error {
 
 // TargetAction performs allow/hold/recheck on a target.
 func (s *Service) TargetAction(model, action string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	t, err := s.store.Target(model)
 	if err != nil || t == nil {
 		return errors.New("模型未配置")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	switch action {
 	case "allow":
 		t.AllowUntil = time.Now().UTC().Add(15 * time.Minute)
-	case "hold":
-		t.State = StateReview
-		t.Reason = "人工暂停"
+	case "hold", "disable":
+		t.ManualHold = true
 		t.AllowUntil = time.Time{}
-	case "disable":
-		t.Enabled = false
 	case "enable":
+		t.ManualHold = false
+		t.State = StateUnknown
+		t.Reason = ""
+		t.FailStreak = 0
+		t.AllowUntil = time.Time{}
+	case "monitor-off":
+		t.Enabled = false
+	case "monitor-on":
 		t.Enabled = true
+		t.NextCheckAt = time.Now().UTC()
 	case "recheck":
-		t.NextCheckAt = time.Now().UTC().Add(-time.Second)
+		if s.closing {
+			return errors.New("检测后台正在关闭")
+		}
+		if _, busy := s.running[model]; busy {
+			return errors.New("该模型检测进行中")
+		}
+		cfg, err := s.store.LoadConfig()
+		if err != nil {
+			return err
+		}
+		if cfg.GatewayURL == "" {
+			return errors.New("请先配置网关")
+		}
+		s.launchRoundLocked(t, cfg, "manual")
+		return nil
 	default:
 		return errors.New("未知操作")
 	}
@@ -621,13 +673,19 @@ func (s *Service) RunManualProbe(model string, promptID string) (*Result, error)
 		return nil, err
 	}
 	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return nil, errors.New("检测后台正在关闭")
+	}
 	if _, busy := s.running[model]; busy {
 		s.mu.Unlock()
 		return nil, errors.New("该模型检测进行中")
 	}
 	runCtx, cancel := context.WithTimeout(s.ctx, time.Duration(cfg.TimeoutSec+30)*time.Second)
 	s.running[model] = cancel
+	s.wg.Add(1)
 	s.mu.Unlock()
+	defer s.wg.Done()
 	defer func() {
 		s.mu.Lock()
 		delete(s.running, model)
@@ -641,32 +699,49 @@ func (s *Service) RunManualProbe(model string, promptID string) (*Result, error)
 	return res, nil
 }
 
-// UpsertPrompt validates and saves a prompt.
+// UpsertPrompt validates and saves a prompt. Builtin status is preserved by
+// the server to prevent forgery.
 func (s *Service) UpsertPrompt(p *Prompt) error {
-	if p.Builtin {
-		return errors.New("内置题目不可修改")
+	p.ID = strings.TrimSpace(p.ID)
+	if p.ID == "" {
+		p.ID = "custom-" + randomHex(4)
+		p.Builtin = false
+	} else {
+		existing, err := s.store.Prompt(p.ID)
+		if err != nil {
+			return err
+		}
+		if existing != nil {
+			p.Builtin = existing.Builtin
+		} else {
+			p.Builtin = isBuiltinPromptID(p.ID)
+		}
 	}
 	if err := p.Validate(); err != nil {
 		return err
-	}
-	if p.ID == "" {
-		p.ID = "custom-" + randomHex(4)
 	}
 	return s.store.SavePrompt(p)
 }
 
 // DeletePrompt removes a custom prompt.
 func (s *Service) DeletePrompt(id string) error {
-	prompts, err := s.store.Prompts()
+	p, err := s.store.Prompt(id)
 	if err != nil {
 		return err
 	}
-	for _, p := range prompts {
-		if p.ID == id && p.Builtin {
-			return errors.New("内置题目不可删除")
-		}
+	if p != nil && p.Builtin {
+		return errors.New("内置题目不可删除")
 	}
 	return s.store.DeletePrompt(id)
+}
+
+func isBuiltinPromptID(id string) bool {
+	for _, b := range Builtins() {
+		if b.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // TargetsDueNow forces a scheduler pass (used after config changes).

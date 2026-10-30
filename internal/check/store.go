@@ -76,6 +76,19 @@ CREATE TABLE IF NOT EXISTS results (
 );
 CREATE INDEX IF NOT EXISTS idx_results_model ON results(model, created_at DESC);
 `)
+	if err != nil {
+		return err
+	}
+	var exists int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('targets') WHERE name='manual_hold'`).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		if _, err := s.db.Exec(`ALTER TABLE targets ADD COLUMN manual_hold INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+		_, err = s.db.Exec(`UPDATE targets SET manual_hold=1 WHERE state='review'`)
+	}
 	return err
 }
 
@@ -164,6 +177,16 @@ type Target struct {
 	CheckedAt      time.Time `json:"checked_at"`
 	AllowUntil     time.Time `json:"allow_until"`
 	FailStreak     int       `json:"fail_streak"`
+	ManualHold     bool      `json:"manual_hold"`
+	Blocked        bool      `json:"blocked"`
+}
+
+// blockedAt is independent of monitoring: stopping probes never releases a hold.
+func (t *Target) blockedAt(now time.Time) bool {
+	if t.AllowUntil.After(now) {
+		return false
+	}
+	return t.ManualHold || t.State == StateFailed || t.State == StateReview || t.State == StateUnavailable
 }
 
 func scanTarget(row interface{ Scan(...any) error }) (*Target, error) {
@@ -173,7 +196,7 @@ func scanTarget(row interface{ Scan(...any) error }) (*Target, error) {
 		next, checked, allow int64
 	)
 	err := row.Scan(&t.Model, &t.Enabled, &promptIDs, &t.IntervalMin, &t.FailRecheckMin,
-		&next, &t.State, &t.Reason, &checked, &allow, &t.FailStreak)
+		&next, &t.State, &t.Reason, &checked, &allow, &t.FailStreak, &t.ManualHold)
 	if err != nil {
 		return nil, err
 	}
@@ -181,10 +204,11 @@ func scanTarget(row interface{ Scan(...any) error }) (*Target, error) {
 	t.NextCheckAt = time.Unix(next, 0).UTC()
 	t.CheckedAt = time.Unix(checked, 0).UTC()
 	t.AllowUntil = time.Unix(allow, 0).UTC()
+	t.Blocked = t.blockedAt(time.Now())
 	return &t, nil
 }
 
-const targetCols = `model,enabled,prompt_ids,interval_min,fail_recheck_min,next_check_at,state,reason,checked_at,allow_until,fail_streak`
+const targetCols = `model,enabled,prompt_ids,interval_min,fail_recheck_min,next_check_at,state,reason,checked_at,allow_until,fail_streak,manual_hold`
 
 // SaveTarget inserts or updates a target.
 func (s *Store) SaveTarget(t *Target) error {
@@ -192,14 +216,16 @@ func (s *Store) SaveTarget(t *Target) error {
 		t.PromptIDs = []string{}
 	}
 	ids, _ := json.Marshal(t.PromptIDs)
-	_, err := s.db.Exec(`INSERT INTO targets(`+targetCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+	_, err := s.db.Exec(`INSERT INTO targets(`+targetCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
 	  ON CONFLICT(model) DO UPDATE SET
 	    enabled=excluded.enabled, prompt_ids=excluded.prompt_ids,
 	    interval_min=excluded.interval_min, fail_recheck_min=excluded.fail_recheck_min,
 	    next_check_at=excluded.next_check_at, state=excluded.state, reason=excluded.reason,
-	    checked_at=excluded.checked_at, allow_until=excluded.allow_until, fail_streak=excluded.fail_streak`,
+	    checked_at=excluded.checked_at, allow_until=excluded.allow_until, fail_streak=excluded.fail_streak,
+	    manual_hold=excluded.manual_hold`,
 		t.Model, t.Enabled, string(ids), t.IntervalMin, t.FailRecheckMin,
-		t.NextCheckAt.Unix(), t.State, t.Reason, t.CheckedAt.Unix(), t.AllowUntil.Unix(), t.FailStreak)
+		t.NextCheckAt.Unix(), t.State, t.Reason, t.CheckedAt.Unix(), t.AllowUntil.Unix(), t.FailStreak, t.ManualHold)
+	t.Blocked = t.blockedAt(time.Now())
 	return err
 }
 
@@ -339,20 +365,76 @@ func dayStartUnix(now time.Time) int64 {
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Unix()
 }
 
-// SeedBuiltins inserts builtin prompts that are missing.
+// SeedBuiltins inserts builtin prompts that are missing, and migrates unedited
+// legacy candy prompts from contains/21 to number/21 without overwriting user edits.
 func (s *Store) SeedBuiltins() error {
 	for _, b := range Builtins() {
-		automatic := b.ID == "candy"
-		p := Prompt{ID: b.ID, Name: b.Name, Text: b.Text, Builtin: true, Automatic: automatic}
-		if automatic {
-			p.Grader = GraderContains
-			p.Expect = "21"
+		var (
+			existingID string
+			name       string
+			text       string
+			grader     string
+			expect     string
+			builtinVal int
+			autoVal    int
+		)
+		err := s.db.QueryRow(`SELECT id,name,text,builtin,grader,expect,automatic FROM prompts WHERE id=?`, b.ID).
+			Scan(&existingID, &name, &text, &builtinVal, &grader, &expect, &autoVal)
+		if errors.Is(err, sql.ErrNoRows) {
+			automatic := b.ID == "candy"
+			p := Prompt{ID: b.ID, Name: b.Name, Text: b.Text, Builtin: true, Automatic: automatic}
+			if automatic {
+				p.Grader = GraderNumber
+				p.Expect = "21"
+			} else {
+				p.Grader = GraderNone
+			}
+			builtin := 1
+			auto := 0
+			if p.Automatic {
+				auto = 1
+			}
+			if _, insertErr := s.db.Exec(`INSERT INTO prompts(id,name,text,builtin,grader,expect,automatic)
+			  VALUES(?,?,?,?,?,?,?)`,
+				p.ID, p.Name, p.Text, builtin, string(p.Grader), p.Expect, auto); insertErr != nil {
+				return insertErr
+			}
+			continue
 		}
-		if err := s.SavePrompt(&p); err != nil {
+		if err != nil {
 			return err
+		}
+
+		// Only migrate unedited original candy (contains/21 with canonical text/name) to number.
+		if b.ID == "candy" && name == b.Name && text == b.Text && GraderKind(grader) == GraderContains && expect == "21" {
+			if _, updateErr := s.db.Exec(`UPDATE prompts SET grader=? WHERE id=?`, string(GraderNumber), b.ID); updateErr != nil {
+				return updateErr
+			}
 		}
 	}
 	return nil
+}
+
+// Prompt gets one prompt; returns (nil, nil) when absent.
+func (s *Store) Prompt(id string) (*Prompt, error) {
+	var (
+		p         Prompt
+		builtin   int
+		grader    string
+		automatic int
+	)
+	err := s.db.QueryRow(`SELECT id,name,text,builtin,grader,expect,automatic FROM prompts WHERE id=?`, id).
+		Scan(&p.ID, &p.Name, &p.Text, &builtin, &grader, &p.Expect, &automatic)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	p.Builtin = builtin != 0
+	p.Grader = GraderKind(grader)
+	p.Automatic = automatic != 0
+	return &p, nil
 }
 
 // DeletePrompt removes a custom prompt (builtin ones are restored on start).
@@ -363,12 +445,20 @@ func (s *Store) DeletePrompt(id string) error {
 
 // SavePrompt inserts or updates a prompt.
 func (s *Store) SavePrompt(p *Prompt) error {
+	builtin := 0
+	if p.Builtin {
+		builtin = 1
+	}
+	automatic := 0
+	if p.Automatic {
+		automatic = 1
+	}
 	_, err := s.db.Exec(`INSERT INTO prompts(id,name,text,builtin,grader,expect,automatic)
 	  VALUES(?,?,?,?,?,?,?)
 	  ON CONFLICT(id) DO UPDATE SET
 	    name=excluded.name, text=excluded.text, grader=excluded.grader,
 	    expect=excluded.expect, automatic=excluded.automatic`,
-		p.ID, p.Name, p.Text, p.Builtin, string(p.Grader), p.Expect, p.Automatic)
+		p.ID, p.Name, p.Text, builtin, string(p.Grader), p.Expect, automatic)
 	return err
 }
 
