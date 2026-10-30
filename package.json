@@ -1,0 +1,21 @@
+{
+  "name": "magpie-model-guard",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Magpie plugin: model-level intelligence downgrade detection, custom probes and scheduled checks. Works with any model.",
+  "main": "./plugin/index.mjs",
+  "files": [
+    "plugin",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "magpie",
+    "magpie-plugin"
+  ],
+  "license": "MIT",
+  "magpie": {
+    "middleware": "./plugin/gate.middleware.js"
+  }
+}

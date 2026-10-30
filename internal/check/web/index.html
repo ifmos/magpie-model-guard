@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Guard 控制台</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>Model Guard <span class="sub">模型级降智检测</span></h1>
+  <nav id="tabs">
+    <button data-tab="targets" class="active">监测目标</button>
+    <button data-tab="prompts">检测题库</button>
+    <button data-tab="results">检测记录</button>
+    <button data-tab="settings">连接设置</button>
+  </nav>
+</header>
+<main>
+  <section id="page-targets" class="page active">
+    <div class="toolbar">
+      <button id="refresh-models">刷新模型</button>
+      <select id="model-pick" size="6"></select>
+      <div class="field"><label>检测间隔(分)</label><input id="new-interval" type="number" value="30" min="5" max="10080"></div>
+      <div class="field"><label>失败复检(分,0=默认60)</label><input id="new-failwait" type="number" value="0" min="0" max="10080"></div>
+      <button id="add-target">添加监测</button>
+    </div>
+    <table id="target-table">
+      <thead><tr><th>模型</th><th>状态</th><th>上次检测</th><th>下次检测</th><th>原因</th><th>操作</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section id="page-prompts" class="page">
+    <div class="toolbar">
+      <button id="new-prompt">新建题目</button>
+    </div>
+    <table id="prompt-table">
+      <thead><tr><th>ID</th><th>名称</th><th>判分</th><th>期望</th><th>自动</th><th>操作</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <form id="prompt-form" class="modal hidden">
+      <h2 id="prompt-form-title">新建题目</h2>
+      <div class="field"><label>名称</label><input id="pf-name" required></div>
+      <div class="field"><label>题目文本</label><textarea id="pf-text" rows="8" required></textarea></div>
+      <div class="field"><label>判分类型</label>
+        <select id="pf-grader">
+          <option value="none">人工评价</option>
+          <option value="contains">包含关键字</option>
+          <option value="exact">精确匹配</option>
+          <option value="regex">正则匹配</option>
+        </select></div>
+      <div class="field"><label>期望答案/规则</label><input id="pf-expect"></div>
+      <div class="field"><label>参与自动门禁</label><input id="pf-automatic" type="checkbox"></div>
+      <div class="actions"><button type="submit">保存</button><button type="button" id="pf-cancel">取消</button></div>
+    </form>
+  </section>
+
+  <section id="page-results" class="page">
+    <div class="toolbar">
+      <select id="result-model"></select>
+      <button id="refresh-results">刷新</button>
+    </div>
+    <div id="result-list"></div>
+  </section>
+
+  <section id="page-settings" class="page">
+    <div class="settings">
+      <div class="field"><label>网关 URL</label><input id="cfg-url" placeholder="http://127.0.0.1:3425"></div>
+      <div class="field"><label>网关 Key</label><input id="cfg-key" type="password" placeholder="magpie"></div>
+      <div class="field"><label>每日预算(次/模型)</label><input id="cfg-limit" type="number" value="120" min="1" max="10000"></div>
+      <div class="field"><label>单次超时(秒)</label><input id="cfg-timeout" type="number" value="180" min="10" max="600"></div>
+      <div class="field"><label>不可用冷却(分)</label><input id="cfg-cool" type="number" value="15" min="1" max="1440"></div>
+      <button id="save-config">保存并验证</button>
+      <p id="config-msg"></p>
+    </div>
+  </section>
+</main>
+<div id="toast" class="hidden"></div>
+<script src="/app.js"></script>
+</body>
+</html>
