@@ -60,6 +60,9 @@ for (const runtime of hostRuntimes) {
     const entry = path.join(dir, 'plugin', 'index.mjs');
     await mkdir(path.dirname(entry));
     await copyFile(path.join(root, 'plugin', 'index.mjs'), entry);
+    for (const extra of ['cloudflared-runtime.mjs', 'console-readiness.mjs']) {
+      await copyFile(path.join(root, 'plugin', extra), path.join(dir, 'plugin', extra));
+    }
     const platform = { win32: 'windows', darwin: 'darwin', linux: 'linux' }[process.platform] || process.platform;
     const arch = { x64: 'amd64' }[process.arch] || process.arch;
     const binary = path.join(root, 'bin', `model-guard-${platform}-${arch}${process.platform === 'win32' ? '.exe' : ''}`);
@@ -122,21 +125,23 @@ for (const runtime of hostRuntimes) {
         host.stdin.write(wire.slice(middle));
       });
     }
-    const url = new URL(await request({ id: 1, method: 'load' }));
-    const token = new URLSearchParams(url.hash.slice(1)).get('token');
-    const headers = { authorization: `Bearer ${token}` };
-    assert.equal((await fetch(url.origin + '/api/state', { headers })).status, 200);
-    const nextUrl = new URL(await request({ id: 2, method: 'authorize' }));
-    const nextToken = new URLSearchParams(nextUrl.hash.slice(1)).get('token');
-    assert.equal((await fetch(nextUrl.origin + '/api/state', {
-      headers: { authorization: `Bearer ${nextToken}` },
-    })).status, 200);
+    const open = async () => {
+      const link = new URL(await request({ id: 2, method: 'authorize' }));
+      const login = await fetch(link, { redirect: 'manual' });
+      assert.equal(login.status, 303);
+      return login.headers.get('set-cookie')?.split(';')[0];
+    };
+    const headers = { cookie: await open() };
+    const origin = (await request({ id: 3, method: 'authorize' })).replace(/\/open\/.*$/, '');
+    assert.equal((await fetch(origin + '/api/state', { headers })).status, 200);
+    const nextHeaders = { cookie: await open() };
+    assert.equal((await fetch(origin + '/api/state', { headers: nextHeaders })).status, 200);
     host.stdin.end();
     let listenerClosed = false;
     const deadline = Date.now() + 3000;
     while (Date.now() < deadline) {
       try {
-        await fetch(url.origin + '/api/state', { headers, signal: AbortSignal.timeout(250) });
+        await fetch(origin + '/api/state', { headers, signal: AbortSignal.timeout(250) });
       } catch (error) {
         if (error.name === 'TypeError') { listenerClosed = true; break; }
         if (error.name !== 'TimeoutError') throw error;

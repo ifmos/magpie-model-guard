@@ -29,17 +29,19 @@ test('GitHub package starts its bundled backend and opens the console without Go
       await hooks.config(cfg);
       const entry = await hooks.auth.methods[0].authorize();
       const url = new URL(entry.url);
-      const token = new URLSearchParams(url.hash.slice(1)).get('token');
-      assert.ok(token);
-      assert.equal((await fetch(url.origin)).status, 200);
-      const headers = { authorization: 'Bearer ' + token, 'content-type': 'application/json' };
+      assert.match(url.pathname, /^\\/open\\//);
+      const login = await fetch(url, { redirect: 'manual' });
+      assert.equal(login.status, 303);
+      const session = login.headers.get('set-cookie')?.split(';')[0];
+      assert.ok(session);
       assert.equal((await fetch(url.origin + '/api/state')).status, 401);
-      const response = await fetch(url.origin + '/api/state', { headers });
+      assert.equal((await fetch(url.origin + '/api/health', { headers: { cookie: session } })).status, 200);
+      const response = await fetch(url.origin + '/api/state', { headers: { cookie: session } });
       assert.equal(response.status, 200);
       const state = await response.json();
       assert.ok(state.prompts.some(p => p.id === 'candy'));
       const target = await fetch(url.origin + '/api/targets', {
-        method: 'POST', headers,
+        method: 'POST', headers: { cookie: session, 'content-type': 'application/json' },
         body: JSON.stringify({ model: 'example/model', enabled: false, prompt_ids: ['candy'], interval_min: 30 }),
       });
       assert.equal(target.status, 200, await target.text());

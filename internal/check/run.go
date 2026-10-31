@@ -23,6 +23,7 @@ type Options struct {
 	PluginOwned  bool
 	MagpieConfig string
 	MagpiePath   string
+	Cloudflared  string
 }
 
 // StartupInfo is printed on stdout (one JSON line) when started by the plugin
@@ -70,8 +71,16 @@ func Run(o Options) error {
 	}
 
 	mux := http.NewServeMux()
-	registerAPI(mux, svc)
-	registerConsole(mux)
+	access := NewAccess("", "")
+	console := NewConsole(access, "", o.DataDir, o.Cloudflared)
+	registerAPI(mux, svc, access, console)
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		// A public readiness probe exposes no management state or credentials.
+		w.Header().Set("X-Magpie-Model-Guard", "ready")
+		w.WriteHeader(http.StatusNoContent)
+	})
+	registerConsole(mux, access)
+	srv := &http.Server{Handler: securityHeaders(mux), ReadHeaderTimeout: 10 * time.Second}
 
 	ln, err := net.Listen("tcp", o.Addr)
 	if err != nil {
@@ -81,18 +90,25 @@ func Run(o Options) error {
 	// Normalize to a reachable origin for the plugin host.
 	origin := fmt.Sprintf("http://%s", normalizeHost(addr))
 
+	// The tunnel needs the final local origin; set it now that the port is known.
+	console.SetLocal(origin)
+
 	var info StartupInfo
 	info.Origin = origin
-	info.Control = svc.NewConsoleToken()
+	info.Control = access.SetControl()
 	info.Pid = os.Getpid()
+
+	access.mu.Lock()
+	access.origins[origin] = true
+	access.mu.Unlock()
 	if o.PluginOwned {
 		b, _ := json.Marshal(info)
 		fmt.Println(string(b))
 	}
 
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	stopHTTP := context.AfterFunc(ownerCtx, func() { _ = srv.Close() })
 	defer stopHTTP()
+	defer console.Close()
 	err = srv.Serve(ln)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -121,4 +137,13 @@ func errJSON(w http.ResponseWriter, status int, msg string) {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// SetControl rotates and returns the control token, granting the plugin host
+// full API access including console link issuance.
+func (a *Access) SetControl() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.control = randomHex(24)
+	return a.control
 }

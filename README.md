@@ -81,7 +81,10 @@ sh scripts/build.sh
 
 ### 首次配置
 
-1. Magpie 插件入口 →「打开 Model Guard 控制台」。
+1. Magpie 插件入口 →「打开本机 Model Guard 控制台」或「打开临时远程控制台（Cloudflare）」。
+   远程入口自动下载经 SHA-256 校验的官方 `cloudflared`（也可用插件选项 `cloudflaredPath` 指定，
+   或设 `autoInstallCloudflared: false` 关闭自动下载），建立临时 HTTPS 通道并返回一次性管理链接；
+   链接十分钟内有效、只能使用一次，临时通道最长 30 分钟。管理链接视同管理员凭证，请勿分享。
 2. 「连接设置」确认网关 URL 与 Key（本机默认 `http://127.0.0.1:3425` / `magpie`；插件直接从本机 `settings.json` 读取）。
 3. 「监测目标」→ 展开「添加监测目标」→ 直接读取本机 Magpie 内部模型目录（包含设置为「仅通过路由组暴露」的供应商模型，排除外部 `group/*`、`auto/*` 别名）→ 搜索模型 ID / 供应商，勾选一个或多个目标 → 添加监测。
 4. 点「重测」立即跑一轮，确认链路正常。
@@ -171,7 +174,8 @@ sh scripts/build.sh
 ## 数据与安全
 
 - 状态存于 `~/.config/magpie-model-guard/model-guard.db`（SQLite）；
-- 管理 API 仅监听回环地址，Bearer token 鉴权，token 由插件入口注入控制台 URL；
+- 管理 API 仅监听回环地址；插件宿主持有控制 token，控制台通过一次性票据链接换取 30 分钟 HttpOnly 会话 Cookie，管理域名不匹配时拒绝票据；
+- 远程临时通道由 Cloudflare Quick Tunnel 提供（无 DNS 配置），隧道目录随会话清理，通道关闭即吊销全部会话；
 - 探针只经过 Magpie 网关，不持有上游供应商凭据；路由同步只管理 `providers.json` 中受影响组的字段，保留供应商与未知配置数据。
 - 路由恢复账本和待提交事务存于插件 SQLite，重启继续处理隔离与恢复。用户修改受管字段时停止覆盖冲突组，并显示组 ID 与冲突字段；请先在 Magpie 中处理冲突。
 - 同步使用插件侧文件锁、写前字节检查和原子替换；Magpie 原生配置写入不共享此锁，因此应避免同时编辑正在同步的组。原生程序在最后检查与替换之间的并发写入仍存在竞争窗口。

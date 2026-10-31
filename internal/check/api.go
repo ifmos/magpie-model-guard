@@ -8,11 +8,14 @@ import (
 	"time"
 )
 
-// auth wraps a handler with bearer-token auth.
-func (s *Service) auth(next http.HandlerFunc) http.HandlerFunc {
+// auth admits the plugin control token or a browser session cookie.
+func auth(access *Access, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !s.CheckConsoleToken(token) {
+		if cookie, err := r.Cookie("mg_session"); err == nil && token == "" {
+			token = cookie.Value
+		}
+		if !access.Control(token) && !access.Session(token) {
 			errJSON(w, http.StatusUnauthorized, "未授权")
 			return
 		}
@@ -21,8 +24,8 @@ func (s *Service) auth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // registerAPI wires all management endpoints.
-func registerAPI(mux *http.ServeMux, s *Service) {
-	h := func(fn http.HandlerFunc) http.Handler { return s.auth(fn) }
+func registerAPI(mux *http.ServeMux, s *Service, access *Access, console *Console) {
+	h := func(fn http.HandlerFunc) http.Handler { return auth(access, fn) }
 
 	mux.Handle("GET /api/state", h(s.apiState))
 	mux.Handle("GET /api/models", h(s.apiModels))
@@ -38,6 +41,8 @@ func registerAPI(mux *http.ServeMux, s *Service) {
 	mux.Handle("POST /api/prompts", h(s.apiPromptUpsert))
 	mux.Handle("POST /api/prompts/delete", h(s.apiPromptDelete))
 	mux.Handle("GET /api/health", h(s.apiHealth))
+	mux.Handle("POST /api/console", controlRequired(access, s.apiConsoleOpen(console)))
+	mux.Handle("POST /api/console/close", h(s.apiConsoleClose(console)))
 }
 
 func (s *Service) apiState(w http.ResponseWriter, r *http.Request) {
@@ -228,4 +233,54 @@ func (s *Service) apiPromptDelete(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) apiHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"health": s.Health(), "time": time.Now().UTC()})
+}
+
+// controlRequired admits only the plugin control token, not browser sessions.
+func controlRequired(access *Access, next http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !access.Control(token) {
+			errJSON(w, http.StatusForbidden, "仅插件可签发管理入口")
+			return
+		}
+		next(w, r)
+	})
+}
+
+// apiConsoleOpen issues a local or remote one-time console link.
+func (s *Service) apiConsoleOpen(console *Console) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if console == nil {
+			errJSON(w, http.StatusServiceUnavailable, "控制台管理未启用")
+			return
+		}
+		var input struct {
+			Remote bool   `json:"remote"`
+			Binary string `json:"binary"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&input); err != nil {
+			errJSON(w, 400, "请求体无效")
+			return
+		}
+		if input.Binary != "" {
+			console.SetBinary(input.Binary)
+		}
+		link, err := console.Open(r.Context(), input.Remote)
+		if err != nil {
+			errJSON(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		writeJSON(w, map[string]string{"url": link})
+	}
+}
+
+// apiConsoleClose tears the tunnel down after acknowledging.
+func (s *Service) apiConsoleClose(console *Console) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if console != nil {
+			// Let the tunnel deliver the acknowledgement before ending transport.
+			time.AfterFunc(300*time.Millisecond, console.Close)
+		}
+		writeJSON(w, map[string]bool{"ok": true})
+	}
 }

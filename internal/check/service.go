@@ -57,8 +57,6 @@ type Service struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
-	consoleMu  sync.Mutex
-	consoleKey string
 	health     string
 	closing    bool
 	routes     *groupController
@@ -112,21 +110,6 @@ func (s *Service) Health() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return strings.TrimSpace(strings.Join([]string{s.health, s.routing.Error}, " "))
-}
-
-// NewConsoleToken rotates and returns the management token.
-func (s *Service) NewConsoleToken() string {
-	s.consoleMu.Lock()
-	defer s.consoleMu.Unlock()
-	s.consoleKey = randomHex(24)
-	return s.consoleKey
-}
-
-// CheckConsoleToken validates a bearer token.
-func (s *Service) CheckConsoleToken(token string) bool {
-	s.consoleMu.Lock()
-	defer s.consoleMu.Unlock()
-	return s.consoleKey != "" && token == s.consoleKey
 }
 
 // loop is the scheduler tick: every 10s it launches due checks.

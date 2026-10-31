@@ -337,9 +337,10 @@ func TestInFlightProbeAppearsInResults(t *testing.T) {
 	defer ts.Close()
 
 	svc, store, _ := newTestService(t, nil)
-	token := svc.NewConsoleToken()
+	access := NewAccess("", "")
+	token := access.SetControl()
 	mux := http.NewServeMux()
-	registerAPI(mux, svc)
+	registerAPI(mux, svc, access, nil)
 
 	cfg := mustConfig(t, store)
 	cfg.GatewayURL = ts.URL

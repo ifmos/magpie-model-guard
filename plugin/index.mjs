@@ -3,6 +3,8 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import os from 'node:os';
+import { resolveCloudflared } from './cloudflared-runtime.mjs';
+import { waitForConsole } from './console-readiness.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 let child, ready, stopDiscovery;
@@ -28,6 +30,7 @@ function start(options = {}) {
       '-magpie-config', options.magpieConfigDir || path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'magpie'),
     ];
     if (options.magpiePath) args.push('-magpie', options.magpiePath);
+    if (options.cloudflaredPath) args.push('-cloudflared', options.cloudflaredPath);
     child = spawn(binary, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     child.stdin.on('error', () => {});
     let output = '';
@@ -123,20 +126,41 @@ export default {
     return {
     auth: {
       provider: 'magpie-model-guard',
-      methods: [{
+      methods: [false, true].map(remote => ({
         type: 'oauth',
-        label: '打开 Model Guard 控制台',
+        label: remote ? '打开临时远程控制台（Cloudflare）' : '打开本机 Model Guard 控制台',
         async authorize() {
           const v = await start(options);
-          const url = `${v.origin}/#token=${v.control}`;
+          let binary;
+          if (remote) binary = await resolveCloudflared(options, options.dataDir || path.join(os.homedir(), '.config', 'magpie-model-guard'));
+          const r = await fetch(v.origin + '/api/console', {
+            method: 'POST',
+            headers: { authorization: `Bearer ${v.control}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ remote, binary }),
+          });
+          if (!r.ok) throw new Error(await r.text());
+          const { url } = await r.json();
+          if (remote) {
+            try { await waitForConsole(url); }
+            catch (error) {
+              await fetch(v.origin + '/api/console/close', {
+                method: 'POST',
+                headers: { authorization: `Bearer ${v.control}`, 'content-type': 'application/json' },
+                body: '{}',
+              }).catch(() => {});
+              // The service delays tunnel shutdown to deliver its acknowledgement.
+              await new Promise(resolve => setTimeout(resolve, 350));
+              throw error;
+            }
+          }
           return {
             url,
-            instructions: `完整管理链接：${url}\n复制链接后在浏览器打开。此入口不是供应商登录，无需提交验证码；使用后可以取消此窗口。`,
+            instructions: `完整管理链接：${url}\n复制链接后在浏览器打开。链接十分钟内有效且只能使用一次。此入口不是供应商登录，无需提交验证码；使用后可以取消此窗口。${remote ? '临时通道最长 30 分钟。' : ''}`,
             method: 'code',
             callback: async () => ({ type: 'failed' }),
           };
         },
-      }],
+      })),
       async loader() { await start(options); return {}; },
     },
     async config(cfg) {
