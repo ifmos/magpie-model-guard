@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { cp, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -56,5 +56,22 @@ test('GitHub package starts its bundled backend and opens the console without Go
     assert.match(stdout, /packaged backend, console, authentication, candy bank and new target: OK/);
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// The npm package must carry every resource the remote console needs: the
+// cloudflared auto-installer copies third_party/cloudflared/LICENSE next to
+// the binary it downloads.
+test('npm package files include the cloudflared third-party license', async () => {
+  const packDir = await mkdtemp(path.join(os.tmpdir(), 'model-guard-pack-'));
+  try {
+    await exec('npm', ['pack', '-q', '--pack-destination', packDir], { cwd: root });
+    const [archive] = await readdir(packDir);
+    const listing = await exec('tar', ['-tzf', path.join(packDir, archive)]);
+    assert.match(listing.stdout, /package\/third_party\/cloudflared\/LICENSE$/m);
+    assert.match(listing.stdout, /package\/plugin\/cloudflared-runtime\.mjs$/m);
+    assert.match(listing.stdout, /package\/plugin\/console-readiness\.mjs$/m);
+  } finally {
+    await rm(packDir, { recursive: true, force: true });
   }
 });
