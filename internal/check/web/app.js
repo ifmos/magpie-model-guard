@@ -473,7 +473,7 @@
     }
 
     if (!models.length) {
-      optionsContainer.innerHTML = "<div class='dropdown-empty'>暂无模型，请先点击「刷新模型列表」从网关获取</div>";
+      optionsContainer.innerHTML = "<div class='dropdown-empty'>暂无模型，请点击「刷新模型列表」读取本机 Magpie 内部目录</div>";
     } else if (!filtered.length) {
       optionsContainer.innerHTML = "<div class='dropdown-empty'>未找到匹配「" + esc(q) + "」的模型</div>";
     } else {
@@ -627,7 +627,7 @@
     }
   });
 
-  // Refresh models list from gateway
+  // Refresh the local Magpie catalog independently of probe gateway settings.
   var refreshModelsBtn = document.getElementById("refresh-models");
   if (refreshModelsBtn) {
     refreshModelsBtn.addEventListener("click", function () {
@@ -638,7 +638,7 @@
         state.models = models || [];
         renderModelPicker();
         openModelDropdown();
-        toast(state.models.length ? "已获取 " + state.models.length + " 个可用模型" : "网关返回模型列表为空，请检查配置");
+        toast(state.models.length ? "已读取 " + state.models.length + " 个 Magpie 内部模型" : "Magpie 内部模型列表为空，请先在 Magpie 中配置模型");
       }).catch(function (e) {
         toast("获取模型失败：" + e.message);
       }).then(function () {
@@ -1294,34 +1294,19 @@
 
       saveConfigBtn.disabled = true;
       if (msgEl) {
-        msgEl.textContent = "正在保存配置并验证网关连接…";
+        msgEl.textContent = "正在保存配置…";
         msgEl.className = "form-message";
       }
 
-      // Step 1: Save config
       api("POST", "/api/config", c).then(function () {
-        // Step 2: Honest verification via real GET /api/models (never fake verified!)
-        return api("GET", "/api/models").then(function (models) {
-          state.models = models || [];
-          renderModelPicker();
-          configDirty = false;
-          if (recalcEl) recalcEl.checked = false;
-          if (msgEl) {
-            msgEl.textContent = "✓ 配置已保存，网关连接验证成功（获取到 " + state.models.length + " 个模型）";
-            msgEl.className = "form-message is-success";
-          }
-          toast("配置已保存，网关连接验证成功");
-          loadState();
-        }).catch(function (verifyErr) {
-          configDirty = false;
-          if (recalcEl) recalcEl.checked = false;
-          if (msgEl) {
-            msgEl.textContent = "⚠ 配置已保存，但网关连接验证失败：" + verifyErr.message + "。请检查网关 URL 与 Key。";
-            msgEl.className = "form-message is-warning";
-          }
-          toast("配置已保存，但网关连接验证失败");
-          loadState();
-        });
+        configDirty = false;
+        if (recalcEl) recalcEl.checked = false;
+        if (msgEl) {
+          msgEl.textContent = "✓ 配置已保存。请在监测目标中点击「重测」验证检测连接。";
+          msgEl.className = "form-message is-success";
+        }
+        toast("配置已保存");
+        loadState();
       }).catch(function (saveErr) {
         if (msgEl) {
           msgEl.textContent = "保存配置失败：" + saveErr.message;
@@ -1349,13 +1334,14 @@
 
   // Initial load
   loadState().then(function () {
-    // Attempt to prefetch models if gateway is configured
-    if (state.config && state.config.gateway_url) {
-      api("GET", "/api/models").then(function (models) {
-        state.models = models || [];
-        renderModelPicker();
-      }).catch(function () { /* ignore initial silent fail */ });
-    }
+    // Local model discovery does not require a configured probe gateway.
+    api("GET", "/api/models").then(function (models) {
+      state.models = models || [];
+      renderModelPicker();
+    }).catch(function () {
+      var statusEl = document.getElementById("model-picker-status");
+      if (statusEl) statusEl.textContent = "内部列表未加载，请点击刷新";
+    });
   });
 
   // Safe polling: does not wipe uncommitted settings, does not interrupt open dialog or running tests

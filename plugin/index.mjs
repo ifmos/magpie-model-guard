@@ -61,7 +61,7 @@ process.stdin.once('end', stopBackend);
 process.stdin.once('close', stopBackend);
 
 // Discover the local magpie gateway (settings.json port / MAGPIE_ADDR).
-async function discoverGateway(options = {}, env = process.env, fetcher = fetch) {
+async function discoverGateway(options = {}, env = process.env) {
   let url = options.gatewayURL;
   const key = options.gatewayKey || 'magpie';
   if (!url) {
@@ -69,7 +69,7 @@ async function discoverGateway(options = {}, env = process.env, fetcher = fetch)
     try {
       const { readFile } = await import('node:fs/promises');
       const settings = JSON.parse(await readFile(
-        path.join(env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'magpie', 'settings.json'), 'utf8'));
+        path.join(options.magpieConfigDir || path.join(env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'magpie'), 'settings.json'), 'utf8'));
       if (Number.isInteger(settings.port) && settings.port > 0 && settings.port < 65536) port = settings.port;
     } catch {}
     let address = env.MAGPIE_ADDR || `127.0.0.1:${port}`;
@@ -84,13 +84,6 @@ async function discoverGateway(options = {}, env = process.env, fetcher = fetch)
     const parsed = new URL(url);
     if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) return undefined;
     if (!['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname) && !options.gatewayKey) return undefined;
-    const base = url.replace(/\/$/, '');
-    const response = await fetcher(base + (base.endsWith('/v1') ? '' : '/v1') + '/models', {
-      headers: { authorization: `Bearer ${key}` }, redirect: 'error', signal: AbortSignal.timeout(3000),
-    });
-    if (!response.ok) return undefined;
-    const data = await response.json();
-    if (!Array.isArray(data.data)) return undefined;
     return { gateway_url: url, gateway_key: key };
   } catch { return undefined; }
 }

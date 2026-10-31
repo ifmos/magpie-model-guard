@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -189,6 +190,130 @@ func TestDailyBudgetExhausted(t *testing.T) {
 	}
 }
 
+
+func TestListLocalInternalModels(t *testing.T) {
+	root := t.TempDir()
+	cfgDir := filepath.Join(root, ".config", "magpie")
+	cacheDir := filepath.Join(root, ".cache", "magpie")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(cacheDir, "models"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	providersJSON := `{
+	  "providers": [
+	    {
+	      "id": "apifox",
+	      "unlisted": true,
+	      "models": ["claude-opus-4-7", "gpt-5.4"]
+	    },
+	    {
+	      "id": "mosai",
+	      "preset": "remote-magpie",
+	      "unlisted": true,
+	      "models": null
+	    },
+	    {
+	      "id": "copilot",
+	      "hidden": true,
+	      "models": ["gpt-4o"]
+	    },
+	    {
+	      "id": "disabled",
+	      "off": true,
+	      "models": ["skip-me"]
+	    }
+	  ],
+	  "groups": [
+	    {
+	      "id": "coding",
+	      "members": ["apifox/gpt-5.4:xhigh", "mosai/codex/gpt-5.4"]
+	    }
+	  ]
+	}`
+	if err := os.WriteFile(filepath.Join(cfgDir, "providers.json"), []byte(providersJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mosaiCacheJSON := `{
+	  "models": [
+	    {"ID": "auto/deepseek-flash"},
+	    {"ID": "codex/gpt-5.4"},
+	    {"ID": "codex/gpt-image-2", "Draws": true}
+	  ]
+	}`
+	if err := os.WriteFile(filepath.Join(cacheDir, "models", "mosai.json"), []byte(mosaiCacheJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stateCacheJSON := `{
+	  "providers": {
+	    "providers": [
+	      {
+	        "id": "codex",
+	        "off": false,
+	        "models": [
+	          {"id": "gpt-5.3-codex", "on": true},
+	          {"id": "gpt-image-1", "on": true, "kind": "image"},
+	          {"id": "off-model", "on": false}
+	        ]
+	      },
+	      {
+	        "id": "copilot",
+	        "off": false,
+	        "models": [{"id": "gpt-4o", "on": true}]
+	      }
+	    ]
+	  }
+	}`
+	if err := os.WriteFile(filepath.Join(cacheDir, "providers-state.json"), []byte(stateCacheJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	gw := &fakeGateway{answer: "ok"}
+	svc, _, _ := newTestService(t, gw)
+	svc.routes = &groupController{configDir: cfgDir}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/models", nil)
+	rec := httptest.NewRecorder()
+	svc.apiModels(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/models status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if gw.requests != 0 {
+		t.Fatalf("GET /api/models must not query external /v1/models, got %d requests", gw.requests)
+	}
+
+	var got []GatewayModel
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := []GatewayModel{
+		{ID: "apifox/claude-opus-4-7", Group: "apifox"},
+		{ID: "apifox/gpt-5.4", Group: "apifox"},
+		{ID: "mosai/auto/deepseek-flash", Group: "mosai"},
+		{ID: "mosai/codex/gpt-5.4", Group: "mosai"},
+		{ID: "codex/gpt-5.3-codex", Group: "codex"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("models = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("models[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+
+	cliParsed := parseLocalModels(
+		"  auto/default               smart\n  group/coding               round-robin\n  apifox/gpt-5.4             OpenAI\n",
+		map[string]bool{"apifox": true, "group": true, "auto": true},
+	)
+	if len(cliParsed) != 1 || cliParsed[0].ID != "apifox/gpt-5.4" {
+		t.Fatalf("parseLocalModels must exclude top-level auto/* and group/*, got %+v", cliParsed)
+	}
+}
 // helpers
 
 func mustConfig(t *testing.T, s *Store) GuardConfig {

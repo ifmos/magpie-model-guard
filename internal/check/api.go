@@ -50,12 +50,14 @@ func (s *Service) apiState(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) apiModels(w http.ResponseWriter, r *http.Request) {
-	cfg, err := s.store.LoadConfig()
-	if err != nil {
-		errJSON(w, 500, err.Error())
+	s.mu.Lock()
+	routes := s.routes
+	s.mu.Unlock()
+	if routes == nil {
+		errJSON(w, 503, "未配置本机 Magpie 目录，请使用 -magpie-config 指定")
 		return
 	}
-	models, err := ListModels(r.Context(), ProbeConfig{GatewayURL: cfg.GatewayURL, GatewayKey: cfg.GatewayKey})
+	models, err := routes.listModels(r.Context())
 	if err != nil {
 		errJSON(w, 502, err.Error())
 		return

@@ -37,51 +37,10 @@ var probeHTTP = &http.Client{
 	},
 }
 
-// GatewayModel is one entry of the gateway model list.
+// GatewayModel is one entry of Magpie's internal model catalog.
 type GatewayModel struct {
 	ID    string `json:"id"`
 	Group string `json:"group"`
-}
-
-// ListModels fetches /v1/models from the gateway.
-func ListModels(ctx context.Context, c ProbeConfig) ([]GatewayModel, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if err := ValidateGateway(c.GatewayURL); err != nil {
-		return nil, err
-	}
-	base := gatewayBase(c.GatewayURL)
-	req, err := http.NewRequestWithContext(ctx, "GET", base+"/models", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.GatewayKey)
-	resp, err := probeHTTP.Do(req)
-	if err != nil {
-		return nil, errors.New("无法读取 Magpie 模型列表")
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("模型列表 HTTP %d", resp.StatusCode)
-	}
-	var data struct {
-		Data []struct {
-			ID      string `json:"id"`
-			OwnedBy string `json:"owned_by"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4*1024*1024)).Decode(&data); err != nil {
-		return nil, errors.New("模型列表无效")
-	}
-	out := []GatewayModel{}
-	for _, m := range data.Data {
-		group := m.OwnedBy
-		if i := strings.Index(m.ID, "/"); i > 0 {
-			group = m.ID[:i]
-		}
-		out = append(out, GatewayModel{ID: m.ID, Group: group})
-	}
-	return out, nil
 }
 
 func gatewayBase(raw string) string {
