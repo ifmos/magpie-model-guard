@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -34,13 +35,25 @@ const (
 // middleware can let them through without recursion.
 const ProbeAliasPrefix = "model-guard-probe/"
 
+// runningProbe tracks an in-flight detection so active checks appear in results.
+type runningProbe struct {
+	id        string
+	model     string
+	promptID  string
+	detail    string
+	source    string
+	startedAt time.Time
+	active    bool
+	cancel    context.CancelFunc
+}
+
 // Service owns all state and the scheduler.
 type Service struct {
 	mu    sync.Mutex
 	store *Store
 	gate  string
 
-	running    map[string]context.CancelFunc // model -> cancel
+	running    map[string]*runningProbe // model -> active run
 	ctx        context.Context
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
@@ -67,7 +80,7 @@ func newService(store *Store, gatePath string, scheduled bool) (*Service, error)
 	s := &Service{
 		store:   store,
 		gate:    gatePath,
-		running: map[string]context.CancelFunc{},
+		running: map[string]*runningProbe{},
 		ctx:     ctx,
 		cancel:  cancel,
 	}
@@ -162,13 +175,36 @@ func (s *Service) schedule() {
 }
 
 // launchRoundLocked starts one round while the caller owns s.mu.
+func initialRoundPromptID(t *Target, cfg GuardConfig) string {
+	if t == nil {
+		return ""
+	}
+	if EffectiveScheduleMode(t.ScheduleMode, cfg.ScheduleMode) == ScheduleModeStaged && t.RetryPromptID != "" {
+		return t.RetryPromptID
+	}
+	if len(t.PromptIDs) > 0 {
+		return strings.Join(t.PromptIDs, "+")
+	}
+	return "auto"
+}
+
 func (s *Service) launchRoundLocked(t *Target, cfg GuardConfig, source string) {
 	runCtx, cancel := context.WithCancel(s.ctx)
-	s.running[t.Model] = cancel
+	rp := &runningProbe{
+		id:        "checking-" + randomHex(8),
+		model:     t.Model,
+		promptID:  initialRoundPromptID(t, cfg),
+		detail:    "探针检测进行中，等待模型响应…",
+		source:    source,
+		startedAt: time.Now().UTC(),
+		active:    true,
+		cancel:    cancel,
+	}
+	s.running[t.Model] = rp
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		defer s.finishRun(t.Model, cancel)
+		defer s.finishRun(t.Model, rp)
 		if _, err := s.runRound(runCtx, t, cfg, source); err != nil {
 			s.mu.Lock()
 			s.health = err.Error()
@@ -177,13 +213,23 @@ func (s *Service) launchRoundLocked(t *Target, cfg GuardConfig, source string) {
 	}()
 }
 
-func (s *Service) finishRun(model string, cancel context.CancelFunc) {
+func (s *Service) finishRun(model string, rp *runningProbe) {
 	s.mu.Lock()
-	delete(s.running, model)
-	s.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	if s.running[model] == rp {
+		delete(s.running, model)
 	}
+	s.mu.Unlock()
+	if rp != nil && rp.cancel != nil {
+		rp.cancel()
+	}
+}
+
+func (s *Service) markRunResultSaved(model string) {
+	s.mu.Lock()
+	if rp := s.running[model]; rp != nil {
+		rp.active = false
+	}
+	s.mu.Unlock()
 }
 
 // gateTarget is the JSON published into the gate middleware.
@@ -298,6 +344,7 @@ func atomicWrite(name string, data []byte) error {
 // In staged mode, it handles single-round retries, retesting failed prompts without false passes.
 // In fixed mode, it retains immediate independent secondary retry.
 func (s *Service) runRound(ctx context.Context, t *Target, cfg GuardConfig, source string) (*Result, error) {
+	defer s.markRunResultSaved(t.Model)
 	prompts, err := s.store.Prompts()
 	if err != nil {
 		return nil, err
@@ -331,6 +378,7 @@ func (s *Service) runRound(ctx context.Context, t *Target, cfg GuardConfig, sour
 				if err := s.store.AppendResult(final); err != nil {
 					return final, err
 				}
+				s.markRunResultSaved(t.Model)
 				s.applyRoundResult(t, verdict, detail, cfg, now, t.RetryPromptID)
 				return final, nil
 			}
@@ -374,6 +422,7 @@ func (s *Service) runRound(ctx context.Context, t *Target, cfg GuardConfig, sour
 			if err := s.store.AppendResult(final); err != nil {
 				return final, err
 			}
+			s.markRunResultSaved(t.Model)
 			s.applyRoundResult(t, verdict, detail, cfg, now, t.RetryPromptID)
 			return final, nil
 		}
@@ -411,6 +460,7 @@ func (s *Service) runRound(ctx context.Context, t *Target, cfg GuardConfig, sour
 			if err := s.store.AppendResult(final); err != nil {
 				return final, err
 			}
+			s.markRunResultSaved(t.Model)
 			s.applyRoundResult(t, verdict, detail, cfg, now)
 			return final, nil
 		}
@@ -466,6 +516,7 @@ func (s *Service) runRound(ctx context.Context, t *Target, cfg GuardConfig, sour
 		if err := s.store.AppendResult(final); err != nil {
 			return final, err
 		}
+		s.markRunResultSaved(t.Model)
 		s.applyRoundResult(t, verdict, detail, cfg, now, failedPromptID)
 		return final, nil
 	}
@@ -550,6 +601,7 @@ func (s *Service) runRound(ctx context.Context, t *Target, cfg GuardConfig, sour
 	if err := s.store.AppendResult(final); err != nil {
 		return final, err
 	}
+	s.markRunResultSaved(t.Model)
 	s.applyRoundResult(t, verdict, detail, cfg, now)
 	return final, nil
 }
@@ -682,6 +734,29 @@ func (s *Service) probeOnce(ctx context.Context, t *Target, p *Prompt, cfg Guard
 	}
 	pctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	var standalone *runningProbe
+	s.mu.Lock()
+	if rp := s.running[t.Model]; rp != nil {
+		rp.promptID = p.ID
+		rp.detail = fmt.Sprintf("正在检测题目 %s，等待模型响应…", p.Name)
+		rp.startedAt = time.Now().UTC()
+		rp.active = true
+	} else {
+		standalone = &runningProbe{
+			id:        "checking-" + randomHex(8),
+			model:     t.Model,
+			promptID:  p.ID,
+			detail:    fmt.Sprintf("正在检测题目 %s，等待模型响应…", p.Name),
+			source:    source,
+			startedAt: time.Now().UTC(),
+			active:    true,
+		}
+		s.running[t.Model] = standalone
+	}
+	s.mu.Unlock()
+	if standalone != nil {
+		defer s.finishRun(t.Model, standalone)
+	}
 	answer, tokens, err := Call(pctx, ProbeConfig{GatewayURL: cfg.GatewayURL, GatewayKey: cfg.GatewayKey},
 		ProbeAliasPrefix+alias+"/"+t.Model, p.Text, nil)
 	res := &Result{
@@ -747,14 +822,74 @@ func (s *Service) Snapshot() (map[string]any, error) {
 	}
 	s.mu.Lock()
 	routing := s.routing
+	checking := make([]string, 0, len(s.running))
+	for model, rp := range s.running {
+		if rp != nil && rp.active {
+			checking = append(checking, model)
+		}
+	}
 	s.mu.Unlock()
+	sort.Strings(checking)
 	return map[string]any{
-		"config":  cfg,
-		"targets": targets,
-		"prompts": prompts,
-		"health":  s.Health(),
-		"routing": routing,
+		"config":   cfg,
+		"targets":  targets,
+		"prompts":  prompts,
+		"checking": checking,
+		"health":   s.Health(),
+		"routing":  routing,
 	}, nil
+}
+
+// Results lists active in-flight probes followed by persisted probe results,
+// optionally filtered by model and prompt.
+func (s *Service) Results(model, promptID string, limit int) ([]*Result, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	s.mu.Lock()
+	active := make([]*Result, 0, len(s.running))
+	for _, rp := range s.running {
+		if rp == nil || !rp.active {
+			continue
+		}
+		if model != "" && rp.model != model {
+			continue
+		}
+		if promptID != "" && rp.promptID != promptID {
+			continue
+		}
+		active = append(active, &Result{
+			ID:        rp.id,
+			Model:     rp.model,
+			PromptID:  rp.promptID,
+			Answer:    "",
+			Verdict:   StateChecking,
+			Detail:    rp.detail,
+			Tokens:    0,
+			CreatedAt: rp.startedAt,
+			Source:    rp.source,
+		})
+	}
+	s.mu.Unlock()
+
+	sort.Slice(active, func(i, j int) bool {
+		if !active[i].CreatedAt.Equal(active[j].CreatedAt) {
+			return active[i].CreatedAt.After(active[j].CreatedAt)
+		}
+		return active[i].Model < active[j].Model
+	})
+	if len(active) >= limit {
+		return active[:limit], nil
+	}
+
+	stored, err := s.store.Results(model, promptID, limit-len(active))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*Result, 0, len(active)+len(stored))
+	out = append(out, active...)
+	out = append(out, stored...)
+	return out, nil
 }
 
 // targetIntervalMin calculates the scheduled interval in minutes.
@@ -1142,16 +1277,21 @@ func (s *Service) RunManualProbe(model string, promptID string) (*Result, error)
 		return nil, errors.New("该模型检测进行中")
 	}
 	runCtx, cancel := context.WithTimeout(s.ctx, time.Duration(cfg.TimeoutSec+30)*time.Second)
-	s.running[model] = cancel
+	rp := &runningProbe{
+		id:        "checking-" + randomHex(8),
+		model:     model,
+		promptID:  p.ID,
+		detail:    fmt.Sprintf("正在检测题目 %s，等待模型响应…", p.Name),
+		source:    "manual",
+		startedAt: time.Now().UTC(),
+		active:    true,
+		cancel:    cancel,
+	}
+	s.running[model] = rp
 	s.wg.Add(1)
 	s.mu.Unlock()
 	defer s.wg.Done()
-	defer func() {
-		s.mu.Lock()
-		delete(s.running, model)
-		s.mu.Unlock()
-		cancel()
-	}()
+	defer s.finishRun(model, rp)
 	res, err := s.probeOnce(runCtx, t, p, cfg, "manual")
 	if err != nil {
 		return res, err

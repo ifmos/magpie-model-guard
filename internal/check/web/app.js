@@ -3,20 +3,23 @@
   "use strict";
 
   var token = "";
-  var state = { targets: [], prompts: [], config: {}, models: [], health: "" };
+  var state = { targets: [], prompts: [], checking: [], config: {}, models: [], health: "" };
   var configDirty = false;
   var selectedModelIds = new Set();
   var modelSearchQuery = "";
   var isModelDropdownOpen = false;
   var inFlightTests = {};
   var lastFocusedElement = null;
+  var hasCheckingResults = false;
+  var activePollTimer = null;
+  var activePollInFlight = false;
 
   var sectionName = { targets: "监测目标", prompts: "检测题库", results: "检测记录", settings: "连接设置" };
   var stateName = {
     unknown: "未检测", checking: "检测中", passed: "通过",
     failed: "已禁用(降智)", unavailable: "检测不可用", review: "人工暂停",
   };
-  var verdictName = { passed: "通过", failed: "未通过", unavailable: "不可用", manual: "人工" };
+  var verdictName = { checking: "检测中", passed: "通过", failed: "未通过", unavailable: "不可用", manual: "人工" };
   var graderName = {
     none: "人工评价",
     number: "独立数字",
@@ -203,6 +206,33 @@
   }
 
   // ---- navigation ----
+  function isPageActive(tab) {
+    var el = document.getElementById("page-" + tab);
+    return !!(el && el.classList.contains("active"));
+  }
+
+  function hasActiveChecks() {
+    return (state.checking && state.checking.length > 0) ||
+      hasCheckingResults ||
+      Object.keys(inFlightTests).length > 0;
+  }
+
+  function scheduleActivePoll() {
+    clearTimeout(activePollTimer);
+    if (!hasActiveChecks()) return;
+    activePollTimer = setTimeout(function () {
+      if (activePollInFlight) {
+        scheduleActivePoll();
+        return;
+      }
+      activePollInFlight = true;
+      loadState().then(function () {
+        activePollInFlight = false;
+        scheduleActivePoll();
+      });
+    }, 2000);
+  }
+
   document.querySelectorAll("#tabs button").forEach(function (b) {
     b.addEventListener("click", function () {
       document.querySelectorAll("#tabs button").forEach(function (x) { x.classList.remove("active"); });
@@ -210,6 +240,8 @@
       document.querySelectorAll(".page").forEach(function (p) { p.classList.remove("active"); });
       var targetPage = document.getElementById("page-" + b.dataset.tab);
       if (targetPage) targetPage.classList.add("active");
+      var mainShell = document.querySelector(".main-shell");
+      if (mainShell) mainShell.scrollTop = 0;
       var currentSection = document.getElementById("current-section");
       if (currentSection) currentSection.textContent = sectionName[b.dataset.tab] || b.dataset.tab;
       if (b.dataset.tab === "results") loadResults();
@@ -224,6 +256,7 @@
       state.config = snap.config || {};
       state.targets = snap.targets || [];
       state.prompts = snap.prompts || [];
+      state.checking = snap.checking || [];
       state.health = snap.health || "";
       state.routing = snap.routing || {};
       renderTargets();
@@ -231,6 +264,10 @@
       renderSettings();
       renderModelFilter();
       updateOverview();
+      if (isPageActive("results")) {
+        loadResults();
+      }
+      scheduleActivePoll();
       if (state.health) toast("后台：" + state.health);
     }).catch(function (e) {
       toast("加载状态失败：" + e.message);
@@ -320,6 +357,7 @@
         gateBadge = "<span class='gate-badge is-ok'><i></i>正常放行</span>";
       }
 
+      var isChecking = (state.checking || []).indexOf(t.model) !== -1;
       var stateLabel = stateName[t.state] || t.state;
       var stateBadgeClass = "status-" + esc(t.state);
       if (t.schedule_stage === "recovery") {
@@ -330,7 +368,15 @@
         stateLabel = "答错，等待复测";
         stateBadgeClass = "status-recovery-pending";
       }
-      var stateHtml = "<span class='status-badge " + stateBadgeClass + "'><i></i>" + esc(stateLabel) + "</span>";
+      var stateHtml = "";
+      if (isChecking && t.state === "unknown") {
+        stateHtml = "<span class='status-badge status-checking'><i></i>检测中</span>";
+      } else {
+        stateHtml = "<span class='status-badge " + stateBadgeClass + "'><i></i>" + esc(stateLabel) + "</span>";
+        if (isChecking) {
+          stateHtml += "<span class='status-badge status-checking'><i></i>检测中</span>";
+        }
+      }
       if (!t.enabled) {
         // Contract: "暂停检测不显示解封"
         stateHtml += "<span class='badge-paused' title='自动探针检测已暂停'>已暂停检测</span>";
@@ -1125,17 +1171,18 @@
         b.textContent = "测试中…";
         inFlightTests[promptId] = targetModel;
         toast("正在发送探针测试 " + targetModel + " …");
+        scheduleActivePoll();
 
         api("POST", "/api/probe", { model: targetModel, prompt_id: promptId }).then(function (res) {
           var verdictStr = verdictName[res.verdict] || res.verdict || "未知";
           toast("测试结果：" + verdictStr + (res.reason ? (" (" + res.reason + ")") : ""));
-          loadState();
         }).catch(function (e) {
           toast("测试请求失败：" + e.message);
         }).then(function () {
           delete inFlightTests[promptId];
           b.disabled = false;
           b.textContent = "测试";
+          loadState();
         });
       });
     });
@@ -1151,17 +1198,27 @@
     return api("GET", "/api/results?limit=100" + (model ? "&model=" + encodeURIComponent(model) : "")).then(function (rows) {
       var box = document.getElementById("result-list");
       if (!box) return;
+      var openIds = new Set();
+      box.querySelectorAll("details[open][data-result-id]").forEach(function (d) {
+        openIds.add(d.dataset.resultId);
+      });
+      hasCheckingResults = (rows || []).some(function (r) { return r.verdict === "checking"; });
       box.innerHTML = (rows || []).map(function (r) {
-        return "<details><summary>" +
+        var isChecking = r.verdict === "checking";
+        var openAttr = r.id && openIds.has(r.id) ? " open" : "";
+        var detailAttr = " data-result-id='" + esc(r.id || "") + "'" + (isChecking ? " class='is-checking'" : "");
+        var content = r.answer || ("(" + (r.detail || (isChecking ? "探针检测进行中，等待模型返回…" : "无回答内容")) + ")");
+        return "<details" + detailAttr + openAttr + "><summary>" +
           "<span class='status-badge status-" + esc(r.verdict) + "'><i></i>" + esc(verdictName[r.verdict] || r.verdict) + "</span>" +
           "<strong>" + esc(r.model) + "</strong>" +
           "<span class='result-meta'>" + esc(r.prompt_id) + " · " + fmtTime(r.created_at) + " · " + esc(r.source) + "</span>" +
-          "</summary><pre>" + esc(r.answer || ("(" + (r.detail || "无回答内容") + ")")) + "</pre></details>";
+          "</summary><pre>" + esc(content) + "</pre></details>";
       }).join("");
 
       var emptyEl = document.getElementById("result-empty");
       if (emptyEl) emptyEl.classList.toggle("hidden", rows && rows.length > 0);
       box.classList.toggle("hidden", !rows || rows.length === 0);
+      scheduleActivePoll();
     }).catch(function (e) {
       toast("获取检测记录失败：" + e.message);
     }).then(function () {

@@ -314,6 +314,112 @@ func TestListLocalInternalModels(t *testing.T) {
 		t.Fatalf("parseLocalModels must exclude top-level auto/* and group/*, got %+v", cliParsed)
 	}
 }
+
+func TestInFlightProbeAppearsInResults(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		once.Do(func() { close(entered) })
+		<-release
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message":       map[string]string{"content": "最少需要取出 21 个糖果。"},
+				"finish_reason": "stop",
+			}},
+			"usage": map[string]int{"total_tokens": 18},
+		})
+	}))
+	defer ts.Close()
+
+	svc, store, _ := newTestService(t, nil)
+	token := svc.NewConsoleToken()
+	mux := http.NewServeMux()
+	registerAPI(mux, svc)
+
+	cfg := mustConfig(t, store)
+	cfg.GatewayURL = ts.URL
+	cfg.GatewayKey = "magpie"
+	cfg.DailyLimit = 1
+	if err := svc.Configure(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.UpsertTarget(&Target{Model: "prov/a", Enabled: true, PromptIDs: []string{"candy"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendResult(&Result{
+		ID:        "older-1",
+		Model:     "prov/a",
+		PromptID:  "candy",
+		Verdict:   VerdictPassed,
+		Answer:    "21",
+		CreatedAt: time.Now().Add(-48 * time.Hour),
+		Source:    "scheduled",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.TargetAction("prov/a", "recheck"); err != nil {
+		t.Fatalf("recheck: %v", err)
+	}
+	<-entered
+
+	getResults := func(query string) []*Result {
+		t.Helper()
+		req := httptest.NewRequest("GET", "/api/results"+query, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /api/results%s = %d: %s", query, rec.Code, rec.Body.String())
+		}
+		var rows []*Result
+		if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
+			t.Fatal(err)
+		}
+		return rows
+	}
+
+	inFlight := getResults("")
+	if len(inFlight) != 2 {
+		t.Fatalf("in-flight results len = %d, want 2 (checking + older); got %+v", len(inFlight), inFlight)
+	}
+	if inFlight[0].Verdict != StateChecking || inFlight[0].Model != "prov/a" || inFlight[0].PromptID != "candy" || inFlight[0].Source != "manual" {
+		t.Fatalf("top in-flight result = %+v, want checking prov/a candy manual", inFlight[0])
+	}
+	if filtered := getResults("?model=prov/other"); len(filtered) != 0 {
+		t.Fatalf("filtered other model results = %+v, want empty", filtered)
+	}
+	if filtered := getResults("?model=prov/a&prompt=candy"); len(filtered) != 2 || filtered[0].Verdict != StateChecking {
+		t.Fatalf("filtered active model/prompt results = %+v, want checking first", filtered)
+	}
+
+	snap, err := svc.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checking, _ := snap["checking"].([]string)
+	if len(checking) != 1 || checking[0] != "prov/a" {
+		t.Fatalf("snapshot checking = %v, want [prov/a]", checking)
+	}
+
+	close(release)
+	svc.wg.Wait()
+
+	after := getResults("")
+	for _, r := range after {
+		if r.Verdict == StateChecking {
+			t.Fatalf("completed round left stale checking entry: %+v", r)
+		}
+	}
+	if len(after) < 2 || after[0].Verdict != VerdictPassed {
+		t.Fatalf("results after completion = %+v, want newest passed result first", after)
+	}
+}
 // helpers
 
 func mustConfig(t *testing.T, s *Store) GuardConfig {

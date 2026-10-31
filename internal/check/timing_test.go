@@ -517,7 +517,7 @@ func TestRecalculateSchedule(t *testing.T) {
 
 	// 3. Busy target should skip recalculation
 	svc.mu.Lock()
-	svc.running["test/recalc"] = func() {}
+	svc.running["test/recalc"] = &runningProbe{cancel: func() {}}
 	svc.mu.Unlock()
 
 	busyDue := saved2.NextCheckAt

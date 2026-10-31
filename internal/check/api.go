@@ -181,7 +181,7 @@ func (s *Service) apiProbe(w http.ResponseWriter, r *http.Request) {
 func (s *Service) apiResults(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
-	results, err := s.store.Results(q.Get("model"), q.Get("prompt"), limit)
+	results, err := s.Results(q.Get("model"), q.Get("prompt"), limit)
 	if err != nil {
 		errJSON(w, 500, err.Error())
 		return
