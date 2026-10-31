@@ -80,9 +80,11 @@
   }
 
   function api(method, path, body) {
+    var headers = { "content-type": "application/json" };
+    if (token) headers.authorization = "Bearer " + token;
     return fetch(path, {
       method: method,
-      headers: { authorization: "Bearer " + token, "content-type": "application/json" },
+      headers: headers,
       body: body ? JSON.stringify(body) : undefined,
     }).then(function (r) {
       if (r.status === 401) {
@@ -1384,8 +1386,23 @@
     });
   }
 
+  function denyAccess() {
+    document.body.innerHTML = "<div class='no-token'><h2>未授权访问</h2><p>请从 Magpie 插件入口重新打开控制台以获得访问令牌。</p></div>";
+  }
+
   if (!token) {
-    document.body.innerHTML = "<div class='no-token'><h2>未授权访问</h2><p>请从 Magpie 插件入口打开控制台以获得访问令牌。</p></div>";
+    // Cookie session from /open/<ticket>: probe once, deny only on 401.
+    api("GET", "/api/state").then(function () {
+      loadState().then(function () {
+        api("GET", "/api/models").then(function (models) {
+          state.models = models || [];
+          renderModelPicker();
+        }).catch(function () {});
+      });
+      setInterval(loadState, 15000);
+    }).catch(function (err) {
+      if (err.message === "unauthorized") denyAccess();
+    });
     return;
   }
 
