@@ -190,7 +190,6 @@ func TestDailyBudgetExhausted(t *testing.T) {
 	}
 }
 
-
 func TestListLocalInternalModels(t *testing.T) {
 	root := t.TempDir()
 	cfgDir := filepath.Join(root, ".config", "magpie")
@@ -421,6 +420,7 @@ func TestInFlightProbeAppearsInResults(t *testing.T) {
 		t.Fatalf("results after completion = %+v, want newest passed result first", after)
 	}
 }
+
 // helpers
 
 func mustConfig(t *testing.T, s *Store) GuardConfig {

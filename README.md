@@ -5,6 +5,8 @@ Magpie 插件：**模型级别**的降智检测与禁用。定时用可自动判
 - 探针经 Magpie 网关的 Chat Completions 接口发出，不绑定任何供应商或账号体系，**任意模型可用**。
 - 检测题内置「糖果推理」；内置和自定义题均可编辑题目、预期答案与判分规则（数字 / 包含 / 精确 / 正则）。
 - 支持原有固定间隔与 codex-guard 风格的分阶段检测；全局默认、单模型覆盖和每日探针预算。
+- 支持按业务回复中上游实际返回的模型（含 Gemini `modelVersion`）配置规则，命中后禁用、改道后续请求或仅记录。
+- 可选 OpenAI 兼容 Provider 端点：客户端（如 omp）可直接把守卫当作供应商，守卫在返回响应前按业务回复规则重试、改道或返回可重试错误。
 - Go 后台（单二进制，内嵌 Web 控制台）+ Magpie JS 插件宿主 + 网关门禁中间件。
 
 ## 工作流程
@@ -54,6 +56,8 @@ magpie plugin add github:ifmos/magpie-model-guard
 Windows AMD64 五个平台的预编译后台，运行机器不需要安装 Go 或自行构建。
 若旧版本提示“找不到 Go 后台二进制”，请更新插件；若安装缓存未刷新，移除后重新添加，
 再重启 Magpie 或关闭后重新启用插件。此修复不修改用户的数据目录。
+
+`0.5.0` 新增业务回复模型判断：检查业务回复里上游实际返回的模型，按 exact / contains / glob / regex 规则禁用目标、改道后续路由组或仅记录；全局规则与目标自定义覆盖并存。降智检测探针保持独立，不参与响应模型判断。Provider 端点升级为原生 Magpie 网关组合：保留 Chat、Responses（含 WebSocket）、Anthropic、Gemini、目录与媒体能力，保留原始模型 ID，支持有界同目标重试与同步动作提交；后台监听地址持久化，可用 `backendAddr` 覆盖。
 
 `0.4.0` 新增临时远程控制台：插件入口可经 Cloudflare Quick Tunnel 签发一次性 HTTPS 管理链接（十分钟有效、仅可使用一次，通道最长 30 分钟），首次使用自动下载经 SHA-256 校验的官方 `cloudflared`。控制台鉴权同时改为票据换会话 Cookie；旧版本 `#token=` 链接随本次发布停用，请从插件入口重新打开。
 
@@ -173,6 +177,52 @@ sh scripts/build.sh
 - 固定模式默认检测间隔 30 分钟，可按目标设置 1–43200 分钟；
 - 固定模式失败复检默认 60 分钟；分阶段模式按上表分别设置。
 
+### 业务回复模型判断
+
+除了回答内容，Guard 还可以检查**业务回复**里上游实际返回的 `model`（Gemini 的 `modelVersion`）。回复模型命中规则时按动作处理：
+
+| 动作 | 处理 |
+| --- | --- |
+| `disable` | 禁用目标，后续直连请求 403 |
+| `reroute` | 把真实模型加入改道集合，后续路由组避开该成员 |
+| `record` | 只写检测记录 |
+
+- 规则可按 `exact`、`contains`、`glob`、`regex` 匹配，默认不区分大小写；正则可用 `(?-i)` 关闭。
+- 「连接设置 → 业务回复模型判断」配置全局模式、全局规则和改道保持时长；监测目标的「策略」弹窗可选择继承全局或自定义覆盖。
+- 规则只判断业务回复，不判断降智探针：降智是持续性问题，定时探针仍有意义；上游实际模型路由是不确定的，单次探针只代表当次，不能用来推断下一次业务请求会落到哪个成员。
+- 业务回复通过 Magpie 异步 `onResponse` 钩子上报，守卫进程在 `dataDir` 写入权限为 `0600` 的 `response-hook.json` 提供本地回环地址和控制 token；规则未启用时钩子直接跳过。宿主不支持 `magpie.hooks` 时，探针检测与直接门禁仍正常，只是无法判断业务回复。
+- 业务回复命中后，异步钩子只能观察已完成的 200 回复，不能重放当前请求；`disable` / `reroute` 影响后续请求。需要让**当前请求**触发重试时，使用下面的可选 Provider 端点。
+- 改道集合默认保留 30 分钟（可设 1–1440 分钟），到期后路由组自动恢复；检测记录会显示实际模型与命中规则。
+
+### 自定义 Provider（可选）
+
+Provider 不是另建一套供应商实现，而是把**原生 Magpie 网关**组合到守卫的回环地址下：供应商、Key、代理、headers、`extraBody`、fallback、affinity、限流、模型与价格仍由 Magpie 原生配置管理；守卫只负责请求门禁、业务回复判定与有界重试，不复制供应商凭据或协议转换。管理、签发密钥、调试、重启与 MCP 接口不在 Provider 路径中。
+
+「连接设置 → 自定义 Provider」展示三个入口（同一 Provider Key）：
+
+```text
+OpenAI / Responses: http://127.0.0.1:<后台端口>/provider/v1
+Anthropic / Ollama: http://127.0.0.1:<后台端口>/provider
+Gemini:             http://127.0.0.1:<后台端口>/provider/v1beta
+API Key:            连接设置中自动生成的 Provider Key
+```
+
+支持 Bearer、`X-Api-Key`、`api-key`、Gemini `X-Goog-Api-Key` 与 query `key`；同时提供多个不同凭据会返回 `401`。客户端凭据、Cookie、`Proxy-Authorization` 与转发来源头不会发往 Magpie，上游仅使用网关 Key。CORS 预检按原生配置转发，实际请求仍必须携带 Provider Key。
+
+已纳入的原生路径：Chat、Responses（含原生 WebSocket 续接）、Anthropic Messages、Gemini generate/stream、模型目录与元数据、count_tokens、System One、alpha search、图片/embeddings/rerank/音频/视频、Ollama 兼容目录与 NDJSON 生成、Codex 模型与 Responses。其他路径返回 `404`，已知路径的错误方法返回 `405` 并写 `Allow`。
+
+判定与重试：
+
+- 请求保留原始模型 ID，不再改写为探针别名；模型目录与元数据原样来自原生网关，未监测但原生可用的模型也能调用。
+- 有监测目标且已阻断时立即返回 `403`；未监测模型使用全局规则。`Provider 尝试次数` 含首次请求（默认 2，可设 1–5）；仅命中 `disable` / `reroute` 且响应尚未交付时重试同一目标。`record` 首次命中即记录并交付原响应，不重试。
+- 判定请求强制 `X-Magpie-Response-Model: vendor`，避免 Magpie 默认把响应模型名改写为请求模型；非流式 JSON 与 SSE/NDJSON 都在交付前提取真实模型。次数用尽后 `disable` / `reroute` 同步提交记录并返回 `503` + `Retry-After: 1`；提交失败返回 `500`，不会伪报成功。
+- Ollama 的 JSON/NDJSON 输出始终回显请求模型名，无法据此判断真实模型：只执行请求目标门禁并透明转发，不执行回复动作或守卫重试。
+- `reroute` 只把实际模型名与原生成员 ID（含已识别 effort 后缀）精确匹配；匹配不到成员时仍记录命中，但不会改变路由组。
+- 启用 Provider 期间，业务回复判断只在 Guard 入口同步执行，Magpie 异步观察暂停；某次响应已开始交付后不会被撤销。关闭 Provider 后恢复异步观察。直接访问 Magpie 的请求仍受模型门禁，但此模式不做回复模型判断。
+- 原生 Responses WebSocket 在同一前端连接上续接 `previous_response_id`；`generate:false` 预热原样透传。Guard 在同一条后端连接上最多重试同一次 `response.create`；内部中断未确认、已出现 terminal、`response.id` 缺失或客户端自身中断时不会重放。坏回复已 terminal 时只返回守卫错误并关闭连接，不交付坏结果。
+
+后台监听地址默认在首次启动时随机分配并持久化到 `dataDir`，重启复用；已保存端口被占用时启动失败而不是漂移。多实例或端口冲突可在插件包选项中设置 `backendAddr`：`127.0.0.1:<端口>`、`localhost:<端口>` 或 `[::1]:<端口>`（1–65535）。
+
 ## 数据与安全
 
 - 状态存于 `~/.config/magpie-model-guard/model-guard.db`（SQLite）；
@@ -182,14 +232,16 @@ sh scripts/build.sh
 - 路由恢复账本和待提交事务存于插件 SQLite，重启继续处理隔离与恢复。自动组由插件临时物化，其受管字段被外部改写时以当前配置为新基线继续隔离，恢复时只撤销插件添加的停用项；显式组的受管字段被外部修改时停止覆盖该组，并显示组 ID 与冲突字段，可在 Magpie 中恢复受管字段，或解除对应监测目标让同步释放该组。
 - 同步使用插件侧文件锁、写前字节检查和原子替换；Magpie 原生配置写入不共享此锁，因此应避免同时编辑正在同步的组。原生程序在最后检查与替换之间的并发写入仍存在竞争窗口。
 - 临时保存的自动组在隔离期间使用保存的成员列表；完全恢复后返回 Magpie 动态发现。禁用或卸载插件前，先解除禁用或删除相关监测目标，等待路由同步恢复；直接退出后台会保留隔离配置。
+- 业务回复模型判断的钩子只上报请求模型、实际模型、协议和 agent，不上报消息正文或凭据；本地握手文件 `response-hook.json` 权限为 `0600`，只用于本机回环 API。
+- Provider 端点复用管理后台的回环监听，使用独立的自动生成 Key，不会把客户端的 API Key 转发给 Magpie；Provider Key 保存在本地配置中，并显示在受会话保护的连接设置里。
 
 ## 验证
 
 `go test ./...` 覆盖状态转换、配置迁移、恢复账本、锁竞争恢复、并发提交与控制台票据（一次性票据、会话 Cookie、
-Cloudflare 临时隧道的启动 / 复用 / 失败与清理）；`node --test tests/*.test.mjs` 检查门禁、无需 Go 的安装启动，
+Cloudflare 临时隧道的启动 / 复用 / 失败与清理）以及 Provider 的鉴权、原生路由透传、非流式/流式/WebSocket 判定与规则动作；`node --test tests/*.test.mjs` 检查门禁、无需 Go 的安装启动，
 以及 Go 后台与完整插件宿主两层的管道退出行为，并验证本机票据入口换取会话后可访问管理 API。插件宿主测试在
 输入结束后保持宿主进程存活，验证后台确实被插件关闭；可设置 `MAGPIE_BUN_TEST_BINARY` 同时使用 Magpie 的 Bun 运行该场景。
-构建后运行 `node scripts/verify-auto-routing.mjs`，可使用真实 Magpie、完整插件包和两个本地测试上游验证显式组、自动组、直接请求门禁、探针、全组禁用与重启恢复。脚本使用独立临时 XDG 目录，完成后清理进程和数据；可用 `MAGPIE_TEST_BINARY` 指定 Magpie 可执行文件。
+构建后运行 `node scripts/verify-auto-routing.mjs`，可使用真实 Magpie、完整插件包和两个本地测试上游验证显式组、自动组、直接请求门禁、探针、全组禁用与重启恢复。`MAGPIE_TEST_BINARY=/Applications/magpie.app/Contents/MacOS/magpie MODEL_GUARD_TEST_BINARY=<仓库>/bin/model-guard node scripts/verify-native-provider.mjs` 使用固定基线版本的真实 Magpie 验证原生供应商组合：四种对话协议、流式工具调用、多 Key fallback、模型目录、媒体/音频/视频、Ollama、Responses WebSocket 续接与重试，以及控制台地址展示。两个脚本都使用独立临时 XDG/HOME，完成后清理进程和数据。
 
 ## 致谢
 

@@ -41,6 +41,7 @@ func registerAPI(mux *http.ServeMux, s *Service, access *Access, console *Consol
 	mux.Handle("POST /api/prompts", h(s.apiPromptUpsert))
 	mux.Handle("POST /api/prompts/delete", h(s.apiPromptDelete))
 	mux.Handle("GET /api/health", h(s.apiHealth))
+	mux.Handle("POST /api/response-model", controlRequired(access, s.apiResponseModel))
 	mux.Handle("POST /api/console", controlRequired(access, s.apiConsoleOpen(console)))
 	mux.Handle("POST /api/console/close", h(s.apiConsoleClose(console)))
 }
@@ -73,14 +74,15 @@ func (s *Service) apiModels(w http.ResponseWriter, r *http.Request) {
 func (s *Service) apiConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		GuardConfig
-		RecalculateSchedule bool `json:"recalculate_schedule"`
+		ProviderEnabled     *bool `json:"provider_enabled"`
+		RecalculateSchedule bool  `json:"recalculate_schedule"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
 		errJSON(w, 400, "请求体无效")
 		return
 	}
 	recalc := req.RecalculateSchedule || r.URL.Query().Get("recalculate_schedule") == "true"
-	if err := s.ConfigureOpt(req.GuardConfig, recalc); err != nil {
+	if err := s.configure(req.GuardConfig, recalc, req.ProviderEnabled); err != nil {
 		errJSON(w, 400, err.Error())
 		return
 	}
@@ -91,13 +93,14 @@ func (s *Service) apiConfig(w http.ResponseWriter, r *http.Request) {
 func (s *Service) apiConfigInitial(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		GuardConfig
-		RecalculateSchedule bool `json:"recalculate_schedule"`
+		ProviderEnabled     *bool `json:"provider_enabled"`
+		RecalculateSchedule bool  `json:"recalculate_schedule"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
 		errJSON(w, 400, "请求体无效")
 		return
 	}
-	if err := s.ConfigureInitial(req.GuardConfig); err != nil {
+	if err := s.ConfigureInitial(req.GuardConfig, req.ProviderEnabled); err != nil {
 		errJSON(w, 400, err.Error())
 		return
 	}
@@ -235,12 +238,32 @@ func (s *Service) apiHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"health": s.Health(), "time": time.Now().UTC()})
 }
 
+// apiResponseModel accepts a completed business reply's real model from the
+// Magpie async hook. Actions run in the background so the hook never waits on
+// routing reconciliation.
+func (s *Service) apiResponseModel(w http.ResponseWriter, r *http.Request) {
+	var ev ResponseModelEvent
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&ev); err != nil {
+		errJSON(w, 400, "请求体无效")
+		return
+	}
+	if cfg, err := s.store.LoadConfig(); err == nil && cfg.ProviderEnabled {
+		// Provider mode judges at its own entry; do not queue async actions.
+		writeJSON(w, map[string]any{"accepted": true, "skipped": "provider_enabled"})
+		return
+	}
+	go func() {
+		_ = s.HandleResponseModel(ev)
+	}()
+	writeJSON(w, map[string]bool{"accepted": true})
+}
+
 // controlRequired admits only the plugin control token, not browser sessions.
 func controlRequired(access *Access, next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if !access.Control(token) {
-			errJSON(w, http.StatusForbidden, "仅插件可签发管理入口")
+			errJSON(w, http.StatusForbidden, "仅插件可调用此接口")
 			return
 		}
 		next(w, r)

@@ -15,7 +15,7 @@
 import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
 import { constants } from 'node:fs';
-import { access, chmod, mkdir, copyFile, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, copyFile, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
@@ -441,15 +441,36 @@ async function startGuard() {
   const hostScriptPath = path.join(tempRoot, 'guard-host-runner.mjs');
   if (!guardHostCreated) {
     const scriptCode = `import { pathToFileURL } from 'node:url';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 const pluginIndexPath = process.argv[2];
 const options = JSON.parse(process.argv[3]);
 const { default: plugin } = await import(pathToFileURL(pluginIndexPath).href);
 const hooks = await plugin.server({}, options);
 await hooks.config({});
 const entry = await hooks.auth.methods[0].authorize();
-const url = new URL(entry.url);
-const token = new URLSearchParams(url.hash.slice(1)).get('token');
-console.log(JSON.stringify({ origin: url.origin, control: token }));
+const openUrl = new URL(entry.url);
+// The authorize URL carries a one-time ticket, not a session token. Redeem it
+// without following the redirect so the Set-Cookie session can be kept.
+const redeemed = await fetch(openUrl, { redirect: 'manual', signal: AbortSignal.timeout(5000) });
+const cookies = typeof redeemed.headers.getSetCookie === 'function'
+  ? redeemed.headers.getSetCookie()
+  : [redeemed.headers.get('set-cookie') || ''];
+let session = '';
+for (const cookie of cookies) {
+  const match = /(?:^|[;\s])mg_session=([^;]+)/.exec(cookie || '');
+  if (match) session = match[1];
+}
+if (!session) throw new Error('console ticket did not return a session');
+// Management access must be proven before the fixture is used.
+const probe = await fetch(openUrl.origin + '/api/state', {
+  headers: { authorization: 'Bearer ' + session },
+  signal: AbortSignal.timeout(3000),
+});
+if (!probe.ok) throw new Error('console session cannot read management state');
+// The control token comes from the protected handshake file, not stdout.
+const hook = JSON.parse(await readFile(path.join(options.dataDir, 'response-hook.json'), 'utf8'));
+console.log(JSON.stringify({ origin: openUrl.origin, control: session, hookControl: hook.control }));
 process.stdin.resume();
 process.stdin.on('end', () => process.exit(0));
 `;
@@ -506,6 +527,7 @@ process.stdin.on('end', () => process.exit(0));
       throw new Error(`invalid model-guard startup line: ${sanitize(String(line).slice(0, 500))}`);
     }
     addSecret(info.control);
+    if (info.hookControl) addSecret(info.hookControl);
     assert.ok(info.origin && info.control, 'model-guard startup line is missing origin/control');
     return new Guard(child, info);
   } catch (error) {
@@ -707,8 +729,9 @@ async function main() {
   await mkdir(pluginSrcDir, { recursive: true });
 
   await copyFile(path.join(root, 'package.json'), path.join(pluginPkgDir, 'package.json'));
-  await copyFile(path.join(root, 'plugin', 'index.mjs'), path.join(pluginSrcDir, 'index.mjs'));
-  await copyFile(path.join(root, 'plugin', 'gate.middleware.js'), path.join(pluginSrcDir, 'gate.middleware.js'));
+  for (const name of await readdir(path.join(root, 'plugin'))) {
+    await copyFile(path.join(root, 'plugin', name), path.join(pluginSrcDir, name));
+  }
 
   const platform = { win32: 'windows', darwin: 'darwin', linux: 'linux' }[process.platform] || process.platform;
   const arch = { x64: 'amd64', arm64: 'arm64' }[process.arch] || process.arch;

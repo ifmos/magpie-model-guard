@@ -53,14 +53,25 @@ type Service struct {
 	store *Store
 	gate  string
 
-	running    map[string]*runningProbe // model -> active run
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	health     string
-	closing    bool
-	routes     *groupController
-	routing    GroupRoutingStatus
+	running        map[string]*runningProbe // model -> active run
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	health         string
+	closing        bool
+	routes         *groupController
+	routing        GroupRoutingStatus
+	providerBase   string
+	providerRoot   string
+	providerOrigin string
+	dataDir        string
+
+	// Response-model judgment.
+	responseHits map[string]time.Time // key -> last action
+	hookMu       sync.Mutex
+	hookPath     string
+	hookOrigin   string
+	hookControl  string
 }
 
 // NewService loads state, seeds builtins, publishes the gate and starts the
@@ -74,16 +85,27 @@ func newService(store *Store, gatePath string, scheduled bool) (*Service, error)
 	if err := store.SeedBuiltins(); err != nil {
 		return nil, err
 	}
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		return nil, err
+	}
+	if cfg.ProviderKey == "" {
+		cfg.ProviderKey = randomHex(24)
+		if err := store.SaveConfig(cfg); err != nil {
+			return nil, err
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Service{
-		store:   store,
-		gate:    gatePath,
-		running: map[string]*runningProbe{},
-		ctx:     ctx,
-		cancel:  cancel,
+		store:        store,
+		gate:         gatePath,
+		running:      map[string]*runningProbe{},
+		responseHits: map[string]time.Time{},
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 	s.mu.Lock()
-	err := s.publishGate()
+	err = s.publishGate()
 	s.mu.Unlock()
 	if err != nil {
 		cancel()
@@ -286,6 +308,11 @@ func (s *Service) syncGroupsLocked(targets []*Target) error {
 			blocked = append(blocked, t.Model)
 		}
 	}
+	if rerouted, err := s.store.ResponseReroutes(now); err != nil {
+		s.health = err.Error()
+	} else {
+		blocked = dedupeStrings(append(blocked, rerouted...))
+	}
 	ctx, cancel := context.WithTimeout(s.ctx, 12*time.Second)
 	defer cancel()
 	status, err := s.routes.sync(ctx, blocked)
@@ -294,6 +321,283 @@ func (s *Service) syncGroupsLocked(targets []*Target) error {
 	}
 	s.routing = status
 	return err
+}
+
+// syncRoutingNow reconciles routing groups after a response-rule action.
+func (s *Service) syncRoutingNow() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing || s.routes == nil {
+		return
+	}
+	targets, err := s.store.Targets()
+	if err != nil {
+		s.health = err.Error()
+		return
+	}
+	_ = s.syncGroupsLocked(targets)
+}
+
+func findTargetForRequest(targets []*Target, model string) *Target {
+	model = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(model), "magpie/"))
+	if model == "" {
+		return nil
+	}
+	for _, t := range targets {
+		if t.Model == model {
+			return t
+		}
+	}
+	for _, t := range targets {
+		if strings.EqualFold(t.Model, model) {
+			return t
+		}
+	}
+	return nil
+}
+
+// errTargetMissing means a rule action referenced a target that no longer
+// exists; the reply is still intercepted but no target is created.
+var errTargetMissing = errors.New("监测目标不存在")
+
+// disableTargetForResponse blocks a monitored target that returned a model
+// matching a response rule. Errors are returned so the caller can refuse to
+// report a successful action.
+func (s *Service) disableTargetForResponse(t *Target, detail string, now time.Time) error {
+	if t == nil {
+		return errTargetMissing
+	}
+	latest, err := s.store.Target(t.Model)
+	if err != nil {
+		return err
+	}
+	if latest == nil {
+		return errTargetMissing
+	}
+	latest.State = StateFailed
+	latest.Reason = detail
+	latest.CheckedAt = now
+	latest.FailStreak++
+	latest.ScheduleStage = ScheduleStageIsolated
+	latest.AllowUntil = time.Time{}
+	wait := latest.FailRecheckMin
+	if wait <= 0 {
+		wait = 60
+	}
+	latest.NextCheckAt = now.Add(time.Duration(wait) * time.Minute)
+	if err := s.store.SaveTarget(latest); err != nil {
+		s.health = err.Error()
+		return err
+	}
+	return s.publishGate()
+}
+
+// applyResponseRuleLocked executes one matched rule and appends the result.
+// Callers hold s.mu. needsSync reports that persisted reroutes must be pushed
+// to route groups; the provider path does that synchronously.
+func (s *Service) applyResponseRuleLocked(cfg GuardConfig, requested, actual string, target *Target, rule ResponseModelRule, now time.Time) (bool, error) {
+	key := responseHitKey(requested, actual, rule)
+	if last, ok := s.responseHits[key]; ok && now.Sub(last) < time.Minute {
+		return false, nil
+	}
+	if len(s.responseHits) > 512 {
+		for k, at := range s.responseHits {
+			if now.Sub(at) > 10*time.Minute {
+				delete(s.responseHits, k)
+			}
+		}
+	}
+	detail := fmt.Sprintf("业务回复模型 %s 命中规则 %s", actual, rule.Pattern)
+	targetModel := requested
+	if target != nil {
+		targetModel = target.Model
+	}
+	verdict := VerdictManual
+	needsSync := false
+	var err error
+	switch rule.Action {
+	case ResponseActionDisable:
+		if target == nil {
+			detail += "，未找到监测目标，未禁用"
+			break
+		}
+		verdict = VerdictFailed
+		detail += "，已禁用目标"
+		err = s.disableTargetForResponse(target, detail, now)
+		if errors.Is(err, errTargetMissing) {
+			err = nil
+			verdict = VerdictManual
+			detail = fmt.Sprintf("业务回复模型 %s 命中规则 %s，未找到监测目标，未禁用", actual, rule.Pattern)
+		}
+	case ResponseActionReroute:
+		detail += "，已加入后续请求改道"
+		err = s.store.AddResponseReroute(actual, now.Add(time.Duration(cfg.ResponseRerouteMin)*time.Minute))
+		needsSync = true
+	case ResponseActionRecord:
+		detail += "，仅记录"
+	}
+	if err != nil {
+		return false, err
+	}
+	res := &Result{
+		ID:          randomHex(8),
+		Model:       targetModel,
+		PromptID:    "response-model",
+		Verdict:     verdict,
+		Detail:      detail,
+		ActualModel: actual,
+		RuleID:      rule.ID,
+		CreatedAt:   now,
+		Source:      "response",
+	}
+	if err := s.store.AppendResult(res); err != nil {
+		return false, err
+	}
+	// The dedupe entry is written only after the action and its result persist,
+	// so a failed submission can be retried by the next matching reply.
+	s.responseHits[key] = now
+	return needsSync, nil
+}
+
+// recordProviderResponse applies a rule synchronously from the provider path.
+// The target and rule are the ones selected for this request; there is no
+// fallback to the actual model because that would use a different rule set.
+func (s *Service) recordProviderResponse(requested, actual string, target *Target, rule ResponseModelRule) error {
+	requested = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(requested), "magpie/"))
+	actual = strings.TrimSpace(actual)
+	if requested == "" || actual == "" {
+		return nil
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg, err := s.store.LoadConfig()
+	if err != nil {
+		return err
+	}
+	if !cfg.ProviderEnabled {
+		return errProviderModeChanged
+	}
+	needsSync, err := s.applyResponseRuleLocked(cfg, requested, actual, target, rule, now)
+	if err != nil {
+		return err
+	}
+	if needsSync {
+		// Reroutes must be visible to route groups before the client sees 503.
+		if err := s.publishGate(); err != nil {
+			// The action persisted, but its routing sync did not. Let the next
+			// matching reply retry the sync instead of being deduplicated.
+			delete(s.responseHits, responseHitKey(requested, actual, rule))
+			return err
+		}
+	}
+	return nil
+}
+
+func responseHitKey(requested, actual string, rule ResponseModelRule) string {
+	return requested + "|" + actual + "|" + rule.ID + "|" + rule.Action + "|" + rule.Pattern
+}
+
+// HandleResponseModel applies business-reply rules reported by Magpie's async
+// response hook. Provider mode runs its own synchronous judgment and drops
+// late events; otherwise actions are applied off the hook's critical path.
+func (s *Service) HandleResponseModel(ev ResponseModelEvent) error {
+	requested := strings.TrimSpace(ev.RequestedModel)
+	requested = strings.TrimSpace(strings.TrimPrefix(requested, "magpie/"))
+	if strings.HasPrefix(requested, ProbeAliasPrefix) {
+		return nil
+	}
+	actual := strings.TrimSpace(ev.ActualModel)
+	if !ev.Success || requested == "" || actual == "" {
+		return nil
+	}
+
+	now := time.Now().UTC()
+	s.mu.Lock()
+	cfg, err := s.store.LoadConfig()
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	if cfg.ProviderEnabled {
+		// Provider mode judges synchronously at the Guard entry. A late event
+		// for an in-flight reply would act on a request already judged there.
+		s.mu.Unlock()
+		return nil
+	}
+	targets, err := s.store.Targets()
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	target := findTargetForRequest(targets, requested)
+	if target == nil {
+		target = findTargetForRequest(targets, actual)
+	}
+	rule := MatchResponseRule(effectiveResponseRules(cfg, target), actual)
+	if rule == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	needsSync, err := s.applyResponseRuleLocked(cfg, requested, actual, target, *rule, now)
+	s.mu.Unlock()
+	if err != nil {
+		s.mu.Lock()
+		s.health = "响应模型动作失败：" + err.Error()
+		s.mu.Unlock()
+		return err
+	}
+	if needsSync {
+		go s.syncRoutingNow()
+	}
+	return nil
+}
+
+// ConfigureResponseHook records the local API origin and control token used
+// by the Magpie async response hook and writes the initial handshake. A write
+// failure must abort startup: without it the hook cannot observe replies.
+func (s *Service) ConfigureResponseHook(path, origin, control string) error {
+	s.hookMu.Lock()
+	s.hookPath, s.hookOrigin, s.hookControl = path, origin, control
+	s.hookMu.Unlock()
+	return s.RefreshResponseHook()
+}
+
+// RefreshResponseHook rewrites the hook handshake after rules or targets
+// change, so the hook can skip requests when no judgment applies.
+func (s *Service) RefreshResponseHook() error {
+	cfg, err := s.store.LoadConfig()
+	if err != nil {
+		return err
+	}
+	targets, err := s.store.Targets()
+	if err != nil {
+		return err
+	}
+	return s.writeResponseHookLocked(cfg, targets)
+}
+
+// writeResponseHookLocked writes the handshake for cfg. Callers hold s.mu (or
+// are serializing a mode change); it only locks hookMu and never reloads state.
+// Provider mode owns business-reply judgment, so async observation is disabled
+// while the provider endpoint is enabled.
+func (s *Service) writeResponseHookLocked(cfg GuardConfig, targets []*Target) error {
+	s.hookMu.Lock()
+	path, origin, control := s.hookPath, s.hookOrigin, s.hookControl
+	s.hookMu.Unlock()
+	if path == "" || origin == "" || control == "" {
+		return nil
+	}
+	b, err := json.Marshal(ResponseModelHook{
+		Origin:  origin,
+		Control: control,
+		Enabled: !cfg.ProviderEnabled && hasResponseRules(cfg, targets),
+	})
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	return atomicWriteFile(path, b, 0o600)
 }
 
 // atomicWrite replaces a file atomically via temp+rename.
@@ -742,6 +1046,7 @@ func (s *Service) probeOnce(ctx context.Context, t *Target, p *Prompt, cfg Guard
 	}
 	answer, tokens, err := Call(pctx, ProbeConfig{GatewayURL: cfg.GatewayURL, GatewayKey: cfg.GatewayKey},
 		ProbeAliasPrefix+alias+"/"+t.Model, p.Text, nil)
+
 	res := &Result{
 		ID:        randomHex(8),
 		Model:     t.Model,
@@ -805,6 +1110,8 @@ func (s *Service) Snapshot() (map[string]any, error) {
 	}
 	s.mu.Lock()
 	routing := s.routing
+	providerBase := s.providerBase
+	providerRoot := s.providerRoot
 	checking := make([]string, 0, len(s.running))
 	for model, rp := range s.running {
 		if rp != nil && rp.active {
@@ -814,12 +1121,14 @@ func (s *Service) Snapshot() (map[string]any, error) {
 	s.mu.Unlock()
 	sort.Strings(checking)
 	return map[string]any{
-		"config":   cfg,
-		"targets":  targets,
-		"prompts":  prompts,
-		"checking": checking,
-		"health":   s.Health(),
-		"routing":  routing,
+		"config":        cfg,
+		"targets":       targets,
+		"prompts":       prompts,
+		"checking":      checking,
+		"health":        s.Health(),
+		"routing":       routing,
+		"provider_base": providerBase,
+		"provider_root": providerRoot,
 	}, nil
 }
 
@@ -958,6 +1267,18 @@ func (s *Service) UpsertTargetOpt(t *Target, recalculate bool) error {
 			return errors.New("无效题目 ID")
 		}
 	}
+	if !validResponseRuleMode(t.ResponseRuleMode) {
+		return errors.New("响应模型规则模式无效")
+	}
+	if t.ResponseRuleMode == ResponseRuleCustom {
+		rules, err := NormalizeResponseRules(t.ResponseModelRules)
+		if err != nil {
+			return err
+		}
+		t.ResponseModelRules = rules
+	} else {
+		t.ResponseModelRules = nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cfg, err := s.store.LoadConfig()
@@ -967,6 +1288,15 @@ func (s *Service) UpsertTargetOpt(t *Target, recalculate bool) error {
 	existing, err := s.store.Target(t.Model)
 	if err != nil {
 		return err
+	}
+	if t.ResponseRuleMode == "" {
+		if existing != nil {
+			t.ResponseRuleMode = existing.ResponseRuleMode
+			t.ResponseModelRules = existing.ResponseModelRules
+		} else {
+			t.ResponseRuleMode = ResponseRuleInherit
+			t.ResponseModelRules = nil
+		}
 	}
 	if existing != nil {
 		oldMode := EffectiveScheduleMode(existing.ScheduleMode, cfg.ScheduleMode)
@@ -1038,6 +1368,9 @@ func (s *Service) UpsertTargetOpt(t *Target, recalculate bool) error {
 	if err := s.store.SaveTarget(t); err != nil {
 		return err
 	}
+	if err := s.RefreshResponseHook(); err != nil {
+		return err
+	}
 	return s.publishGate()
 }
 
@@ -1046,6 +1379,9 @@ func (s *Service) DeleteTarget(model string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.store.DeleteTarget(model); err != nil {
+		return err
+	}
+	if err := s.RefreshResponseHook(); err != nil {
 		return err
 	}
 	return s.publishGate()
@@ -1112,8 +1448,27 @@ func (s *Service) Configure(c GuardConfig) error {
 }
 
 // ConfigureOpt validates and saves config with optional schedule recalculation.
+// ProviderEnabled is applied exactly as provided.
 func (s *Service) ConfigureOpt(c GuardConfig, recalculate bool) error {
-	old, _ := s.store.LoadConfig()
+	enabled := c.ProviderEnabled
+	return s.configure(c, recalculate, &enabled)
+}
+
+// configure merges and saves config under s.mu. A nil providerEnabled keeps the
+// saved value so a partial console update cannot silently disable the provider.
+// The mode switch and the response-hook handshake share the lock and land
+// together or not at all.
+func (s *Service) configure(c GuardConfig, recalculate bool, providerEnabled *bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.configureLocked(c, recalculate, providerEnabled)
+}
+
+func (s *Service) configureLocked(c GuardConfig, recalculate bool, providerEnabled *bool) error {
+	old, err := s.store.LoadConfig()
+	if err != nil {
+		return err
+	}
 	if c.GatewayKey == "" {
 		c.GatewayKey = old.GatewayKey
 	}
@@ -1128,6 +1483,38 @@ func (s *Service) ConfigureOpt(c GuardConfig, recalculate bool) error {
 	}
 	if c.DefaultIntervalMin == 0 {
 		c.DefaultIntervalMin = old.DefaultIntervalMin
+	}
+	if c.ResponseModelMode == "" {
+		c.ResponseModelMode = old.ResponseModelMode
+	}
+	if c.ResponseModelMode == "" {
+		c.ResponseModelMode = ResponseModelOff
+	}
+	if c.ResponseRerouteMin == 0 {
+		c.ResponseRerouteMin = old.ResponseRerouteMin
+	}
+	if c.ResponseRerouteMin == 0 {
+		c.ResponseRerouteMin = 30
+	}
+	if c.ResponseRules == nil {
+		c.ResponseRules = old.ResponseRules
+	}
+	if c.ProviderKey == "" {
+		c.ProviderKey = old.ProviderKey
+	}
+	if c.ProviderKey == "" {
+		c.ProviderKey = randomHex(24)
+	}
+	if c.ProviderAttempts == 0 {
+		c.ProviderAttempts = old.ProviderAttempts
+	}
+	if c.ProviderAttempts == 0 {
+		c.ProviderAttempts = 2
+	}
+	if providerEnabled != nil {
+		c.ProviderEnabled = *providerEnabled
+	} else {
+		c.ProviderEnabled = old.ProviderEnabled
 	}
 	if c.ScheduleMode == "" {
 		c.ScheduleMode = old.ScheduleMode
@@ -1162,17 +1549,39 @@ func (s *Service) ConfigureOpt(c GuardConfig, recalculate bool) error {
 	if err := ValidateGateway(c.GatewayURL); err != nil {
 		return err
 	}
+	if c.ResponseModelMode != ResponseModelOff && c.ResponseModelMode != ResponseModelOn {
+		return errors.New("响应模型判断模式无效")
+	}
+	if c.ResponseRerouteMin < 1 || c.ResponseRerouteMin > 1440 {
+		return errors.New("响应模型改道保持时间须为 1–1440 分钟")
+	}
+	if c.ProviderAttempts < 1 || c.ProviderAttempts > 5 {
+		return errors.New("Provider 尝试次数须为 1–5 次")
+	}
+	rules, err := NormalizeResponseRules(c.ResponseRules)
+	if err != nil {
+		return err
+	}
+	c.ResponseRules = rules
 	if c.GatewayKey == "" {
 		return errors.New("请输入网关 Key；本机默认 Key 为 magpie")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.store.SaveConfig(c); err != nil {
-		return err
 	}
 	targets, err := s.store.Targets()
 	if err != nil {
 		return err
+	}
+	if err := s.store.SaveConfig(c); err != nil {
+		return err
+	}
+	// Mode and handshake move together: a late async event must never act on
+	// the previous mode. Restore both when the handshake write fails.
+	if err := s.writeResponseHookLocked(c, targets); err != nil {
+		restoreErr := s.store.SaveConfig(old)
+		hookErr := s.writeResponseHookLocked(old, targets)
+		if restoreErr != nil || hookErr != nil {
+			s.health = "配置回滚失败：" + errors.Join(restoreErr, hookErr).Error()
+		}
+		return fmt.Errorf("更新响应观察握手失败: %w", err)
 	}
 	now := time.Now().UTC()
 	for _, tgt := range targets {
@@ -1212,16 +1621,23 @@ func (s *Service) ConfigureOpt(c GuardConfig, recalculate bool) error {
 	return s.publishGate()
 }
 
-// ConfigureInitial only fills config when empty (auto-discovery).
-func (s *Service) ConfigureInitial(c GuardConfig) error {
+// ConfigureInitial only fills config when empty (auto-discovery). Once a
+// gateway is configured it ignores the partial payload, but an explicit
+// provider mode still applies through the same locked path.
+func (s *Service) ConfigureInitial(c GuardConfig, providerEnabled *bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	old, err := s.store.LoadConfig()
 	if err != nil {
 		return err
 	}
 	if old.GatewayURL != "" {
-		return nil
+		if providerEnabled == nil || *providerEnabled == old.ProviderEnabled {
+			return nil
+		}
+		return s.configureLocked(old, false, providerEnabled)
 	}
-	return s.Configure(c)
+	return s.configureLocked(c, false, providerEnabled)
 }
 
 // RunManualProbe runs a prompt against a model immediately (any prompt,

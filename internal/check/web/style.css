@@ -194,7 +194,16 @@ html,body{overflow-x:clip}
 .app-shell{height:100vh;height:100dvh;overflow:hidden}
 .sidebar{height:100%;min-height:0;overflow-y:auto}
 .main-shell{height:100%;min-height:0;overflow-y:auto;overflow-x:hidden}
+.response-rule-editor{display:flex;flex-direction:column;gap:8px;margin:8px 0}
+.response-rule-row{display:grid;grid-template-columns:110px minmax(160px,1fr) 110px 32px;gap:6px;align-items:center}
+.response-rule-row select,.response-rule-row input{min-width:0;font-size:12px;padding:7px 8px}
+.response-rule-row .rule-remove{border:1px solid var(--border);background:transparent;color:var(--muted);border-radius:6px;height:30px;cursor:pointer}
+.response-rule-row .rule-remove:hover{color:var(--bad);border-color:var(--bad)}
+.response-rule-empty{font-size:12px;color:var(--muted);padding:8px 0}
 @media(max-width:700px){
+  .response-rule-row{grid-template-columns:1fr 1fr;gap:6px}
+  .response-rule-row .rule-pattern{grid-column:span 2}
+  .response-rule-row .rule-remove{justify-self:end}
   .summary-card{gap:3px 8px;padding:12px 14px}
   .summary-card .summary-label{font-size:11px}
   .summary-card strong{font-size:25px}
@@ -213,3 +222,9 @@ html,body{overflow-x:clip}
   .app-shell{height:auto;min-height:100vh;overflow:visible}
   .sidebar,.main-shell{height:auto;overflow:visible}
 }
+
+.provider-url{display:block;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface);font-size:12px;word-break:break-all;user-select:all;}
+.provider-base-list{display:grid;gap:8px}
+.provider-base-row{display:grid;grid-template-columns:130px minmax(0,1fr) auto;gap:8px;align-items:center}
+.provider-base-row>span{font-size:12px;color:var(--muted)}
+@media (max-width:720px){.provider-base-row{grid-template-columns:1fr;align-items:start}}

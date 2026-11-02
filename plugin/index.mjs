@@ -9,10 +9,30 @@ import { waitForConsole } from './console-readiness.mjs';
 const root = fileURLToPath(new URL('../', import.meta.url));
 let child, ready, stopDiscovery;
 
+// Backend listen address override for multi-instance hosts and port conflicts.
+// Only loopback addresses with a concrete port are accepted; the default
+// persisted address stays in use when the option is absent.
+function backendAddr(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  const match = typeof value === 'string' && /^(?:127\.0\.0\.1|localhost|\[::1\]):([0-9]{1,5})$/.exec(value);
+  const port = match ? Number(match[1]) : 0;
+  if (!match || port < 1 || port > 65535) {
+    throw new Error(`backendAddr 必须是 127.0.0.1:<端口>、localhost:<端口> 或 [::1]:<端口>（1–65535），收到：${String(value)}`);
+  }
+  return value;
+}
+
 // Start the Go backend; resolves with {origin, control} startup info.
 function start(options = {}) {
   if (ready) return ready;
   ready = new Promise((resolve, reject) => {
+    let addr;
+    try {
+      addr = backendAddr(options.backendAddr);
+    } catch (error) {
+      reject(error);
+      return;
+    }
     const platform = { win32: 'windows', darwin: 'darwin', linux: 'linux' }[process.platform] || process.platform;
     const arch = { x64: 'amd64', arm64: 'arm64' }[process.arch] || process.arch;
     const suffix = platform === 'windows' ? '.exe' : '';
@@ -31,6 +51,7 @@ function start(options = {}) {
     ];
     if (options.magpiePath) args.push('-magpie', options.magpiePath);
     if (options.cloudflaredPath) args.push('-cloudflared', options.cloudflaredPath);
+    if (addr) args.push('-addr', addr);
     child = spawn(binary, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     child.stdin.on('error', () => {});
     let output = '';

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -32,6 +33,59 @@ type StartupInfo struct {
 	Origin  string `json:"origin"`
 	Control string `json:"control"`
 	Pid     int    `json:"pid"`
+}
+
+const backendAddrKey = "backend_listen_addr"
+
+// BackendAddr returns the persisted management API address, if any.
+func (s *Store) BackendAddr() (string, bool, error) {
+	var addr string
+	ok, err := s.getKV(backendAddrKey, &addr)
+	if err != nil || !ok {
+		return "", false, err
+	}
+	addr = strings.TrimSpace(addr)
+	return addr, addr != "", nil
+}
+
+// SaveBackendAddr remembers the bound management API address.
+func (s *Store) SaveBackendAddr(addr string) error { return s.setKV(backendAddrKey, addr) }
+
+// listenBackend binds the management API. The default ephemeral address is
+// remembered so provider URLs stay stable across restarts. An explicit address
+// wins over the saved one and refreshes it after a successful bind. A saved
+// address that is already in use fails startup instead of drifting to a new
+// port, because clients were configured against the saved URL.
+func listenBackend(store *Store, requested string) (net.Listener, string, error) {
+	if requested == "" {
+		requested = "127.0.0.1:0"
+	}
+	saved, ok, err := store.BackendAddr()
+	if err != nil {
+		// Never overwrite state we could not read; bind the requested address.
+		ln, lerr := net.Listen("tcp", requested)
+		if lerr != nil {
+			return nil, "", fmt.Errorf("listen %s: %w", requested, lerr)
+		}
+		return ln, ln.Addr().String(), nil
+	}
+	listenAddr := requested
+	explicit := requested != "127.0.0.1:0"
+	if !explicit && ok {
+		listenAddr = saved
+	}
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return nil, "", fmt.Errorf("listen %s: %w", listenAddr, err)
+	}
+	addr := ln.Addr().String()
+	if explicit || !ok || addr != saved {
+		if err := store.SaveBackendAddr(addr); err != nil {
+			_ = ln.Close()
+			return nil, "", fmt.Errorf("save backend address: %w", err)
+		}
+	}
+	return ln, addr, nil
 }
 
 // Run starts the backend and blocks until the process is interrupted or the
@@ -60,6 +114,7 @@ func Run(o Options) error {
 		return err
 	}
 	defer svc.Close()
+	svc.dataDir = o.DataDir
 	stopOwner := context.AfterFunc(ownerCtx, svc.cancel)
 	defer stopOwner()
 	if o.MagpieConfig != "" {
@@ -80,18 +135,22 @@ func Run(o Options) error {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	registerConsole(mux, access)
-	srv := &http.Server{Handler: securityHeaders(mux), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Handler: securityHeaders(registerProvider(mux, svc)), ReadHeaderTimeout: 10 * time.Second}
 
-	ln, err := net.Listen("tcp", o.Addr)
+	ln, addr, err := listenBackend(store, o.Addr)
 	if err != nil {
-		return fmt.Errorf("listen %s: %w", o.Addr, err)
+		return err
 	}
-	addr := ln.Addr().String()
 	// Normalize to a reachable origin for the plugin host.
 	origin := fmt.Sprintf("http://%s", normalizeHost(addr))
 
 	// The tunnel needs the final local origin; set it now that the port is known.
 	console.SetLocal(origin)
+	svc.mu.Lock()
+	svc.providerBase = origin + "/provider/v1"
+	svc.providerRoot = origin + "/provider"
+	svc.providerOrigin = origin
+	svc.mu.Unlock()
 
 	var info StartupInfo
 	info.Origin = origin
@@ -101,6 +160,10 @@ func Run(o Options) error {
 	access.mu.Lock()
 	access.origins[origin] = true
 	access.mu.Unlock()
+	if err := svc.ConfigureResponseHook(filepath.Join(o.DataDir, "response-hook.json"), origin, info.Control); err != nil {
+		_ = ln.Close()
+		return fmt.Errorf("write response hook: %w", err)
+	}
 	if o.PluginOwned {
 		b, _ := json.Marshal(info)
 		fmt.Println(string(b))

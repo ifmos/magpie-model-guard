@@ -120,6 +120,88 @@
     });
   }
 
+  // ---- response-model rule editor ----
+  var responseMatchLabels = { exact: "精确", contains: "包含", glob: "通配 *", regex: "正则" };
+  var responseActionLabels = { disable: "禁用目标", reroute: "后续改道", record: "仅记录" };
+
+  function optionList(labels, selected) {
+    return Object.keys(labels).map(function (k) {
+      return "<option value='" + esc(k) + "'" + (k === selected ? " selected" : "") + ">" + esc(labels[k]) + "</option>";
+    }).join("");
+  }
+
+  function responseRuleRowHtml(rule) {
+    rule = rule || {};
+    return "<div class='response-rule-row' data-response-rule>" +
+      "<input type='hidden' class='rule-id' value='" + esc(rule.id || "") + "'>" +
+      "<select class='rule-match' title='匹配方式'>" + optionList(responseMatchLabels, rule.match || "contains") + "</select>" +
+      "<input class='rule-pattern' placeholder='真实模型匹配字符串' value='" + esc(rule.pattern || "") + "'>" +
+      "<select class='rule-action' title='命中动作'>" + optionList(responseActionLabels, rule.action || "disable") + "</select>" +
+      "<button type='button' class='rule-remove' title='删除规则'>×</button>" +
+      "</div>";
+  }
+
+  function renderResponseRules(container, rules) {
+    if (!container) return;
+    rules = rules || [];
+    container.innerHTML = rules.length
+      ? rules.map(responseRuleRowHtml).join("")
+      : "<div class='response-rule-empty'>暂无规则；命中后按动作禁用、改道或记录。</div>";
+  }
+
+  function appendResponseRule(container) {
+    if (!container) return;
+    var empty = container.querySelector(".response-rule-empty");
+    if (empty) empty.remove();
+    container.insertAdjacentHTML("beforeend", responseRuleRowHtml({}));
+    var rows = container.querySelectorAll("[data-response-rule]");
+    var row = rows[rows.length - 1];
+    var input = row && row.querySelector(".rule-pattern");
+    if (input) input.focus();
+  }
+
+  function readResponseRules(container) {
+    if (!container) return [];
+    var out = [];
+    container.querySelectorAll("[data-response-rule]").forEach(function (row) {
+      var pattern = (row.querySelector(".rule-pattern").value || "").trim();
+      if (!pattern) throw new Error("业务回复模型规则的匹配字符串不能为空");
+      var match = row.querySelector(".rule-match").value;
+      if (match === "regex") {
+        try { new RegExp(pattern); } catch (e) { throw new Error("响应模型正则无效：" + pattern); }
+      }
+      var action = row.querySelector(".rule-action").value;
+      out.push({
+        id: row.querySelector(".rule-id").value || "",
+        match: match,
+        pattern: pattern,
+        action: action
+      });
+    });
+    return out;
+  }
+
+  function bindResponseRuleEditor(container, markDirty) {
+    if (!container || container.dataset.ruleBound === "1") return;
+    container.dataset.ruleBound = "1";
+    container.addEventListener("click", function (ev) {
+      var btn = ev.target.closest && ev.target.closest(".rule-remove");
+      if (!btn) return;
+      var row = btn.closest("[data-response-rule]");
+      if (row) row.remove();
+      if (!container.querySelector("[data-response-rule]")) {
+        container.innerHTML = "<div class='response-rule-empty'>暂无规则；命中后按动作禁用、改道或记录。</div>";
+      }
+      if (markDirty !== false && typeof markConfigDirty === "function") markConfigDirty();
+    });
+    container.addEventListener("change", function () {
+      if (markDirty !== false && typeof markConfigDirty === "function") markConfigDirty();
+    });
+    container.addEventListener("input", function () {
+      if (markDirty !== false && typeof markConfigDirty === "function") markConfigDirty();
+    });
+  }
+
   function fmtTime(s) {
     if (!s || s === "0001-01-01T00:00:00Z") return "—";
     var d = new Date(s);
@@ -256,6 +338,8 @@
   function loadState() {
     return api("GET", "/api/state").then(function (snap) {
       state.config = snap.config || {};
+      state.provider_base = snap.provider_base || "";
+      state.provider_root = snap.provider_root || "";
       state.targets = snap.targets || [];
       state.prompts = snap.prompts || [];
       state.checking = snap.checking || [];
@@ -285,7 +369,8 @@
     var policyLabel = effMode === "staged" ? "分阶段" : "固定间隔";
     var inheritHtml = isInherit ? "<span class='policy-sub'>继承全局</span>" : "";
     var customHtml = t.timing_policy ? "<span class='badge-custom' title='此模型使用独立的分阶段间隔'>单独配置</span>" : "";
-    return "<div class='policy-cell'><span class='policy-badge " + policyBadgeClass + "'>" + esc(policyLabel) + "</span>" + inheritHtml + customHtml + "</div>";
+    var responseHtml = t.response_rule_mode === "custom" ? "<span class='badge-custom' title='此模型使用自定义业务回复模型规则'>响应规则</span>" : "";
+    return "<div class='policy-cell'><span class='policy-badge " + policyBadgeClass + "'>" + esc(policyLabel) + "</span>" + inheritHtml + customHtml + responseHtml + "</div>";
   }
 
   function getStageBadge(t, effMode) {
@@ -810,6 +895,10 @@
     document.getElementById("tpf-tp-rec-confirm").value = tp.recovery_confirm_min != null ? tp.recovery_confirm_min : 2;
     document.getElementById("tpf-tp-unavail").value = tp.unavailable_min != null ? tp.unavailable_min : 30;
 
+    document.getElementById("tpf-response-mode").value = t.response_rule_mode === "custom" ? "custom" : "inherit";
+    renderResponseRules(document.getElementById("tpf-response-rules"), t.response_model_rules || []);
+    if (typeof syncTargetResponseEditor === "function") syncTargetResponseEditor();
+
     if (typeof targetPolicyDialog.showModal === "function") {
       targetPolicyDialog.showModal();
     } else {
@@ -855,6 +944,24 @@
       toast("已填入 codex-guard 推荐预设");
     });
   }
+
+  var tpfResponseRules = document.getElementById("tpf-response-rules");
+  bindResponseRuleEditor(tpfResponseRules, false);
+  var tpfAddResponseRule = document.getElementById("tpf-add-response-rule");
+  var tpfResponseMode = document.getElementById("tpf-response-mode");
+  function syncTargetResponseEditor() {
+    if (!tpfResponseMode) return;
+    var custom = tpfResponseMode.value === "custom";
+    if (tpfResponseRules) tpfResponseRules.style.display = custom ? "" : "none";
+    if (tpfAddResponseRule) tpfAddResponseRule.style.display = custom ? "" : "none";
+  }
+  if (tpfAddResponseRule) {
+    tpfAddResponseRule.addEventListener("click", function () {
+      appendResponseRule(tpfResponseRules);
+    });
+  }
+  if (tpfResponseMode) tpfResponseMode.addEventListener("change", syncTargetResponseEditor);
+  syncTargetResponseEditor();
 
   var tpfCloseBtn = document.getElementById("tpf-close");
   if (tpfCloseBtn) tpfCloseBtn.addEventListener("click", closeTargetPolicyDialog);
@@ -905,6 +1012,17 @@
         }
       }
 
+      var responseRuleMode = document.getElementById("tpf-response-mode").value;
+      var responseRules = [];
+      if (responseRuleMode === "custom") {
+        try {
+          responseRules = readResponseRules(document.getElementById("tpf-response-rules"));
+        } catch (err) {
+          toast(err.message);
+          return;
+        }
+      }
+
       var payload = {
         model: t.model,
         enabled: t.enabled,
@@ -913,6 +1031,8 @@
         fail_recheck_min: failRecheckMin,
         schedule_mode: scheduleMode,
         timing_policy: timingPolicy,
+        response_rule_mode: responseRuleMode,
+        response_model_rules: responseRules,
         recalculate_schedule: recalc
       };
 
@@ -1211,9 +1331,9 @@
         var detailAttr = " data-result-id='" + esc(r.id || "") + "'" + (isChecking ? " class='is-checking'" : "");
         var content = r.answer || ("(" + (r.detail || (isChecking ? "探针检测进行中，等待模型返回…" : "无回答内容")) + ")");
         return "<details" + detailAttr + openAttr + "><summary>" +
-          "<span class='status-badge status-" + esc(r.verdict) + "'><i></i>" + esc(verdictName[r.verdict] || r.verdict) + "</span>" +
+          "<span class='status-badge status-" + esc(r.verdict) + "'><i></i>" + esc(r.prompt_id === "response-model" ? (r.verdict === "failed" ? "规则禁用" : (String(r.detail || "").includes("改道") ? "规则改道" : "规则记录")) : (verdictName[r.verdict] || r.verdict)) + "</span>" +
           "<strong>" + esc(r.model) + "</strong>" +
-          "<span class='result-meta'>" + esc(r.prompt_id) + " · " + fmtTime(r.created_at) + " · " + esc(r.source) + "</span>" +
+          "<span class='result-meta'>" + esc(r.prompt_id === "response-model" ? "响应模型" : r.prompt_id) + (r.actual_model ? " · 实际模型 " + esc(r.actual_model) : "") + " · " + fmtTime(r.created_at) + " · " + esc(r.source) + "</span>" +
           "</summary><pre>" + esc(content) + "</pre></details>";
       }).join("");
 
@@ -1234,25 +1354,39 @@
   if (resultModelSel) resultModelSel.addEventListener("change", loadResults);
 
   // ---- settings & real verification ----
+  function markConfigDirty() {
+    configDirty = true;
+    var msgEl = document.getElementById("config-msg");
+    if (msgEl && !msgEl.textContent) {
+      msgEl.textContent = "有未保存的配置更改";
+      msgEl.className = "form-message";
+    }
+  }
+
   // Protect uncommitted drafts from being overwritten by 15s polling
   [
     "cfg-url", "cfg-key", "cfg-limit", "cfg-timeout", "cfg-cool",
     "cfg-schedule-mode", "cfg-recalculate-schedule",
-    "cfg-tp-normal", "cfg-tp-retry", "cfg-tp-iso-first", "cfg-tp-iso-later", "cfg-tp-rec-confirm", "cfg-tp-unavail"
+    "cfg-tp-normal", "cfg-tp-retry", "cfg-tp-iso-first", "cfg-tp-iso-later", "cfg-tp-rec-confirm", "cfg-tp-unavail",
+    "cfg-response-mode", "cfg-response-reroute",
+    "cfg-provider-enabled", "cfg-provider-attempts"
   ].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) {
       var evt = (el.type === "checkbox" || el.tagName === "SELECT") ? "change" : "input";
-      el.addEventListener(evt, function () {
-        configDirty = true;
-        var msgEl = document.getElementById("config-msg");
-        if (msgEl && !msgEl.textContent) {
-          msgEl.textContent = "有未保存的配置更改";
-          msgEl.className = "form-message";
-        }
-      });
+      el.addEventListener(evt, markConfigDirty);
     }
   });
+
+  var cfgResponseRules = document.getElementById("cfg-response-rules");
+  bindResponseRuleEditor(cfgResponseRules);
+  var cfgAddResponseRule = document.getElementById("cfg-add-response-rule");
+  if (cfgAddResponseRule) {
+    cfgAddResponseRule.addEventListener("click", function () {
+      appendResponseRule(cfgResponseRules);
+      markConfigDirty();
+    });
+  }
 
   var cfgPresetBtn = document.getElementById("cfg-btn-preset-codex");
   if (cfgPresetBtn) {
@@ -1298,6 +1432,27 @@
     var modeEl = document.getElementById("cfg-schedule-mode");
     if (modeEl) modeEl.value = c.schedule_mode || "fixed";
 
+    var responseModeEl = document.getElementById("cfg-response-mode");
+    if (responseModeEl) responseModeEl.value = c.response_model_mode || "off";
+    var responseRerouteEl = document.getElementById("cfg-response-reroute");
+    if (responseRerouteEl) responseRerouteEl.value = c.response_reroute_min || 30;
+    renderResponseRules(document.getElementById("cfg-response-rules"), c.response_rules || []);
+
+    var providerEnabledEl = document.getElementById("cfg-provider-enabled");
+    if (providerEnabledEl) providerEnabledEl.checked = !!c.provider_enabled;
+    var providerKeyEl = document.getElementById("cfg-provider-key");
+    if (providerKeyEl) providerKeyEl.value = c.provider_key || "";
+    var providerAttemptsEl = document.getElementById("cfg-provider-attempts");
+    if (providerAttemptsEl) providerAttemptsEl.value = c.provider_attempts || 2;
+    var providerBase = state.provider_base || (window.location.origin + "/provider/v1");
+    var providerRoot = state.provider_root || providerBase.replace(/\/v1$/, "");
+    var providerURLel = document.getElementById("cfg-provider-url");
+    if (providerURLel) providerURLel.textContent = providerBase;
+    var providerNativeEl = document.getElementById("cfg-provider-url-native");
+    if (providerNativeEl) providerNativeEl.textContent = providerRoot;
+    var providerGeminiEl = document.getElementById("cfg-provider-url-gemini");
+    if (providerGeminiEl) providerGeminiEl.textContent = providerRoot + "/v1beta";
+
     var tp = c.timing_policy || defaultTimingPolicy;
     var tpNormal = document.getElementById("cfg-tp-normal");
     if (tpNormal) tpNormal.value = tp.normal_min != null ? tp.normal_min : 30;
@@ -1338,6 +1493,18 @@
       var recalcEl = document.getElementById("cfg-recalculate-schedule");
       var recalc = recalcEl ? recalcEl.checked : false;
 
+      var responseRules;
+      try {
+        responseRules = readResponseRules(document.getElementById("cfg-response-rules"));
+      } catch (err) {
+        if (msgEl) {
+          msgEl.textContent = err.message;
+          msgEl.className = "form-message is-error";
+        }
+        toast(err.message);
+        return;
+      }
+
       // Preserve all other config fields from state.config
       var existingCfg = state.config || {};
       var c = Object.assign({}, existingCfg, {
@@ -1348,6 +1515,12 @@
         cool_min: parseInt(document.getElementById("cfg-cool").value, 10),
         schedule_mode: document.getElementById("cfg-schedule-mode").value,
         timing_policy: timingPolicy,
+        response_model_mode: document.getElementById("cfg-response-mode").value,
+        response_reroute_min: parseInt(document.getElementById("cfg-response-reroute").value, 10),
+        response_rules: responseRules,
+        provider_enabled: document.getElementById("cfg-provider-enabled").checked,
+        provider_key: document.getElementById("cfg-provider-key").value,
+        provider_attempts: parseInt(document.getElementById("cfg-provider-attempts").value, 10),
         recalculate_schedule: recalc
       });
 
@@ -1377,6 +1550,32 @@
       });
     });
   }
+
+  function fallbackCopy(text, done) {
+    var area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    try { document.execCommand("copy"); done(); } catch (err) { toast("复制失败，请手动选择地址"); }
+    document.body.removeChild(area);
+  }
+
+  Array.prototype.forEach.call(document.querySelectorAll(".provider-copy"), function (btn) {
+    btn.addEventListener("click", function () {
+      var el = document.getElementById(btn.getAttribute("data-copy"));
+      if (!el) return;
+      var text = el.textContent || "";
+      var done = function () { toast("已复制 Base URL"); };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function () { fallbackCopy(text, done); });
+      } else {
+        fallbackCopy(text, done);
+      }
+    });
+  });
 
   var topRefreshBtn = document.getElementById("top-refresh");
   if (topRefreshBtn) {

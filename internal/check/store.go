@@ -4,6 +4,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -14,7 +17,8 @@ const maxResults = 500
 
 // Store persists guard state in SQLite.
 type Store struct {
-	db *sql.DB
+	db        *sql.DB
+	rerouteMu sync.Mutex
 }
 
 // OpenStore opens (creating if needed) the state database.
@@ -70,10 +74,12 @@ CREATE TABLE IF NOT EXISTS results (
   prompt_id  TEXT NOT NULL,
   answer     TEXT NOT NULL DEFAULT '',
   verdict    TEXT NOT NULL,
-  detail     TEXT NOT NULL DEFAULT '',
-  tokens     INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL,
-  source     TEXT NOT NULL DEFAULT 'manual'
+  detail       TEXT NOT NULL DEFAULT '',
+  actual_model TEXT NOT NULL DEFAULT '',
+  rule_id     TEXT NOT NULL DEFAULT '',
+  tokens       INTEGER NOT NULL DEFAULT 0,
+  created_at   INTEGER NOT NULL,
+  source       TEXT NOT NULL DEFAULT 'manual'
 );
 CREATE INDEX IF NOT EXISTS idx_results_model ON results(model, created_at DESC);
 `)
@@ -99,6 +105,33 @@ CREATE INDEX IF NOT EXISTS idx_results_model ON results(model, created_at DESC);
 	}
 	if sjExists == 0 {
 		if _, err := s.db.Exec(`ALTER TABLE targets ADD COLUMN schedule_json TEXT NOT NULL DEFAULT '{}'`); err != nil {
+			return err
+		}
+	}
+	var rrExists int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('targets') WHERE name='response_rules_json'`).Scan(&rrExists); err != nil {
+		return err
+	}
+	if rrExists == 0 {
+		if _, err := s.db.Exec(`ALTER TABLE targets ADD COLUMN response_rules_json TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	var amExists int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('results') WHERE name='actual_model'`).Scan(&amExists); err != nil {
+		return err
+	}
+	if amExists == 0 {
+		if _, err := s.db.Exec(`ALTER TABLE results ADD COLUMN actual_model TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	var ridExists int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('results') WHERE name='rule_id'`).Scan(&ridExists); err != nil {
+		return err
+	}
+	if ridExists == 0 {
+		if _, err := s.db.Exec(`ALTER TABLE results ADD COLUMN rule_id TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
 		}
 	}
@@ -140,6 +173,17 @@ type GuardConfig struct {
 	ProbeMaxTokens     int          `json:"probe_max_tokens"`
 	ScheduleMode       string       `json:"schedule_mode"` // "fixed" | "staged", default "fixed"
 	TimingPolicy       TimingPolicy `json:"timing_policy"`
+
+	// Response-model judgment: match the real model in replies.
+	ResponseModelMode  string              `json:"response_model_mode"` // "off" | "on"
+	ResponseRules      []ResponseModelRule `json:"response_rules,omitempty"`
+	ResponseRerouteMin int                 `json:"response_reroute_min"` // minutes a rerouted model stays excluded
+
+	// Custom provider endpoint. It speaks OpenAI Chat and forwards to the
+	// configured Magpie gateway, applying response rules and bounded retries.
+	ProviderEnabled  bool   `json:"provider_enabled"`
+	ProviderKey      string `json:"provider_key,omitempty"`
+	ProviderAttempts int    `json:"provider_attempts"`
 }
 
 func defaultConfig() GuardConfig {
@@ -151,6 +195,9 @@ func defaultConfig() GuardConfig {
 		ProbeMaxTokens:     8192,
 		ScheduleMode:       ScheduleModeFixed,
 		TimingPolicy:       DefaultTimingPolicy(),
+		ResponseModelMode:  ResponseModelOff,
+		ResponseRerouteMin: 30,
+		ProviderAttempts:   2,
 	}
 }
 
@@ -160,6 +207,15 @@ func (s *Store) LoadConfig() (GuardConfig, error) {
 	_, err := s.getKV("config", &c)
 	if c.ScheduleMode == "" {
 		c.ScheduleMode = ScheduleModeFixed
+	}
+	if c.ResponseModelMode == "" {
+		c.ResponseModelMode = ResponseModelOff
+	}
+	if c.ResponseRerouteMin <= 0 {
+		c.ResponseRerouteMin = 30
+	}
+	if c.ProviderAttempts <= 0 {
+		c.ProviderAttempts = 2
 	}
 	c.TimingPolicy = ResolveTimingPolicy(nil, c.TimingPolicy)
 	return c, err
@@ -208,6 +264,16 @@ type Target struct {
 	RecoveryPasses    int           `json:"recovery_passes"`
 	IsolationRechecks int           `json:"isolation_rechecks"`
 	RetryPromptID     string        `json:"retry_prompt_id"`
+
+	// Response-model judgment override: inherit global or use custom rules.
+	ResponseRuleMode   string              `json:"response_rule_mode,omitempty"`
+	ResponseModelRules []ResponseModelRule `json:"response_model_rules,omitempty"`
+}
+
+// targetResponseRulesPayload is persisted beside the schedule fields.
+type targetResponseRulesPayload struct {
+	Mode  string              `json:"mode,omitempty"`
+	Rules []ResponseModelRule `json:"rules,omitempty"`
 }
 
 type targetSchedulePayload struct {
@@ -217,6 +283,25 @@ type targetSchedulePayload struct {
 	RecoveryPasses    int           `json:"recovery_passes,omitempty"`
 	IsolationRechecks int           `json:"isolation_rechecks,omitempty"`
 	RetryPromptID     string        `json:"retry_prompt_id,omitempty"`
+}
+
+func marshalResponseRulesJSON(t *Target) string {
+	if t.ResponseRuleMode == "" && len(t.ResponseModelRules) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(targetResponseRulesPayload{Mode: t.ResponseRuleMode, Rules: t.ResponseModelRules})
+	return string(b)
+}
+
+func unmarshalResponseRulesJSON(t *Target, raw string) {
+	if raw == "" {
+		return
+	}
+	var p targetResponseRulesPayload
+	if err := json.Unmarshal([]byte(raw), &p); err == nil {
+		t.ResponseRuleMode = p.Mode
+		t.ResponseModelRules = p.Rules
+	}
 }
 
 func marshalScheduleJSON(t *Target) string {
@@ -266,10 +351,11 @@ func scanTarget(row interface{ Scan(...any) error }) (*Target, error) {
 		t                    Target
 		promptIDs            string
 		scheduleJSON         string
+		responseRulesJSON    string
 		next, checked, allow int64
 	)
 	err := row.Scan(&t.Model, &t.Enabled, &promptIDs, &t.IntervalMin, &t.FailRecheckMin,
-		&next, &t.State, &t.Reason, &checked, &allow, &t.FailStreak, &t.ManualHold, &scheduleJSON)
+		&next, &t.State, &t.Reason, &checked, &allow, &t.FailStreak, &t.ManualHold, &scheduleJSON, &responseRulesJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -279,10 +365,11 @@ func scanTarget(row interface{ Scan(...any) error }) (*Target, error) {
 	t.AllowUntil = time.Unix(allow, 0).UTC()
 	t.Blocked = t.blockedAt(time.Now())
 	unmarshalScheduleJSON(&t, scheduleJSON)
+	unmarshalResponseRulesJSON(&t, responseRulesJSON)
 	return &t, nil
 }
 
-const targetCols = `model,enabled,prompt_ids,interval_min,fail_recheck_min,next_check_at,state,reason,checked_at,allow_until,fail_streak,manual_hold,schedule_json`
+const targetCols = `model,enabled,prompt_ids,interval_min,fail_recheck_min,next_check_at,state,reason,checked_at,allow_until,fail_streak,manual_hold,schedule_json,response_rules_json`
 
 // SaveTarget inserts or updates a target.
 func (s *Store) SaveTarget(t *Target) error {
@@ -291,15 +378,17 @@ func (s *Store) SaveTarget(t *Target) error {
 	}
 	ids, _ := json.Marshal(t.PromptIDs)
 	sj := marshalScheduleJSON(t)
-	_, err := s.db.Exec(`INSERT INTO targets(`+targetCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+	rr := marshalResponseRulesJSON(t)
+	_, err := s.db.Exec(`INSERT INTO targets(`+targetCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 	  ON CONFLICT(model) DO UPDATE SET
 	    enabled=excluded.enabled, prompt_ids=excluded.prompt_ids,
 	    interval_min=excluded.interval_min, fail_recheck_min=excluded.fail_recheck_min,
 	    next_check_at=excluded.next_check_at, state=excluded.state, reason=excluded.reason,
 	    checked_at=excluded.checked_at, allow_until=excluded.allow_until, fail_streak=excluded.fail_streak,
-	    manual_hold=excluded.manual_hold, schedule_json=excluded.schedule_json`,
+	    manual_hold=excluded.manual_hold, schedule_json=excluded.schedule_json,
+	    response_rules_json=excluded.response_rules_json`,
 		t.Model, t.Enabled, string(ids), t.IntervalMin, t.FailRecheckMin,
-		t.NextCheckAt.Unix(), t.State, t.Reason, t.CheckedAt.Unix(), t.AllowUntil.Unix(), t.FailStreak, t.ManualHold, sj)
+		t.NextCheckAt.Unix(), t.State, t.Reason, t.CheckedAt.Unix(), t.AllowUntil.Unix(), t.FailStreak, t.ManualHold, sj, rr)
 	t.Blocked = t.blockedAt(time.Now())
 	return err
 }
@@ -360,23 +449,25 @@ func (s *Store) DueTargets(now time.Time) ([]*Target, error) {
 
 // Result is one probe outcome.
 type Result struct {
-	ID        string    `json:"id"`
-	Model     string    `json:"model"`
-	PromptID  string    `json:"prompt_id"`
-	Answer    string    `json:"answer"`
-	Verdict   string    `json:"verdict"` // passed|failed|unavailable|manual
-	Detail    string    `json:"detail"`
-	Tokens    int       `json:"tokens"`
-	CreatedAt time.Time `json:"created_at"`
-	Source    string    `json:"source"` // manual|scheduled|triggered
+	ID          string    `json:"id"`
+	Model       string    `json:"model"`
+	PromptID    string    `json:"prompt_id"`
+	Answer      string    `json:"answer"`
+	Verdict     string    `json:"verdict"` // passed|failed|unavailable|manual
+	Detail      string    `json:"detail"`
+	ActualModel string    `json:"actual_model,omitempty"`
+	RuleID      string    `json:"rule_id,omitempty"`
+	Tokens      int       `json:"tokens"`
+	CreatedAt   time.Time `json:"created_at"`
+	Source      string    `json:"source"` // manual|scheduled|triggered|response
 }
 
 // AppendResult stores a probe result and prunes history beyond the retention
 // window (keep the newest maxResults rows).
 func (s *Store) AppendResult(r *Result) error {
-	if _, err := s.db.Exec(`INSERT INTO results(id,model,prompt_id,answer,verdict,detail,tokens,created_at,source)
-	  VALUES(?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.Model, r.PromptID, r.Answer, r.Verdict, r.Detail, r.Tokens, r.CreatedAt.Unix(), r.Source); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO results(id,model,prompt_id,answer,verdict,detail,actual_model,rule_id,tokens,created_at,source)
+	  VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.Model, r.PromptID, r.Answer, r.Verdict, r.Detail, r.ActualModel, r.RuleID, r.Tokens, r.CreatedAt.Unix(), r.Source); err != nil {
 		return err
 	}
 	_, err := s.db.Exec(`DELETE FROM results WHERE id NOT IN (
@@ -389,7 +480,7 @@ func (s *Store) Results(model, promptID string, limit int) ([]*Result, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	q := `SELECT id,model,prompt_id,answer,verdict,detail,tokens,created_at,source FROM results`
+	q := `SELECT id,model,prompt_id,answer,verdict,detail,actual_model,rule_id,tokens,created_at,source FROM results`
 	args := []any{}
 	where := ""
 	if model != "" {
@@ -416,7 +507,7 @@ func (s *Store) Results(model, promptID string, limit int) ([]*Result, error) {
 			r       Result
 			created int64
 		)
-		if err := rows.Scan(&r.ID, &r.Model, &r.PromptID, &r.Answer, &r.Verdict, &r.Detail, &r.Tokens, &created, &r.Source); err != nil {
+		if err := rows.Scan(&r.ID, &r.Model, &r.PromptID, &r.Answer, &r.Verdict, &r.Detail, &r.ActualModel, &r.RuleID, &r.Tokens, &created, &r.Source); err != nil {
 			return nil, err
 		}
 		r.CreatedAt = time.Unix(created, 0).UTC()
@@ -429,7 +520,7 @@ func (s *Store) Results(model, promptID string, limit int) ([]*Result, error) {
 func (s *Store) CountProbesToday(model string, now time.Time) (int, error) {
 	var n int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM results
-	  WHERE model=? AND created_at>=? AND verdict<>'manual-count'`,
+	  WHERE model=? AND created_at>=? AND verdict<>'manual-count' AND source<>'response'`,
 		model, dayStartUnix(now)).Scan(&n)
 	return n, err
 }
@@ -438,6 +529,58 @@ func dayStartUnix(now time.Time) int64 {
 	utc := now.UTC()
 	y, m, d := utc.Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Unix()
+}
+
+const responseReroutesKey = "response_reroutes"
+
+// AddResponseReroute excludes a real model from route groups until the given
+// time, so the next request can take another member.
+func (s *Store) AddResponseReroute(model string, until time.Time) error {
+	s.rerouteMu.Lock()
+	defer s.rerouteMu.Unlock()
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil
+	}
+	routes := map[string]int64{}
+	ok, err := s.getKV(responseReroutesKey, &routes)
+	if err != nil {
+		// Never replace an unreadable isolation set with an empty map.
+		return err
+	}
+	if !ok || routes == nil {
+		routes = map[string]int64{}
+	}
+	routes[model] = until.Unix()
+	return s.setKV(responseReroutesKey, routes)
+}
+
+// ResponseReroutes lists unexpired rerouted models and prunes expired ones.
+func (s *Store) ResponseReroutes(now time.Time) ([]string, error) {
+	s.rerouteMu.Lock()
+	defer s.rerouteMu.Unlock()
+	routes := map[string]int64{}
+	ok, err := s.getKV(responseReroutesKey, &routes)
+	if err != nil || !ok {
+		return nil, err
+	}
+	changed := false
+	var out []string
+	for model, until := range routes {
+		if until > now.Unix() {
+			out = append(out, model)
+		} else {
+			delete(routes, model)
+			changed = true
+		}
+	}
+	if changed {
+		if err := s.setKV(responseReroutesKey, routes); err != nil {
+			return nil, err
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // SeedBuiltins inserts builtin prompts that are missing, and migrates unedited

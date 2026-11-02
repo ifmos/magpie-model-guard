@@ -3,7 +3,9 @@ module github.com/mos/magpie-model-guard
 go 1.26.0
 
 require (
+	github.com/coder/websocket v1.8.14
 	github.com/gofrs/flock v0.12.1
+	github.com/klauspost/compress v1.18.3
 	modernc.org/sqlite v1.61.0
 )
 
