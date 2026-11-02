@@ -532,6 +532,278 @@ func TestExternalEdit(t *testing.T) {
 	}
 }
 
+// 8b. An external conflict must not pin a group after the guard no longer
+// needs to isolate anything in it; deleting or pausing the target has to be a
+// working recovery path.
+func TestExternalConflictReleasedWhenNoLongerBlocked(t *testing.T) {
+	store, configDir, ctrl := setupTestEnv(t)
+	defer store.Close()
+
+	initial := map[string]any{
+		"groups": []any{
+			map[string]any{
+				"id":      "conflict-grp",
+				"name":    "Conflict Group",
+				"members": []any{"vendor/m1", "vendor/m2"},
+				"routing": "order",
+			},
+		},
+	}
+	writeProvidersJSON(t, configDir, initial)
+
+	ctx := context.Background()
+	if _, err := ctrl.sync(ctx, []string{"vendor/m1"}); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	data := readProvidersJSON(t, configDir)
+	grp := getGroup(data["groups"].([]any), "conflict-grp")
+	grp["off"] = []any{"vendor/m1", "user-added-off"}
+	writeProvidersJSON(t, configDir, data)
+
+	if _, err := ctrl.sync(ctx, []string{"vendor/m1"}); err == nil {
+		t.Fatalf("expected conflict while the model is still blocked")
+	}
+
+	// Target removed/paused: the guard has nothing left to isolate, so the
+	// external edit wins and the group is released.
+	status, err := ctrl.sync(ctx, []string{})
+	if err != nil {
+		t.Fatalf("release after conflict failed: %v", err)
+	}
+	if status.ManagedGroups != 0 {
+		t.Fatalf("expected ManagedGroups=0 after release, got %d", status.ManagedGroups)
+	}
+
+	grp = getGroup(readProvidersJSON(t, configDir)["groups"].([]any), "conflict-grp")
+	if off := toStringSlice(grp["off"]); !reflect.DeepEqual(off, []string{"vendor/m1", "user-added-off"}) {
+		t.Fatalf("released group must keep the external off edit, got %v", off)
+	}
+
+	var ledger groupLedger
+	if _, err := store.getKV(groupRoutingLedgerKey, &ledger); err != nil {
+		t.Fatalf("getKV failed: %v", err)
+	}
+	if _, stillManaged := ledger.Groups["conflict-grp"]; stillManaged {
+		t.Fatalf("released group must leave the ledger")
+	}
+}
+
+// 8c. A group whose own definition no longer reaches any blocked model must
+// also be released despite an external off edit.
+func TestExternalConflictReleasedWhenGroupNoLongerTouched(t *testing.T) {
+	store, configDir, ctrl := setupTestEnv(t)
+	defer store.Close()
+
+	initial := map[string]any{
+		"groups": []any{
+			map[string]any{
+				"id":      "detached-grp",
+				"name":    "Detached Group",
+				"members": []any{"vendor/m1", "vendor/m2"},
+				"routing": "order",
+			},
+		},
+	}
+	writeProvidersJSON(t, configDir, initial)
+
+	ctx := context.Background()
+	if _, err := ctrl.sync(ctx, []string{"vendor/m1"}); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	data := readProvidersJSON(t, configDir)
+	grp := getGroup(data["groups"].([]any), "detached-grp")
+	grp["off"] = []any{"vendor/m1", "user-added-off"}
+	grp["members"] = []any{"vendor/m2", "vendor/m3"}
+	writeProvidersJSON(t, configDir, data)
+
+	status, err := ctrl.sync(ctx, []string{"vendor/m1"})
+	if err != nil {
+		t.Fatalf("release after member change failed: %v", err)
+	}
+	if status.ManagedGroups != 0 {
+		t.Fatalf("expected ManagedGroups=0 after release, got %d", status.ManagedGroups)
+	}
+
+	grp = getGroup(readProvidersJSON(t, configDir)["groups"].([]any), "detached-grp")
+	if off := toStringSlice(grp["off"]); !reflect.DeepEqual(off, []string{"vendor/m1", "user-added-off"}) {
+		t.Fatalf("released group must keep the external off edit, got %v", off)
+	}
+}
+
+// 8d. A group deleted in Magpie must not stay counted as managed.
+func TestMissingGroupDropsLedger(t *testing.T) {
+	store, configDir, ctrl := setupTestEnv(t)
+	defer store.Close()
+
+	initial := map[string]any{
+		"groups": []any{
+			map[string]any{
+				"id":      "gone-grp",
+				"name":    "Gone Group",
+				"members": []any{"vendor/m1", "vendor/m2"},
+				"routing": "order",
+			},
+		},
+	}
+	writeProvidersJSON(t, configDir, initial)
+
+	ctx := context.Background()
+	if _, err := ctrl.sync(ctx, []string{"vendor/m1"}); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	writeProvidersJSON(t, configDir, map[string]any{"groups": []any{}})
+	status, err := ctrl.sync(ctx, []string{"vendor/m1"})
+	if err != nil {
+		t.Fatalf("sync after group removal failed: %v", err)
+	}
+	if status.ManagedGroups != 0 {
+		t.Fatalf("expected ManagedGroups=0 for a removed group, got %d", status.ManagedGroups)
+	}
+
+	var ledger groupLedger
+	if _, err := store.getKV(groupRoutingLedgerKey, &ledger); err != nil {
+		t.Fatalf("getKV failed: %v", err)
+	}
+	if _, stillManaged := ledger.Groups["gone-grp"]; stillManaged {
+		t.Fatalf("removed group must leave the ledger")
+	}
+}
+
+// 8e. Materialized auto groups are guard-owned: an external off edit becomes
+// the new baseline so isolation continues instead of failing forever.
+func TestAutoGroupExternalEditRebases(t *testing.T) {
+	cases := []struct {
+		name string
+		off  []any
+	}{
+		{name: "user added exclusion", off: []any{"vendor/m1", "user-added-off"}},
+		{name: "user removed guard exclusion", off: []any{"user-added-off"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, configDir, ctrl := setupTestEnv(t)
+			defer store.Close()
+			writeProvidersJSON(t, configDir, map[string]any{"providers": []any{}, "groups": []any{}})
+
+			ctrl.discoverAuto = func(ctx context.Context, magpiePath string) ([]autoGroupSummary, error) {
+				return []autoGroupSummary{{Ref: "auto/test-model", Name: "Test Model", Routing: "smart"}}, nil
+			}
+			ctrl.fetchMembers = func(ctx context.Context, magpiePath, ref string) ([]string, error) {
+				return []string{"vendor/m1", "vendor/m2"}, nil
+			}
+
+			ctx := context.Background()
+			status, err := ctrl.sync(ctx, []string{"vendor/m1"})
+			if err != nil || status.ManagedGroups != 1 {
+				t.Fatalf("materialize sync failed: status=%+v err=%v", status, err)
+			}
+
+			data := readProvidersJSON(t, configDir)
+			grp := getGroup(data["groups"].([]any), "auto-test-model")
+			grp["off"] = tc.off
+			// Keep the group after recovery so the user-owned exclusion is visible.
+			grp["name"] = "Renamed Auto Group"
+			writeProvidersJSON(t, configDir, data)
+
+			status, err = ctrl.sync(ctx, []string{"vendor/m1"})
+			if err != nil {
+				t.Fatalf("auto group rebase failed: %v", err)
+			}
+			if status.ManagedGroups != 1 {
+				t.Fatalf("expected auto group to stay managed, got %d", status.ManagedGroups)
+			}
+
+			grp = getGroup(readProvidersJSON(t, configDir)["groups"].([]any), "auto-test-model")
+			off := toStringSlice(grp["off"])
+			sort.Strings(off)
+			if !reflect.DeepEqual(off, []string{"user-added-off", "vendor/m1"}) {
+				t.Fatalf("expected guard exclusion restored beside the user edit, got %v", off)
+			}
+
+			// Recovery must drop only the guard's exclusion.
+			status, err = ctrl.sync(ctx, []string{})
+			if err != nil {
+				t.Fatalf("auto group recovery failed: %v", err)
+			}
+			if status.ManagedGroups != 0 {
+				t.Fatalf("expected ManagedGroups=0 after recovery, got %d", status.ManagedGroups)
+			}
+			grp = getGroup(readProvidersJSON(t, configDir)["groups"].([]any), "auto-test-model")
+			if got := toStringSlice(grp["off"]); !reflect.DeepEqual(got, []string{"user-added-off"}) {
+				t.Fatalf("expected user exclusion preserved after recovery, got %v", got)
+			}
+		})
+	}
+}
+
+// 8f. A group whose off already contains a blocked model must not be released
+// or removed on the first sync. The auto- prefix alone is not proof that the
+// group is guard-owned; only the ledger's IsAuto may drive removal.
+func TestExistingOffWithBlockedKeepsIsolation(t *testing.T) {
+	store, configDir, ctrl := setupTestEnv(t)
+	defer store.Close()
+
+	initial := map[string]any{
+		"groups": []any{
+			map[string]any{
+				"id":      "auto-user-group",
+				"name":    "User Group",
+				"members": []any{"vendor/m1", "vendor/m2"},
+				"routing": "smart",
+				"off":     []any{"vendor/m1", "user-added-off"},
+			},
+		},
+	}
+	writeProvidersJSON(t, configDir, initial)
+
+	ctx := context.Background()
+	status, err := ctrl.sync(ctx, []string{"vendor/m1"})
+	if err != nil {
+		t.Fatalf("first sync must keep isolation, got %v", err)
+	}
+	if status.ManagedGroups != 1 {
+		t.Fatalf("expected group to stay managed, got %d", status.ManagedGroups)
+	}
+
+	grp := getGroup(readProvidersJSON(t, configDir)["groups"].([]any), "auto-user-group")
+	if grp == nil {
+		t.Fatalf("group must not be deleted")
+	}
+	off := toStringSlice(grp["off"])
+	sort.Strings(off)
+	if !reflect.DeepEqual(off, []string{"user-added-off", "vendor/m1"}) {
+		t.Fatalf("expected exclusions preserved, got %v", off)
+	}
+
+	var ledger groupLedger
+	if _, err := store.getKV(groupRoutingLedgerKey, &ledger); err != nil {
+		t.Fatalf("getKV failed: %v", err)
+	}
+	entry := ledger.Groups["auto-user-group"]
+	if entry == nil {
+		t.Fatalf("expected group in ledger")
+	}
+	if entry.IsAuto {
+		t.Fatalf("auto- prefix must not mark a user group as auto")
+	}
+
+	// Once nothing is blocked, the guard releases the group but must not
+	// delete it: it was never proven to be guard-owned.
+	status, err = ctrl.sync(ctx, []string{})
+	if err != nil {
+		t.Fatalf("release sync failed: %v", err)
+	}
+	if status.ManagedGroups != 0 {
+		t.Fatalf("expected release, got %d managed", status.ManagedGroups)
+	}
+	if getGroup(readProvidersJSON(t, configDir)["groups"].([]any), "auto-user-group") == nil {
+		t.Fatalf("released user group must not be deleted")
+	}
+}
+
 // 9. Restart journal crash recovery test
 func TestRestartJournal(t *testing.T) {
 	store, configDir, ctrl := setupTestEnv(t)

@@ -253,16 +253,40 @@ func (c *groupController) sync(ctx context.Context, blocked []string) (GroupRout
 	// Restart / journal validation: check for external edits on managed fields.
 	var conflictErrors []string
 	conflictedGroups := make(map[string]bool)
+	ledgerDropped := false
+	autoRebased := false
 
 	for id, entry := range ledger.Groups {
 		g, exists := groupMap[id]
 		if !exists {
+			// The group is gone; keeping its ledger row would report a stale
+			// managed group and could resurface a conflict on a same-id group.
+			delete(ledger.Groups, id)
+			ledgerDropped = true
 			continue
 		}
 		live := extractManagedFields(g)
 		// Compare live against committed After and baseline Before
 		if !managedFieldsEqual(live, entry.After) {
 			if !managedFieldsEqual(live, entry.Before) {
+				// Nothing left to isolate in this group: accept the external
+				// edit and stop managing it instead of blocking recovery with
+				// a conflict forever.
+				if !groupTouchedByBlocked(g, blocked) {
+					delete(ledger.Groups, id)
+					ledgerDropped = true
+					continue
+				}
+				// A materialized auto group is the guard's own ephemeral copy;
+				// Magpie may rewrite its off list. Adopt the live state as the
+				// new baseline and keep enforcing the blocked members.
+				if entry.IsAuto {
+					entry.Before = rebaseManagedFields(live, entry.AddedOff)
+					entry.After = entry.Before
+					entry.AddedOff = nil
+					autoRebased = true
+					continue
+				}
 				field := diffManagedField(live, entry.After)
 				conflictedGroups[id] = true
 				conflictErrors = append(conflictErrors, fmt.Sprintf("组 %s 的受管字段 %s 被外部修改", id, field))
@@ -304,7 +328,7 @@ func (c *groupController) sync(ctx context.Context, blocked []string) (GroupRout
 		}
 	}
 
-	changed := false
+	changed := ledgerDropped || autoRebased
 	for _, g := range groups {
 		id, _ := g["id"].(string)
 		if id == "" || conflictedGroups[id] {
@@ -324,6 +348,9 @@ func (c *groupController) sync(ctx context.Context, blocked []string) (GroupRout
 				OriginalJSON: raw,
 				Before:       extractManagedFields(g),
 			}
+			// Adopting a group is a ledger change even when its fields already
+			// match, so the next sync still knows it is managed.
+			changed = true
 		}
 
 		if reconcileGroup(g, entry, blocked) {
@@ -331,7 +358,11 @@ func (c *groupController) sync(ctx context.Context, blocked []string) (GroupRout
 		}
 
 		wasReleased := entry.Deleted
-		if isGroupRecovered(g, entry) {
+		// A group that still reaches a blocked model must stay managed even
+		// when its live fields already match the baseline (for example, an
+		// adopted group that already excluded it). Releasing here would drop
+		// the auto group and lose isolation.
+		if isGroupRecovered(g, entry) && !groupTouchedByBlocked(g, blocked) {
 			entry.After = extractManagedFields(g)
 			entry.Deleted = true
 			entry.Removed = false
@@ -448,7 +479,7 @@ func (c *groupController) sync(ctx context.Context, blocked []string) (GroupRout
 
 	var allErrors []string
 	if len(conflictErrors) > 0 {
-		allErrors = append(allErrors, fmt.Sprintf("外部冲突: %s，已停止对冲突组的覆盖", strings.Join(conflictErrors, "; ")))
+		allErrors = append(allErrors, fmt.Sprintf("外部冲突: %s，已停止对冲突组的覆盖；可解除对应监测目标释放该组", strings.Join(conflictErrors, "; ")))
 	}
 	for _, e := range autoErrs {
 		allErrors = append(allErrors, e.Error())
@@ -1212,6 +1243,18 @@ func extractManagedFields(g map[string]any) managedFields {
 		}
 	}
 	return mf
+}
+
+// rebaseManagedFields adopts an externally edited live state as the baseline.
+// Exclusions the guard previously added are removed from the baseline so a
+// later recovery still clears them, while user exclusions are kept.
+func rebaseManagedFields(live managedFields, added []string) managedFields {
+	base := live
+	if len(added) > 0 {
+		base.Off = stringSliceDiff(live.Off, added)
+		base.HasOff = len(base.Off) > 0
+	}
+	return base
 }
 
 func managedFieldsEqual(a, b managedFields) bool {
