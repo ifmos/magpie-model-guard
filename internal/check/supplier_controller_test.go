@@ -765,9 +765,10 @@ func TestSupplierValidationLoopsAndEligibility(t *testing.T) {
 
 	t.Run("credential-bearing and host-dependent bases are refused", func(t *testing.T) {
 		cases := []struct {
-			name     string
-			provider map[string]any
-			conflict string
+			name        string
+			provider    map[string]any
+			conflict    string
+			unsupported string
 		}{
 			{
 				name:     "gemini query key",
@@ -816,7 +817,7 @@ func TestSupplierValidationLoopsAndEligibility(t *testing.T) {
 					"chat": "https://other-magpie.example/v1", "responses": "https://other-magpie.example/v1",
 					"anthropic": "https://other-magpie.example", "gemini": "https://other-magpie.example/v1beta",
 				},
-				conflict: "远程 Magpie",
+				unsupported: "远程 Magpie",
 			},
 		}
 		for _, tc := range cases {
@@ -827,13 +828,27 @@ func TestSupplierValidationLoopsAndEligibility(t *testing.T) {
 				if err != nil {
 					t.Fatalf("list: %v", err)
 				}
-				if len(list.Providers) != 1 || !strings.Contains(list.Providers[0].Conflict, tc.conflict) {
-					t.Fatalf("list conflict = %#v", list.Providers)
+				if len(list.Providers) != 1 {
+					t.Fatalf("list = %#v", list.Providers)
 				}
-				if got := strings.Count(list.Providers[0].Conflict, tc.conflict); got != 1 {
-					t.Fatalf("conflict %q repeated %d times: %q", tc.conflict, got, list.Providers[0].Conflict)
+				got := list.Providers[0]
+				if tc.unsupported != "" {
+					if !strings.Contains(got.Unsupported, tc.unsupported) || got.Conflict != "" {
+						t.Fatalf("unsupported supplier = %#v", got)
+					}
+				} else if !strings.Contains(got.Conflict, tc.conflict) {
+					t.Fatalf("list conflict = %#v", got)
 				}
-				if err := ctrl.setProtection(context.Background(), id, true); err == nil || !strings.Contains(err.Error(), tc.conflict) {
+				if tc.unsupported == "" {
+					if n := strings.Count(got.Conflict, tc.conflict); n != 1 {
+						t.Fatalf("conflict %q repeated %d times: %q", tc.conflict, n, got.Conflict)
+					}
+				}
+				wantReason := tc.conflict
+				if tc.unsupported != "" {
+					wantReason = tc.unsupported
+				}
+				if err := ctrl.setProtection(context.Background(), id, true); err == nil || !strings.Contains(err.Error(), wantReason) {
 					t.Fatalf("setProtection err = %v", err)
 				}
 				if ledger := supplierTestLedger(t, ctrl.store); len(ledger.Entries) != 0 || ledger.Pending != nil {
@@ -844,6 +859,23 @@ func TestSupplierValidationLoopsAndEligibility(t *testing.T) {
 				}
 			})
 		}
+
+		t.Run("remote magpie stays listed without protocol addresses", func(t *testing.T) {
+			supplierTestWriteProviders(t, configDir, map[string]any{"providers": []any{map[string]any{
+				"id": "remote-only", "name": "Remote", "preset": "remote-magpie", "models": []any{"remote/model"},
+			}}})
+			list, err := ctrl.list(context.Background())
+			if err != nil {
+				t.Fatalf("list: %v", err)
+			}
+			if len(list.Providers) != 1 {
+				t.Fatalf("list = %#v", list.Providers)
+			}
+			got := list.Providers[0]
+			if got.Conflict != "" || !strings.Contains(got.Unsupported, "远程 Magpie") || len(got.Protocols) != 0 {
+				t.Fatalf("remote supplier = %#v", got)
+			}
+		})
 	})
 
 	t.Run("non-loopback origin", func(t *testing.T) {
@@ -1219,6 +1251,49 @@ func TestSupplierAddedProtocolIsConflictWithoutBinding(t *testing.T) {
 	}
 	if ledger := supplierTestLedger(t, store); len(ledger.Entries) != 0 || ledger.Pending != nil {
 		t.Fatalf("ledger not cleared: %#v", ledger)
+	}
+}
+
+func TestSupplierExistingTakeoverSwitchedToRemoteMagpieStaysRestorable(t *testing.T) {
+	store, configDir, ctrl := newSupplierTestEnv(t)
+	supplierTestWriteProviders(t, configDir, supplierTestProvidersFile())
+	ctx := context.Background()
+	if err := ctrl.setProtection(ctx, "vendor", true); err != nil {
+		t.Fatalf("enable protection: %v", err)
+	}
+
+	data := supplierTestReadProviders(t, configDir)
+	provider := supplierTestProvider(t, data, "vendor")
+	provider["preset"] = "remote-magpie"
+	supplierTestWriteProviders(t, configDir, data)
+
+	list, err := ctrl.list(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list.Providers) != 1 {
+		t.Fatalf("list = %#v", list.Providers)
+	}
+	got := list.Providers[0]
+	if !got.Protected || got.Unsupported != "" || got.Conflict != "" {
+		t.Fatalf("protected remote supplier = %#v", got)
+	}
+	if err := ctrl.setProtection(ctx, "vendor", true); err == nil || !strings.Contains(err.Error(), "远程 Magpie") {
+		t.Fatalf("enabling remote protection err = %v", err)
+	}
+	if err := ctrl.setProtection(ctx, "vendor", false); err != nil {
+		t.Fatalf("restore remote takeover: %v", err)
+	}
+	if ledger := supplierTestLedger(t, store); len(ledger.Entries) != 0 || ledger.Pending != nil {
+		t.Fatalf("ledger not cleared: %#v", ledger)
+	}
+	list, err = ctrl.list(ctx)
+	if err != nil {
+		t.Fatalf("list after restore: %v", err)
+	}
+	if len(list.Providers) != 1 || list.Providers[0].Protected || list.Providers[0].Conflict != "" ||
+		!strings.Contains(list.Providers[0].Unsupported, "远程 Magpie") {
+		t.Fatalf("restored remote supplier = %#v", list.Providers)
 	}
 }
 

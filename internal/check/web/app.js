@@ -1407,7 +1407,8 @@
           name: p.name == null ? "" : String(p.name),
           protected: !!p.protected,
           protocols: Array.isArray(p.protocols) ? p.protocols.map(String) : [],
-          conflict: p.conflict == null ? "" : String(p.conflict)
+          conflict: p.conflict == null ? "" : String(p.conflict),
+          unsupported: p.unsupported == null ? "" : String(p.unsupported)
         };
       });
     }
@@ -1466,20 +1467,26 @@
     }
 
     var providers = supplierData.providers || [];
-    var protectedCount = providers.filter(function (p) { return p.protected; }).length;
+    var supported = providers.filter(function (p) { return !p.unsupported; });
+    var unsupported = providers.filter(function (p) { return !!p.unsupported; });
+    var protectedCount = supported.filter(function (p) { return p.protected; }).length;
     if (summaryEl) {
       if (supplierData.error && !providers.length) summaryEl.textContent = "状态不可用";
       else if (!supplierData.configured) summaryEl.textContent = "未找到供应商配置";
       else if (!providers.length) summaryEl.textContent = "未发现自定义供应商";
-      else summaryEl.textContent = protectedCount + " / " + providers.length + " 已保护";
+      else {
+        var summary = supported.length ? protectedCount + " / " + supported.length + " 已保护" : "没有可接管的自定义供应商";
+        if (unsupported.length) summary += " · " + unsupported.length + " 个不支持接管";
+        summaryEl.textContent = summary;
+      }
     }
 
     if (supplierData.error) {
       listEl.appendChild(supplierEl("p", "supplier-empty is-error", "供应商状态：" + supplierData.error));
     }
 
-    if (providers.length) {
-      providers.forEach(function (p) {
+    if (supported.length) {
+      supported.forEach(function (p) {
         listEl.appendChild(renderSupplierRow(p));
       });
       if (focusedSupplier != null) {
@@ -1490,8 +1497,14 @@
           }
         });
       }
-      return;
     }
+    if (unsupported.length) {
+      listEl.appendChild(supplierEl("p", "supplier-group-title", "不支持接管的供应商"));
+      unsupported.forEach(function (p) {
+        listEl.appendChild(renderSupplierRow(p));
+      });
+    }
+    if (providers.length) return;
 
     if (!supplierData.configured) {
       if (!supplierData.error) {
@@ -1516,8 +1529,12 @@
     var title = document.createElement("div");
     title.className = "supplier-title";
     title.appendChild(supplierEl("strong", "", p.name || p.id || "未命名供应商"));
-    title.appendChild(supplierEl("span", "supplier-badge " + (p.protected ? "is-on" : "is-off"), p.protected ? "已保护" : "未保护"));
-    if (p.conflict) title.appendChild(supplierEl("span", "supplier-badge is-warn", "冲突"));
+    if (p.unsupported) {
+      title.appendChild(supplierEl("span", "supplier-badge is-muted", "不支持接管"));
+    } else {
+      title.appendChild(supplierEl("span", "supplier-badge " + (p.protected ? "is-on" : "is-off"), p.protected ? "已保护" : "未保护"));
+      if (p.conflict) title.appendChild(supplierEl("span", "supplier-badge is-warn", "冲突"));
+    }
     main.appendChild(title);
 
     if (p.id) main.appendChild(supplierEl("div", "supplier-id", p.id));
@@ -1533,7 +1550,9 @@
     }
     main.appendChild(protoWrap);
 
-    if (p.conflict) {
+    if (p.unsupported) {
+      main.appendChild(supplierEl("p", "supplier-unsupported", p.unsupported));
+    } else if (p.conflict) {
       main.appendChild(supplierEl("p", "supplier-conflict", "⚠ 冲突：" + p.conflict));
     }
     row.appendChild(main);
@@ -1543,17 +1562,20 @@
     var btn = document.createElement("button");
     btn.type = "button";
     btn.className = "secondary-button-sm supplier-action";
-    if (pending) {
+    if (p.unsupported) {
+      btn.textContent = "不支持接管";
+      btn.setAttribute("aria-label", "不支持接管：" + (p.name || p.id));
+    } else if (pending) {
       btn.textContent = supplierPending[p.id] ? "正在启用…" : "正在恢复…";
       btn.setAttribute("aria-busy", "true");
     } else {
       btn.textContent = p.protected ? "恢复原始地址" : "启用保护";
+      btn.setAttribute("aria-label", (p.protected ? "恢复原始地址：" : "启用保护：") + (p.name || p.id));
+      btn.addEventListener("click", function () {
+        setSupplierProtection(p.id, !p.protected);
+      });
     }
-    btn.disabled = anyPending || !p.id;
-    btn.setAttribute("aria-label", pending ? btn.textContent : (p.protected ? "恢复原始地址：" : "启用保护：") + (p.name || p.id));
-    btn.addEventListener("click", function () {
-      setSupplierProtection(p.id, !p.protected);
-    });
+    btn.disabled = !!p.unsupported || anyPending || !p.id;
     row.appendChild(btn);
     return row;
   }

@@ -70,11 +70,12 @@ type supplierList struct {
 }
 
 type supplierProvider struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	Protected bool     `json:"protected"`
-	Protocols []string `json:"protocols"`
-	Conflict  string   `json:"conflict,omitempty"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Protected   bool     `json:"protected"`
+	Protocols   []string `json:"protocols"`
+	Conflict    string   `json:"conflict,omitempty"`
+	Unsupported string   `json:"unsupported,omitempty"`
 }
 
 // supplierBinding is what /upstream resolves a route token to. Base is the
@@ -215,6 +216,19 @@ func (c *supplierController) list(ctx context.Context) (supplierList, error) {
 		seen[id] = true
 
 		entry := entries[id]
+		if reason := supplierUnsupportedPresetReason(provider); reason != "" && !(entry != nil && entry.Protected) {
+			// Remote Magpie keeps its own native endpoint rewrite; it can never
+			// be taken over, so list it apart from recoverable conflicts. An
+			// existing takeover stays restorable until the user disables it.
+			protocols, _ := supplierProtocolInfo(provider, originURL)
+			out.Providers = append(out.Providers, supplierProvider{
+				ID:          id,
+				Name:        supplierProviderName(provider, id),
+				Protocols:   protocols,
+				Unsupported: reason,
+			})
+			continue
+		}
 		var protocols []string
 		var problems []string
 		if entry != nil && entry.Protected {
@@ -314,6 +328,9 @@ func (c *supplierController) setProtection(ctx context.Context, id string, enabl
 	provider := providers[idx]
 
 	if enabled {
+		if reason := supplierUnsupportedPresetReason(provider); reason != "" {
+			return fmt.Errorf("供应商 %s 不能启用保护: %s", id, reason)
+		}
 		originURL, canonicalOrigin, err := supplierParseGuardOrigin(c.origin)
 		if err != nil {
 			return err
@@ -1015,6 +1032,15 @@ func supplierStrictOriginalSnapshot(provider map[string]json.RawMessage, origin 
 		return nil, "", err
 	}
 	return original, headerState, nil
+}
+
+// supplierUnsupportedPresetReason marks presets that are listed separately
+// and never offered for takeover, instead of being reported as conflicts.
+func supplierUnsupportedPresetReason(provider map[string]json.RawMessage) string {
+	if supplierRawStringField(provider, "preset") == "remote-magpie" {
+		return supplierLockedPresetReason("remote-magpie")
+	}
+	return ""
 }
 
 // supplierLockedPresetReason reports why a preset cannot be taken over. These
