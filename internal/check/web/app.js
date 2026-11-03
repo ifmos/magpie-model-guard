@@ -1380,6 +1380,12 @@
       : String(protocol);
   }
 
+  var supplierPresetNames = { "remote-magpie": "远程 Magpie" };
+
+  function supplierPresetLabel(preset) {
+    return Object.prototype.hasOwnProperty.call(supplierPresetNames, preset) ? supplierPresetNames[preset] : "";
+  }
+
   function supplierNameFor(id) {
     var providers = (supplierData && supplierData.providers) || [];
     for (var i = 0; i < providers.length; i++) {
@@ -1408,7 +1414,8 @@
           protected: !!p.protected,
           protocols: Array.isArray(p.protocols) ? p.protocols.map(String) : [],
           conflict: p.conflict == null ? "" : String(p.conflict),
-          unsupported: p.unsupported == null ? "" : String(p.unsupported)
+          unsupported: p.unsupported == null ? "" : String(p.unsupported),
+          preset: p.preset == null ? "" : String(p.preset)
         };
       });
     }
@@ -1499,10 +1506,17 @@
       }
     }
     if (unsupported.length) {
-      listEl.appendChild(supplierEl("p", "supplier-group-title", "不支持接管的供应商"));
+      var group = document.createElement("div");
+      group.className = "supplier-group";
+      var head = supplierEl("div", "supplier-group-head", "");
+      head.appendChild(supplierEl("h3", "supplier-group-title", "不支持接管"));
+      head.appendChild(supplierEl("span", "supplier-group-count", unsupported.length + " 个供应商"));
+      group.appendChild(head);
+      group.appendChild(supplierEl("p", "supplier-group-note", "这些供应商由 Magpie 原生处理，Guard 不会修改其地址，客户端照常使用。"));
       unsupported.forEach(function (p) {
-        listEl.appendChild(renderSupplierRow(p));
+        group.appendChild(renderSupplierRow(p));
       });
+      listEl.appendChild(group);
     }
     if (providers.length) return;
 
@@ -1520,7 +1534,7 @@
 
   function renderSupplierRow(p) {
     var row = document.createElement("div");
-    row.className = "supplier-row";
+    row.className = "supplier-row" + (p.unsupported ? " is-unsupported" : "");
     row.setAttribute("data-supplier-id", p.id);
 
     var main = document.createElement("div");
@@ -1530,7 +1544,7 @@
     title.className = "supplier-title";
     title.appendChild(supplierEl("strong", "", p.name || p.id || "未命名供应商"));
     if (p.unsupported) {
-      title.appendChild(supplierEl("span", "supplier-badge is-muted", "不支持接管"));
+      title.appendChild(supplierEl("span", "supplier-badge is-muted", supplierPresetLabel(p.preset) || "不支持接管"));
     } else {
       title.appendChild(supplierEl("span", "supplier-badge " + (p.protected ? "is-on" : "is-off"), p.protected ? "已保护" : "未保护"));
       if (p.conflict) title.appendChild(supplierEl("span", "supplier-badge is-warn", "冲突"));
@@ -1552,7 +1566,10 @@
 
     if (p.unsupported) {
       main.appendChild(supplierEl("p", "supplier-unsupported", p.unsupported));
-    } else if (p.conflict) {
+      row.appendChild(main);
+      return row;
+    }
+    if (p.conflict) {
       main.appendChild(supplierEl("p", "supplier-conflict", "⚠ 冲突：" + p.conflict));
     }
     row.appendChild(main);
@@ -1562,20 +1579,17 @@
     var btn = document.createElement("button");
     btn.type = "button";
     btn.className = "secondary-button-sm supplier-action";
-    if (p.unsupported) {
-      btn.textContent = "不支持接管";
-      btn.setAttribute("aria-label", "不支持接管：" + (p.name || p.id));
-    } else if (pending) {
+    if (pending) {
       btn.textContent = supplierPending[p.id] ? "正在启用…" : "正在恢复…";
       btn.setAttribute("aria-busy", "true");
     } else {
       btn.textContent = p.protected ? "恢复原始地址" : "启用保护";
-      btn.setAttribute("aria-label", (p.protected ? "恢复原始地址：" : "启用保护：") + (p.name || p.id));
-      btn.addEventListener("click", function () {
-        setSupplierProtection(p.id, !p.protected);
-      });
     }
-    btn.disabled = !!p.unsupported || anyPending || !p.id;
+    btn.disabled = anyPending || !p.id;
+    btn.setAttribute("aria-label", pending ? btn.textContent : (p.protected ? "恢复原始地址：" : "启用保护：") + (p.name || p.id));
+    btn.addEventListener("click", function () {
+      setSupplierProtection(p.id, !p.protected);
+    });
     row.appendChild(btn);
     return row;
   }

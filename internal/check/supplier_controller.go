@@ -72,6 +72,7 @@ type supplierList struct {
 type supplierProvider struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
+	Preset      string   `json:"preset,omitempty"`
 	Protected   bool     `json:"protected"`
 	Protocols   []string `json:"protocols"`
 	Conflict    string   `json:"conflict,omitempty"`
@@ -216,6 +217,7 @@ func (c *supplierController) list(ctx context.Context) (supplierList, error) {
 		seen[id] = true
 
 		entry := entries[id]
+		preset := supplierRawStringField(provider, "preset")
 		if reason := supplierUnsupportedPresetReason(provider); reason != "" && !(entry != nil && entry.Protected) {
 			// Remote Magpie keeps its own native endpoint rewrite; it can never
 			// be taken over, so list it apart from recoverable conflicts. An
@@ -224,6 +226,7 @@ func (c *supplierController) list(ctx context.Context) (supplierList, error) {
 			out.Providers = append(out.Providers, supplierProvider{
 				ID:          id,
 				Name:        supplierProviderName(provider, id),
+				Preset:      preset,
 				Protocols:   protocols,
 				Unsupported: reason,
 			})
@@ -246,6 +249,7 @@ func (c *supplierController) list(ctx context.Context) (supplierList, error) {
 		info := supplierProvider{
 			ID:        id,
 			Name:      supplierProviderName(provider, id),
+			Preset:    preset,
 			Protocols: protocols,
 		}
 		if entry != nil && entry.Protected {
