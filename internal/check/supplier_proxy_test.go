@@ -107,6 +107,25 @@ func TestSupplierRetriesKeepVendorCredentialAndWireBody(t *testing.T) {
 	if err != nil || latest.State != StatePassed {
 		t.Fatal("successful retry disabled target")
 	}
+	logged, err := store.SupplierEvents(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawProtect, sawRetry bool
+	for _, ev := range logged {
+		if ev.Kind == "protect" && ev.ProviderID == "vendor" {
+			sawProtect = true
+			if ev.CreatedAt.IsZero() {
+				t.Fatal("protect event has no timestamp")
+			}
+		}
+		if ev.Kind == "retry" && ev.ProviderID == "vendor" && ev.ActualModel == "bad" && ev.Model == "vendor/alias" {
+			sawRetry = true
+		}
+	}
+	if !sawProtect || !sawRetry {
+		t.Fatalf("protection log missing entries: %#v", logged)
+	}
 	// Live blocked state stops the next business call before sending vendor data.
 	latest.State = StateFailed
 	if err := store.SaveTarget(latest); err != nil {
@@ -148,6 +167,19 @@ func TestSupplierRetriesKeepVendorCredentialAndWireBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+	logged, err = store.SupplierEvents(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawRestore bool
+	for _, ev := range logged {
+		if ev.Kind == "restore" && ev.ProviderID == "vendor" {
+			sawRestore = true
+		}
+	}
+	if !sawRestore {
+		t.Fatalf("restore was not logged: %#v", logged)
+	}
 	if resp.StatusCode != 404 || calls.Load() != 3 {
 		t.Fatal("stale takeover URL remained usable")
 	}
@@ -158,7 +190,7 @@ func TestSupplierRerouteUsesSelectedInternalModel(t *testing.T) {
 	cfg := mustConfig(t, store)
 	rule := ResponseModelRule{ID: "route", Match: ResponseMatchExact, Pattern: "vendor-bad", Action: ResponseActionReroute}
 	svc.mu.Lock()
-	_, err := svc.applyResponseRuleForRouteLocked(cfg, "relay/alias", "vendor-bad", "relay/alias", nil, rule, time.Now())
+	_, err := svc.applyResponseRuleForRouteLocked(cfg, "relay", "relay/alias", "vendor-bad", "relay/alias", nil, rule, time.Now())
 	svc.mu.Unlock()
 	if err != nil {
 		t.Fatal(err)
@@ -170,12 +202,13 @@ func TestSupplierRerouteUsesSelectedInternalModel(t *testing.T) {
 	if len(routes) != 1 || routes[0] != "relay/alias" {
 		t.Fatalf("reroutes=%v", routes)
 	}
-	results, err := svc.Results("relay/alias", "", 10)
-	if err != nil {
-		t.Fatal(err)
+	events := supplierEvents(t, store)
+	if len(events) != 1 || events[0].Kind != "action" || events[0].ActualModel != "vendor-bad" ||
+		events[0].Action != ResponseActionReroute || events[0].Model != "relay/alias" {
+		t.Fatalf("protection log lost reroute: %#v", events)
 	}
-	if len(results) != 1 || results[0].ActualModel != "vendor-bad" {
-		t.Fatalf("history lost vendor model: %v", results)
+	if results, err := svc.Results("relay/alias", "", 10); err != nil || len(results) != 0 {
+		t.Fatalf("rule hit leaked into probe history: %v err=%v", results, err)
 	}
 }
 
@@ -248,8 +281,8 @@ func TestSupplierSocketJudgesWithProviderDisabled(t *testing.T) {
 		t.Fatalf("blocked socket reply leaked: %s", got)
 	}
 	latest, err := store.Target("vendor/big")
-	if err != nil || latest.State != StateFailed {
-		t.Fatal("supplier socket did not disable selected target")
+	if err != nil || latest == nil || !latest.Blocked || latest.BlockSource != BlockSourceRule {
+		t.Fatalf("supplier socket did not block selected target: %+v err=%v", latest, err)
 	}
 }
 
@@ -309,5 +342,70 @@ func TestSupplierTransportUsesPreparedAPIKeyForPerKeyProxy(t *testing.T) {
 	}
 	if got := supplierCredentialKey(req); got != key {
 		t.Fatalf("credential key = %q", got)
+	}
+}
+
+func TestSupplierEventsAPIListsProtectionLog(t *testing.T) {
+	svc, store := newRuleTestService(t)
+	for _, ev := range []*SupplierEvent{
+		{Kind: "protect", ProviderID: "vendor", Detail: "已启用供应商保护"},
+		{Kind: "retry", ProviderID: "vendor", Model: "vendor/big", ActualModel: "vendor/flash", Action: "disable", Detail: "命中规则，已重试"},
+	} {
+		if err := store.AppendSupplierEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	access := NewAccess("", "")
+	token := access.SetControl()
+	mux := http.NewServeMux()
+	registerAPI(mux, svc, access, nil)
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/api/supplier-events", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated log = %d", rec.Code)
+	}
+
+	req := httptest.NewRequest("GET", "/api/supplier-events?limit=10", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("log endpoint = %d: %s", rec.Code, rec.Body.String())
+	}
+	var events []SupplierEvent
+	if err := json.Unmarshal(rec.Body.Bytes(), &events); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].Kind != "retry" || events[1].Kind != "protect" {
+		t.Fatalf("log order = %#v", events)
+	}
+	if events[0].Model != "vendor/big" || events[0].ActualModel != "vendor/flash" || events[0].Action != "disable" {
+		t.Fatalf("log fields = %#v", events[0])
+	}
+}
+
+func TestSupplierEventRetentionCap(t *testing.T) {
+	_, store := newRuleTestService(t)
+	for i := 0; i < maxSupplierEvents+5; i++ {
+		if err := store.AppendSupplierEvent(&SupplierEvent{Kind: "retry", Detail: "event"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events, err := store.SupplierEvents(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 100 {
+		t.Fatalf("default limit = %d, want 100", len(events))
+	}
+	all, err := store.SupplierEvents(500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The cap keeps the newest maxSupplierEvents rows: the first inserts are
+	// gone, so the oldest row returned is id 6 rather than 1.
+	if len(all) != 500 || all[0].ID != int64(maxSupplierEvents+5) || all[len(all)-1].ID != int64(maxSupplierEvents+5-499) {
+		t.Fatalf("retention = %d rows, ids %d..%d", len(all), all[0].ID, all[len(all)-1].ID)
 	}
 }

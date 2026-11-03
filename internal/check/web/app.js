@@ -19,7 +19,7 @@
   var supplierLoadSeq = 0;
   var supplierPending = Object.create(null);
 
-  var sectionName = { targets: "监测目标", prompts: "检测题库", results: "检测记录", settings: "连接设置" };
+  var sectionName = { targets: "监测目标", prompts: "检测题库", results: "检测记录", supplierlog: "保护日志", settings: "连接设置" };
   var stateName = {
     unknown: "未检测", checking: "检测中", passed: "通过",
     failed: "已禁用(降智)", unavailable: "检测不可用", review: "人工暂停",
@@ -146,12 +146,18 @@
       "</div>";
   }
 
+  function responseRuleHeadHtml() {
+    return "<div class='response-rule-head' aria-hidden='true'>" +
+      "<span>匹配方式</span><span>匹配字符串</span><span>命中动作</span><span></span>" +
+      "</div>";
+  }
+
   function renderResponseRules(container, rules) {
     if (!container) return;
     rules = rules || [];
-    container.innerHTML = rules.length
+    container.innerHTML = responseRuleHeadHtml() + (rules.length
       ? rules.map(responseRuleRowHtml).join("")
-      : "<div class='response-rule-empty'>暂无规则；命中后按动作禁用、改道或记录。</div>";
+      : "<div class='response-rule-empty'>暂无规则；命中后按动作禁用、改道或记录。</div>");
   }
 
   function appendResponseRule(container) {
@@ -195,7 +201,7 @@
       var row = btn.closest("[data-response-rule]");
       if (row) row.remove();
       if (!container.querySelector("[data-response-rule]")) {
-        container.innerHTML = "<div class='response-rule-empty'>暂无规则；命中后按动作禁用、改道或记录。</div>";
+        container.innerHTML = responseRuleHeadHtml() + "<div class='response-rule-empty'>暂无规则；命中后按动作禁用、改道或记录。</div>";
       }
       if (markDirty !== false && typeof markConfigDirty === "function") markConfigDirty();
     });
@@ -336,6 +342,7 @@
       if (b.dataset.tab === "results") loadResults();
       if (b.dataset.tab === "targets") loadState();
       if (b.dataset.tab === "prompts") renderPrompts();
+      if (b.dataset.tab === "supplierlog") loadSupplierLog();
       if (b.dataset.tab === "settings") loadSuppliers();
     });
   });
@@ -443,8 +450,16 @@
       if (isTempAllow) {
         gateBadge = "<span class='gate-badge is-warn' title='临时放行至 " + esc(fmtTime(t.allow_until)) + "'><i></i>临时放行</span>";
       } else if (blocked) {
-        var reason = t.manual_hold ? "手动禁用" : (t.reason || "探针未通过，已阻断");
-        gateBadge = "<span class='gate-badge is-danger' title='" + esc(reason) + "'><i></i>已阻断</span>";
+        var blockLabel = "已阻断";
+        var reason = t.reason || "探针未通过，已阻断";
+        if (t.block_source === "manual" || t.manual_hold) {
+          blockLabel = "手动禁用";
+          reason = "手动禁用";
+        } else if (t.block_source === "rule") {
+          blockLabel = "规则阻断";
+          reason = t.reason || "业务回复模型判断命中规则，已阻断";
+        }
+        gateBadge = "<span class='gate-badge is-danger' title='" + esc(reason) + "'><i></i>" + esc(blockLabel) + "</span>";
       } else {
         gateBadge = "<span class='gate-badge is-ok'><i></i>正常放行</span>";
       }
@@ -482,7 +497,9 @@
       var ops = [];
       // 1. Gateway route control
       if (blocked || t.manual_hold) {
-        ops.push("<button class='btn-action btn-enable' data-model='" + esc(t.model) + "' data-action='enable' title='解除手动禁用，恢复模型路由'>解除禁用</button>");
+        var unblockLabel = t.block_source === "rule" ? "解除阻断" : "解除禁用";
+        var unblockTitle = t.block_source === "rule" ? "解除业务回复规则阻断，恢复模型路由" : "解除手动禁用，恢复模型路由";
+        ops.push("<button class='btn-action btn-enable' data-model='" + esc(t.model) + "' data-action='enable' title='" + unblockTitle + "'>" + unblockLabel + "</button>");
       } else {
         ops.push("<button class='btn-action btn-disable' data-model='" + esc(t.model) + "' data-action='disable' title='手动禁用该模型，阻断其网关路由'>禁用模型</button>");
       }
@@ -1336,9 +1353,9 @@
         var detailAttr = " data-result-id='" + esc(r.id || "") + "'" + (isChecking ? " class='is-checking'" : "");
         var content = r.answer || ("(" + (r.detail || (isChecking ? "探针检测进行中，等待模型返回…" : "无回答内容")) + ")");
         return "<details" + detailAttr + openAttr + "><summary>" +
-          "<span class='status-badge status-" + esc(r.verdict) + "'><i></i>" + esc(r.prompt_id === "response-model" ? (r.verdict === "failed" ? "规则禁用" : (String(r.detail || "").includes("改道") ? "规则改道" : "规则记录")) : (verdictName[r.verdict] || r.verdict)) + "</span>" +
+          "<span class='status-badge status-" + esc(r.verdict) + "'><i></i>" + esc(verdictName[r.verdict] || r.verdict) + "</span>" +
           "<strong>" + esc(r.model) + "</strong>" +
-          "<span class='result-meta'>" + esc(r.prompt_id === "response-model" ? "响应模型" : r.prompt_id) + (r.actual_model ? " · 实际模型 " + esc(r.actual_model) : "") + " · " + fmtTime(r.created_at) + " · " + esc(r.source) + "</span>" +
+          "<span class='result-meta'>" + esc(r.prompt_id) + (r.actual_model ? " · 实际模型 " + esc(r.actual_model) : "") + " · " + fmtTime(r.created_at) + " · " + esc(r.source) + "</span>" +
           "</summary><pre>" + esc(content) + "</pre></details>";
       }).join("");
 
@@ -1636,6 +1653,7 @@
       }
       focusSupplierAction(id);
       loadState();
+      loadSupplierLog();
     }).catch(function (err) {
       delete supplierPending[id];
       renderSupplierPanel();
@@ -1660,6 +1678,54 @@
     });
   }
 
+  // ---- supplier protection log ----
+  var supplierEventKinds = {
+    protect: { label: "启用保护", cls: "is-on" },
+    restore: { label: "恢复地址", cls: "is-off" },
+    retry: { label: "命中重试", cls: "is-warn" },
+    action: { label: "命中动作", cls: "is-warn" },
+    error: { label: "提交失败", cls: "is-error" }
+  };
+
+  function renderSupplierLog(rows) {
+    var box = document.getElementById("supplier-log");
+    if (!box) return;
+    var emptyEl = document.getElementById("supplier-log-empty");
+    rows = rows || [];
+    box.innerHTML = rows.map(function (ev) {
+      var kind = supplierEventKinds[ev.kind] || { label: ev.kind || "事件", cls: "is-off" };
+      var provider = supplierNameFor(ev.provider_id) || ev.provider_id || "";
+      var models = ev.model ? esc(ev.model) + (ev.actual_model && ev.actual_model !== ev.model ? " → " + esc(ev.actual_model) : "") : "";
+      return "<div class='supplier-log-row'>" +
+        "<div class='supplier-log-head'><span class='supplier-badge " + kind.cls + "'>" + esc(kind.label) + "</span>" +
+        "<span class='supplier-log-time'>" + esc(fmtTime(ev.created_at)) + "</span></div>" +
+        (provider ? "<div class='supplier-log-provider'>" + esc(provider) + "</div>" : "") +
+        (models ? "<div class='supplier-log-model'>" + models + "</div>" : "") +
+        "<div class='supplier-log-detail'>" + esc(ev.detail || "") + "</div></div>";
+    }).join("");
+    box.classList.toggle("hidden", rows.length === 0);
+    if (emptyEl) emptyEl.classList.toggle("hidden", rows.length > 0);
+  }
+
+  var supplierLogPromise = null;
+  function loadSupplierLog() {
+    if (supplierLogPromise) return supplierLogPromise;
+    var btn = document.getElementById("supplier-log-refresh");
+    if (btn) btn.disabled = true;
+    supplierLogPromise = api("GET", "/api/supplier-events?limit=200").then(function (rows) {
+      renderSupplierLog(rows);
+    }).catch(function (err) {
+      toast("获取保护日志失败：" + err.message);
+    }).then(function () {
+      supplierLogPromise = null;
+      if (btn) btn.disabled = false;
+    });
+    return supplierLogPromise;
+  }
+
+  var supplierLogRefreshBtn = document.getElementById("supplier-log-refresh");
+  if (supplierLogRefreshBtn) supplierLogRefreshBtn.addEventListener("click", loadSupplierLog);
+
   // ---- settings & real verification ----
   function markConfigDirty() {
     configDirty = true;
@@ -1675,7 +1741,7 @@
     "cfg-url", "cfg-key", "cfg-limit", "cfg-timeout", "cfg-cool",
     "cfg-schedule-mode", "cfg-recalculate-schedule",
     "cfg-tp-normal", "cfg-tp-retry", "cfg-tp-iso-first", "cfg-tp-iso-later", "cfg-tp-rec-confirm", "cfg-tp-unavail",
-    "cfg-response-mode", "cfg-response-reroute",
+    "cfg-response-mode", "cfg-response-reroute", "cfg-response-hold",
     "cfg-provider-attempts"
   ].forEach(function (id) {
     var el = document.getElementById(id);
@@ -1743,6 +1809,8 @@
     if (responseModeEl) responseModeEl.value = c.response_model_mode || "off";
     var responseRerouteEl = document.getElementById("cfg-response-reroute");
     if (responseRerouteEl) responseRerouteEl.value = c.response_reroute_min || 30;
+    var responseHoldEl = document.getElementById("cfg-response-hold");
+    if (responseHoldEl) responseHoldEl.value = c.response_hold_min || 30;
     renderResponseRules(document.getElementById("cfg-response-rules"), c.response_rules || []);
 
     var providerAttemptsEl = document.getElementById("cfg-provider-attempts");
@@ -1812,6 +1880,7 @@
         timing_policy: timingPolicy,
         response_model_mode: document.getElementById("cfg-response-mode").value,
         response_reroute_min: parseInt(document.getElementById("cfg-response-reroute").value, 10),
+        response_hold_min: parseInt(document.getElementById("cfg-response-hold").value, 10),
         response_rules: responseRules,
         provider_attempts: parseInt(document.getElementById("cfg-provider-attempts").value, 10),
         recalculate_schedule: recalc

@@ -15,6 +15,9 @@ import (
 // maxResults is the retention cap for probe results (newest kept).
 const maxResults = 500
 
+// maxSupplierEvents is the retention cap for the protection log.
+const maxSupplierEvents = 1000
+
 // Store persists guard state in SQLite.
 type Store struct {
 	db        *sql.DB
@@ -82,6 +85,18 @@ CREATE TABLE IF NOT EXISTS results (
   source       TEXT NOT NULL DEFAULT 'manual'
 );
 CREATE INDEX IF NOT EXISTS idx_results_model ON results(model, created_at DESC);
+CREATE TABLE IF NOT EXISTS supplier_events (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind          TEXT NOT NULL,
+  provider_id   TEXT NOT NULL DEFAULT '',
+  model         TEXT NOT NULL DEFAULT '',
+  actual_model  TEXT NOT NULL DEFAULT '',
+  action        TEXT NOT NULL DEFAULT '',
+  rule_id       TEXT NOT NULL DEFAULT '',
+  detail        TEXT NOT NULL DEFAULT '',
+  created_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_supplier_events_created ON supplier_events(created_at DESC);
 `)
 	if err != nil {
 		return err
@@ -135,7 +150,43 @@ CREATE INDEX IF NOT EXISTS idx_results_model ON results(model, created_at DESC);
 			return err
 		}
 	}
-	return nil
+	var rhExists int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('targets') WHERE name='rule_hold_until'`).Scan(&rhExists); err != nil {
+		return err
+	}
+	if rhExists == 0 {
+		if _, err := s.db.Exec(`ALTER TABLE targets ADD COLUMN rule_hold_until INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	var serExists int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('supplier_events') WHERE name='rule_id'`).Scan(&serExists); err != nil {
+		return err
+	}
+	if serExists == 0 {
+		if _, err := s.db.Exec(`ALTER TABLE supplier_events ADD COLUMN rule_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	// Business-reply rule hits used to be stored as probe results. Move them
+	// into the protection log so probe history and supplier protection stay
+	// independent; the action column is recovered from the old verdict/detail.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT INTO supplier_events(kind,provider_id,model,actual_model,action,rule_id,detail,created_at)
+	  SELECT 'action','',model,actual_model,
+	    CASE WHEN verdict='failed' THEN 'disable' WHEN detail LIKE '%改道%' THEN 'reroute' ELSE 'record' END,
+	    rule_id,detail,created_at
+	  FROM results WHERE prompt_id='response-model' OR source='response'`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM results WHERE prompt_id='response-model' OR source='response'`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // KV helpers.
@@ -178,6 +229,7 @@ type GuardConfig struct {
 	ResponseModelMode  string              `json:"response_model_mode"` // "off" | "on"
 	ResponseRules      []ResponseModelRule `json:"response_rules,omitempty"`
 	ResponseRerouteMin int                 `json:"response_reroute_min"` // minutes a rerouted model stays excluded
+	ResponseHoldMin    int                 `json:"response_hold_min"`    // minutes a rule-blocked target stays blocked
 
 	// Response-model retries for supplier protection. The JSON name is kept
 	// for configs saved before the direct-provider mode was removed.
@@ -195,6 +247,7 @@ func defaultConfig() GuardConfig {
 		TimingPolicy:       DefaultTimingPolicy(),
 		ResponseModelMode:  ResponseModelOff,
 		ResponseRerouteMin: 30,
+		ResponseHoldMin:    30,
 		ProviderAttempts:   2,
 	}
 }
@@ -211,6 +264,9 @@ func (s *Store) LoadConfig() (GuardConfig, error) {
 	}
 	if c.ResponseRerouteMin <= 0 {
 		c.ResponseRerouteMin = 30
+	}
+	if c.ResponseHoldMin <= 0 {
+		c.ResponseHoldMin = 30
 	}
 	if c.ProviderAttempts <= 0 {
 		c.ProviderAttempts = 2
@@ -254,7 +310,12 @@ type Target struct {
 	FailStreak     int       `json:"fail_streak"`
 	ManualHold     bool      `json:"manual_hold"`
 	Blocked        bool      `json:"blocked"`
+	BlockSource    string    `json:"block_source,omitempty"` // manual|rule|probe
 
+	// RuleHoldUntil blocks the target after a business-reply rule hit. It is
+	// independent of the probe state machine: a passing probe never lifts it,
+	// only its own expiry (or an operator) does.
+	RuleHoldUntil time.Time `json:"rule_hold_until,omitempty"`
 	// Staged schedule configuration and runtime fields:
 	ScheduleMode      string        `json:"schedule_mode"`
 	TimingPolicy      *TimingPolicy `json:"timing_policy,omitempty"`
@@ -336,24 +397,50 @@ func unmarshalScheduleJSON(t *Target, raw string) {
 	}
 }
 
-// blockedAt is independent of monitoring: stopping probes never releases a hold.
+// Block sources shown in the console. One blocked set is shared by the request
+// gate, the supplier proxy and route isolation; the source records who set it.
+const (
+	BlockSourceManual = "manual"
+	BlockSourceRule   = "rule"
+	BlockSourceProbe  = "probe"
+)
+
+// blockedAt is independent of monitoring: stopping probes never releases a
+// hold. A rule hold also survives a passing probe; only manual allow or its
+// own expiry releases it.
 func (t *Target) blockedAt(now time.Time) bool {
 	if t.AllowUntil.After(now) {
 		return false
 	}
-	return t.ManualHold || t.State == StateFailed || t.State == StateReview || t.State == StateUnavailable
+	if t.ManualHold || t.RuleHoldUntil.After(now) {
+		return true
+	}
+	return t.State == StateFailed || t.State == StateReview || t.State == StateUnavailable
+}
+
+// blockSourceOf names what currently blocks the target, "" when it is open.
+func (t *Target) blockSourceOf(now time.Time) string {
+	switch {
+	case t.ManualHold:
+		return BlockSourceManual
+	case t.RuleHoldUntil.After(now):
+		return BlockSourceRule
+	case t.State == StateFailed || t.State == StateReview || t.State == StateUnavailable:
+		return BlockSourceProbe
+	}
+	return ""
 }
 
 func scanTarget(row interface{ Scan(...any) error }) (*Target, error) {
 	var (
-		t                    Target
-		promptIDs            string
-		scheduleJSON         string
-		responseRulesJSON    string
-		next, checked, allow int64
+		t                          Target
+		promptIDs                  string
+		scheduleJSON               string
+		responseRulesJSON          string
+		next, checked, allow, hold int64
 	)
 	err := row.Scan(&t.Model, &t.Enabled, &promptIDs, &t.IntervalMin, &t.FailRecheckMin,
-		&next, &t.State, &t.Reason, &checked, &allow, &t.FailStreak, &t.ManualHold, &scheduleJSON, &responseRulesJSON)
+		&next, &t.State, &t.Reason, &checked, &allow, &t.FailStreak, &t.ManualHold, &hold, &scheduleJSON, &responseRulesJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -361,13 +448,16 @@ func scanTarget(row interface{ Scan(...any) error }) (*Target, error) {
 	t.NextCheckAt = time.Unix(next, 0).UTC()
 	t.CheckedAt = time.Unix(checked, 0).UTC()
 	t.AllowUntil = time.Unix(allow, 0).UTC()
-	t.Blocked = t.blockedAt(time.Now())
+	t.RuleHoldUntil = time.Unix(hold, 0).UTC()
+	now := time.Now()
+	t.Blocked = t.blockedAt(now)
+	t.BlockSource = t.blockSourceOf(now)
 	unmarshalScheduleJSON(&t, scheduleJSON)
 	unmarshalResponseRulesJSON(&t, responseRulesJSON)
 	return &t, nil
 }
 
-const targetCols = `model,enabled,prompt_ids,interval_min,fail_recheck_min,next_check_at,state,reason,checked_at,allow_until,fail_streak,manual_hold,schedule_json,response_rules_json`
+const targetCols = `model,enabled,prompt_ids,interval_min,fail_recheck_min,next_check_at,state,reason,checked_at,allow_until,fail_streak,manual_hold,rule_hold_until,schedule_json,response_rules_json`
 
 // SaveTarget inserts or updates a target.
 func (s *Store) SaveTarget(t *Target) error {
@@ -377,17 +467,20 @@ func (s *Store) SaveTarget(t *Target) error {
 	ids, _ := json.Marshal(t.PromptIDs)
 	sj := marshalScheduleJSON(t)
 	rr := marshalResponseRulesJSON(t)
-	_, err := s.db.Exec(`INSERT INTO targets(`+targetCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err := s.db.Exec(`INSERT INTO targets(`+targetCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 	  ON CONFLICT(model) DO UPDATE SET
 	    enabled=excluded.enabled, prompt_ids=excluded.prompt_ids,
 	    interval_min=excluded.interval_min, fail_recheck_min=excluded.fail_recheck_min,
 	    next_check_at=excluded.next_check_at, state=excluded.state, reason=excluded.reason,
 	    checked_at=excluded.checked_at, allow_until=excluded.allow_until, fail_streak=excluded.fail_streak,
-	    manual_hold=excluded.manual_hold, schedule_json=excluded.schedule_json,
-	    response_rules_json=excluded.response_rules_json`,
+	    manual_hold=excluded.manual_hold, rule_hold_until=excluded.rule_hold_until,
+	    schedule_json=excluded.schedule_json, response_rules_json=excluded.response_rules_json`,
 		t.Model, t.Enabled, string(ids), t.IntervalMin, t.FailRecheckMin,
-		t.NextCheckAt.Unix(), t.State, t.Reason, t.CheckedAt.Unix(), t.AllowUntil.Unix(), t.FailStreak, t.ManualHold, sj, rr)
-	t.Blocked = t.blockedAt(time.Now())
+		t.NextCheckAt.Unix(), t.State, t.Reason, t.CheckedAt.Unix(), t.AllowUntil.Unix(), t.FailStreak,
+		t.ManualHold, t.RuleHoldUntil.Unix(), sj, rr)
+	now := time.Now()
+	t.Blocked = t.blockedAt(now)
+	t.BlockSource = t.blockSourceOf(now)
 	return err
 }
 
@@ -471,6 +564,63 @@ func (s *Store) AppendResult(r *Result) error {
 	_, err := s.db.Exec(`DELETE FROM results WHERE id NOT IN (
 	  SELECT id FROM results ORDER BY created_at DESC LIMIT ?)`, maxResults)
 	return err
+}
+
+// SupplierEvent is one protection activity entry shown in the console log.
+type SupplierEvent struct {
+	ID          int64     `json:"id"`
+	Kind        string    `json:"kind"` // protect|restore|retry|action|error
+	ProviderID  string    `json:"provider_id,omitempty"`
+	Model       string    `json:"model,omitempty"`
+	ActualModel string    `json:"actual_model,omitempty"`
+	Action      string    `json:"action,omitempty"`
+	RuleID      string    `json:"rule_id,omitempty"`
+	Detail      string    `json:"detail"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// AppendSupplierEvent stores one protection event and prunes old entries.
+func (s *Store) AppendSupplierEvent(ev *SupplierEvent) error {
+	if ev == nil || strings.TrimSpace(ev.Detail) == "" {
+		return nil
+	}
+	if ev.CreatedAt.IsZero() {
+		ev.CreatedAt = time.Now().UTC()
+	}
+	if _, err := s.db.Exec(`INSERT INTO supplier_events(kind,provider_id,model,actual_model,action,rule_id,detail,created_at)
+	  VALUES(?,?,?,?,?,?,?,?)`,
+		ev.Kind, ev.ProviderID, ev.Model, ev.ActualModel, ev.Action, ev.RuleID, ev.Detail, ev.CreatedAt.Unix()); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`DELETE FROM supplier_events WHERE id NOT IN (
+	  SELECT id FROM supplier_events ORDER BY id DESC LIMIT ?)`, maxSupplierEvents)
+	return err
+}
+
+// SupplierEvents lists recent protection events, newest first.
+func (s *Store) SupplierEvents(limit int) ([]*SupplierEvent, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.db.Query(`SELECT id,kind,provider_id,model,actual_model,action,rule_id,detail,created_at
+	  FROM supplier_events ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*SupplierEvent
+	for rows.Next() {
+		var (
+			ev      SupplierEvent
+			created int64
+		)
+		if err := rows.Scan(&ev.ID, &ev.Kind, &ev.ProviderID, &ev.Model, &ev.ActualModel, &ev.Action, &ev.RuleID, &ev.Detail, &created); err != nil {
+			return nil, err
+		}
+		ev.CreatedAt = time.Unix(created, 0).UTC()
+		out = append(out, &ev)
+	}
+	return out, rows.Err()
 }
 
 // Results lists recent results, optionally filtered by model and prompt.

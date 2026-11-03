@@ -393,8 +393,8 @@ func TestHandleResponseModelSkipsUncorrelatedProtectedDirectReplies(t *testing.T
 	}); err != nil {
 		t.Fatalf("protected fallback: %v", err)
 	}
-	if results, err := store.Results("vendor/model", "response-model", 10); err != nil || len(results) != 0 {
-		t.Fatalf("protected direct event was judged: %d results, err=%v", len(results), err)
+	if n := supplierEventCount(t, store, "action", "vendor/model"); n != 0 {
+		t.Fatalf("protected direct event was judged: %d events", n)
 	}
 
 	// An unprotected provider keeps async judgment.
@@ -403,8 +403,8 @@ func TestHandleResponseModelSkipsUncorrelatedProtectedDirectReplies(t *testing.T
 	}); err != nil {
 		t.Fatalf("unprotected event: %v", err)
 	}
-	if results, err := store.Results("sub/model", "response-model", 10); err != nil || len(results) != 1 {
-		t.Fatalf("unprotected event lost judgment: %d results, err=%v", len(results), err)
+	if n := supplierEventCount(t, store, "action", "sub/model"); n != 1 {
+		t.Fatalf("unprotected event lost judgment: %d events", n)
 	}
 
 	// Magpie can generate an id when the vendor omitted it. A non-empty id
@@ -415,8 +415,8 @@ func TestHandleResponseModelSkipsUncorrelatedProtectedDirectReplies(t *testing.T
 	}); err != nil {
 		t.Fatalf("generated id event: %v", err)
 	}
-	if results, err := store.Results("vendor/other", "response-model", 10); err != nil || len(results) != 0 {
-		t.Fatalf("protected generated id was judged again: %d results, err=%v", len(results), err)
+	if n := supplierEventCount(t, store, "action", "vendor/other"); n != 0 {
+		t.Fatalf("protected generated id was judged again: %d events", n)
 	}
 	if err := svc.HandleResponseModel(ResponseModelEvent{
 		RequestedModel: "sub/other", ActualModel: "vendor/flash",
@@ -424,8 +424,8 @@ func TestHandleResponseModelSkipsUncorrelatedProtectedDirectReplies(t *testing.T
 	}); err != nil {
 		t.Fatalf("unprotected id event: %v", err)
 	}
-	if results, err := store.Results("sub/other", "response-model", 10); err != nil || len(results) != 1 {
-		t.Fatalf("unprotected id lost judgment: %d results, err=%v", len(results), err)
+	if n := supplierEventCount(t, store, "action", "sub/other"); n != 1 {
+		t.Fatalf("unprotected id lost judgment: %d events", n)
 	}
 
 	// A provider whose id begins "auto-" is a direct provider, not an auto
@@ -436,8 +436,8 @@ func TestHandleResponseModelSkipsUncorrelatedProtectedDirectReplies(t *testing.T
 	}); err != nil {
 		t.Fatalf("auto-prefixed provider event: %v", err)
 	}
-	if results, err := store.Results("auto-relay/model", "response-model", 10); err != nil || len(results) != 1 {
-		t.Fatalf("auto-prefixed provider lost judgment: %d results, err=%v", len(results), err)
+	if n := supplierEventCount(t, store, "action", "auto-relay/model"); n != 1 {
+		t.Fatalf("auto-prefixed provider lost judgment: %d events", n)
 	}
 
 	// A group reply that cannot be correlated with the supplier inspector is
@@ -450,8 +450,8 @@ func TestHandleResponseModelSkipsUncorrelatedProtectedDirectReplies(t *testing.T
 		}); err != nil {
 			t.Fatalf("group event %s: %v", model, err)
 		}
-		if results, err := store.Results(model, "response-model", 10); err != nil || len(results) != 0 {
-			t.Fatalf("active group event %s was judged: %d results, err=%v", model, len(results), err)
+		if n := supplierEventCount(t, store, "action", model); n != 0 {
+			t.Fatalf("active group event %s was judged: %d events", model, n)
 		}
 	}
 }

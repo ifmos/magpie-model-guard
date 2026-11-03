@@ -79,6 +79,15 @@ type supplierProvider struct {
 	Unsupported string   `json:"unsupported,omitempty"`
 }
 
+// logSupplierEvent records one protection activity entry. A log write must
+// never undo or fail a completed provider change.
+func (c *supplierController) logSupplierEvent(kind, id, detail string) {
+	if c.store == nil {
+		return
+	}
+	_ = c.store.AppendSupplierEvent(&SupplierEvent{Kind: kind, ProviderID: id, Detail: detail})
+}
+
 // supplierBinding is what /upstream resolves a route token to. Base is the
 // exact original provider value; the proxy path normalizes it at runtime,
 // including omitting a scheme and Gemini's /v1beta, so restoring it later is
@@ -359,6 +368,7 @@ func (c *supplierController) setProtection(ctx context.Context, id string, enabl
 			if err := c.writeSupplierTransition(ctx, &ledger, providersPath, id, entry, newEntry, entry.After, after, entry.HeaderState); err != nil {
 				return fmt.Errorf("重建供应商 %s 的 Guard 地址失败: %w", id, err)
 			}
+			c.logSupplierEvent("protect", id, fmt.Sprintf("已启用供应商保护并重建 Guard 地址：%s", supplierProviderName(provider, id)))
 			return nil
 		}
 
@@ -386,6 +396,7 @@ func (c *supplierController) setProtection(ctx context.Context, id string, enabl
 			return fmt.Errorf("启用供应商 %s 保护失败: %w", id, err)
 		}
 		ledger.ProvidersPath = absPath
+		c.logSupplierEvent("protect", id, fmt.Sprintf("已启用供应商保护：%s", supplierProviderName(provider, id)))
 		return nil
 	}
 
@@ -401,7 +412,11 @@ func (c *supplierController) setProtection(ctx context.Context, id string, enabl
 			// stale ledger row without writing the file again.
 			delete(ledger.Entries, id)
 			ledger.Pending = nil
-			return c.store.setKV(supplierLedgerKey, ledger)
+			err := c.store.setKV(supplierLedgerKey, ledger)
+			if err == nil {
+				c.logSupplierEvent("restore", id, fmt.Sprintf("供应商地址已恢复原始值，保护记录已解除：%s", supplierProviderName(provider, id)))
+			}
+			return err
 		}
 		diff := supplierSnapshotDiffKeys(entry.After, live)
 		return fmt.Errorf("供应商 %s 的受管字段 %s 已被外部修改，拒绝覆盖", id, strings.Join(diff, "、"))
@@ -410,6 +425,7 @@ func (c *supplierController) setProtection(ctx context.Context, id string, enabl
 	if err := c.writeSupplierTransition(ctx, &ledger, providersPath, id, entry, nil, entry.After, entry.Original, entry.HeaderState); err != nil {
 		return fmt.Errorf("关闭供应商 %s 保护失败: %w", id, err)
 	}
+	c.logSupplierEvent("restore", id, fmt.Sprintf("已恢复原始地址并关闭保护：%s", supplierProviderName(provider, id)))
 	return nil
 }
 

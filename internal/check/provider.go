@@ -400,6 +400,7 @@ func (t *providerTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		if rule.Action == ResponseActionRecord {
 			if err := st.record(actual, *rule); err != nil {
 				_ = resp.Body.Close()
+				st.logActionError(actual, *rule, err)
 				return nil, providerActionError(err)
 			}
 			return resp, nil
@@ -407,9 +408,19 @@ func (t *providerTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		// disable or reroute: this response must never reach the client.
 		_ = resp.Body.Close()
 		if attempt < attempts {
+			st.svc.logSupplierEvent(&SupplierEvent{
+				Kind:        "retry",
+				ProviderID:  st.supplier.binding.ProviderID,
+				Model:       st.requested,
+				ActualModel: actual,
+				Action:      string(rule.Action),
+				RuleID:      rule.ID,
+				Detail:      fmt.Sprintf("第 %d/%d 次尝试返回模型 %s，命中规则 %s，已重试", attempt, attempts, actual, rule.Pattern),
+			})
 			continue
 		}
 		if err := st.record(actual, *rule); err != nil {
+			st.logActionError(actual, *rule, err)
 			return nil, providerActionError(err)
 		}
 		return providerLocalResponse(http.StatusServiceUnavailable, st.proto,

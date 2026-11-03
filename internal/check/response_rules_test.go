@@ -154,8 +154,9 @@ func TestHandleResponseModelDisablesAndReroutes(t *testing.T) {
 		t.Fatalf("HandleResponseModel disable: %v", err)
 	}
 	got, _ := store.Target("vendor/big")
-	if got == nil || got.State != StateFailed || !strings.Contains(got.Reason, "flash") {
-		t.Fatalf("target not disabled: %+v", got)
+	requireRuleHold(t, got)
+	if !strings.Contains(got.Reason, "flash") {
+		t.Fatalf("target reason missing rule detail: %+v", got)
 	}
 
 	if err := svc.HandleResponseModel(ResponseModelEvent{
@@ -167,14 +168,17 @@ func TestHandleResponseModelDisablesAndReroutes(t *testing.T) {
 	if err != nil || len(routes) != 1 || routes[0] != "vendor/mini" {
 		t.Fatalf("expected reroute, got %v err=%v", routes, err)
 	}
-	res, err := store.Results("vendor/big", "response-model", 10)
-	if err != nil || len(res) != 2 {
-		t.Fatalf("expected two response results, got %d err=%v", len(res), err)
+	events := supplierEvents(t, store)
+	if len(events) != 2 {
+		t.Fatalf("expected two protection events, got %d", len(events))
 	}
-	for _, r := range res {
-		if r.Source != "response" || r.ActualModel == "" {
-			t.Fatalf("bad response result: %+v", r)
+	for _, ev := range events {
+		if ev.Kind != "action" || ev.Model != "vendor/big" || ev.ActualModel == "" || ev.RuleID == "" {
+			t.Fatalf("bad protection event: %+v", ev)
 		}
+	}
+	if results, err := store.Results("vendor/big", "", 10); err != nil || len(results) != 0 {
+		t.Fatalf("rule hits leaked into probe history: %v err=%v", results, err)
 	}
 }
 
@@ -201,8 +205,8 @@ func TestHandleResponseModelSkipsObservedSupplierReply(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("observed event: %v", err)
 	}
-	if results, err := store.Results("group/alias", "response-model", 10); err != nil || len(results) != 0 {
-		t.Fatalf("observed supplier reply was judged again: %d results, err=%v", len(results), err)
+	if n := supplierEventCount(t, store, "action", "group/alias"); n != 0 {
+		t.Fatalf("observed supplier reply was judged again: %d events", n)
 	}
 
 	// An id that was never observed keeps its asynchronous judgment.
@@ -212,8 +216,8 @@ func TestHandleResponseModelSkipsObservedSupplierReply(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("unobserved event: %v", err)
 	}
-	if results, err := store.Results("group/unseen", "response-model", 10); err != nil || len(results) != 1 {
-		t.Fatalf("unobserved reply was suppressed: %d results, err=%v", len(results), err)
+	if n := supplierEventCount(t, store, "action", "group/unseen"); n != 1 {
+		t.Fatalf("unobserved reply was suppressed: %d events", n)
 	}
 
 	// Missing ids must not broadly suppress unrelated group requests.
@@ -222,8 +226,8 @@ func TestHandleResponseModelSkipsObservedSupplierReply(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("missing-id event: %v", err)
 	}
-	if results, err := store.Results("group/no-id", "response-model", 10); err != nil || len(results) != 1 {
-		t.Fatalf("missing-id reply was suppressed: %d results, err=%v", len(results), err)
+	if n := supplierEventCount(t, store, "action", "group/no-id"); n != 1 {
+		t.Fatalf("missing-id reply was suppressed: %d events", n)
 	}
 }
 
@@ -356,6 +360,21 @@ func TestConfigureResponseRules(t *testing.T) {
 	if got.ResponseRules[0].ID == "" {
 		t.Fatalf("rule id not normalized")
 	}
+	if got.ResponseHoldMin != 30 {
+		t.Fatalf("default rule hold = %d, want 30", got.ResponseHoldMin)
+	}
+	cfg.ResponseHoldMin = 45
+	if err := svc.Configure(cfg); err != nil {
+		t.Fatalf("Configure hold: %v", err)
+	}
+	got, _ = store.LoadConfig()
+	if got.ResponseHoldMin != 45 {
+		t.Fatalf("rule hold not saved: %d", got.ResponseHoldMin)
+	}
+	cfg.ResponseHoldMin = 1441
+	if err := svc.Configure(cfg); err == nil {
+		t.Fatal("out-of-range rule hold accepted")
+	}
 }
 
 func TestResponseModelAPI(t *testing.T) {
@@ -387,11 +406,11 @@ func TestResponseModelAPI(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		got, _ := store.Target("vendor/big")
-		if got != nil && got.State == StateFailed {
+		if got != nil && got.Blocked && got.BlockSource == BlockSourceRule {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("target was not disabled: %+v", got)
+			t.Fatalf("target was not rule-blocked: %+v", got)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

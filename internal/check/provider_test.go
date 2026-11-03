@@ -608,8 +608,11 @@ func TestSupplierDisablesAfterAttempts(t *testing.T) {
 		t.Fatalf("vendor calls=%d, want 2", calls.Load())
 	}
 	target, _ := env.store.Target("vendor/big")
-	if target == nil || target.State != StateFailed {
-		t.Fatalf("target not disabled: %+v", target)
+	if target == nil || !target.Blocked || target.BlockSource != BlockSourceRule || target.RuleHoldUntil.IsZero() {
+		t.Fatalf("target not rule-blocked: %+v", target)
+	}
+	if target.State == StateFailed {
+		t.Fatalf("rule hold must not rewrite probe state: %+v", target)
 	}
 }
 
@@ -1038,7 +1041,7 @@ func TestSupplierActionFailureReturns500(t *testing.T) {
 	}, ResponseModelRule{
 		ID: "r-flash", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionDisable,
 	}, 2)
-	if _, err := env.store.db.Exec(`CREATE TRIGGER fail_results BEFORE INSERT ON results BEGIN SELECT RAISE(ABORT,'boom'); END`); err != nil {
+	if _, err := env.store.db.Exec(`CREATE TRIGGER fail_targets BEFORE UPDATE ON targets BEGIN SELECT RAISE(ABORT,'boom'); END`); err != nil {
 		t.Fatal(err)
 	}
 	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
@@ -1052,15 +1055,17 @@ func TestSupplierActionFailureReturns500(t *testing.T) {
 		t.Fatal("action failure must not advertise Retry-After")
 	}
 	target, _ := env.store.Target("vendor/big")
-	if target == nil || target.State != StateFailed {
-		t.Fatalf("persisted disable must be kept on action failure: %+v", target)
+	if target == nil || target.Blocked || !target.RuleHoldUntil.IsZero() {
+		t.Fatalf("failed hold must not be reported as applied: %+v", target)
+	}
+	if n := supplierEventCount(t, env.store, "action", "vendor/big"); n != 0 {
+		t.Fatalf("failed action was logged as applied: %d entries", n)
+	}
+	if n := supplierEventCount(t, env.store, "error", "vendor/big"); n != 1 {
+		t.Fatalf("failed action error log entries = %d", n)
 	}
 	// The dedupe entry was not written, so a repaired guard can retry the action.
-	target.State = StatePassed
-	if err := env.store.SaveTarget(target); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := env.store.db.Exec(`DROP TRIGGER fail_results`); err != nil {
+	if _, err := env.store.db.Exec(`DROP TRIGGER fail_targets`); err != nil {
 		t.Fatal(err)
 	}
 	resp = env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
@@ -1071,8 +1076,11 @@ func TestSupplierActionFailureReturns500(t *testing.T) {
 		t.Fatalf("retry after repair status=%d body=%s", resp.StatusCode, body)
 	}
 	target, _ = env.store.Target("vendor/big")
-	if target == nil || target.State != StateFailed {
-		t.Fatalf("recovered submission must disable the target: %+v", target)
+	if target == nil || !target.Blocked || target.BlockSource != BlockSourceRule {
+		t.Fatalf("recovered submission must hold the target: %+v", target)
+	}
+	if n := supplierEventCount(t, env.store, "action", "vendor/big"); n != 1 {
+		t.Fatalf("recovered action log entries = %d", n)
 	}
 }
 
@@ -1237,12 +1245,15 @@ func TestSupplierUnmonitoredRequestUsesOnlyGlobalRules(t *testing.T) {
 	if monitored == nil || monitored.State == StateFailed {
 		t.Fatalf("a different monitored target must not be disabled: %+v", monitored)
 	}
-	results, err := env.store.Results("vendor/unmonitored", "response-model", 10)
-	if err != nil || len(results) == 0 {
-		t.Fatalf("results=%v err=%v", results, err)
+	events, err := env.store.SupplierEvents(10)
+	if err != nil || len(events) == 0 {
+		t.Fatalf("events=%v err=%v", events, err)
 	}
-	if !strings.Contains(results[0].Detail, "未找到监测目标，未禁用") || results[0].RuleID != "r-global" {
-		t.Fatalf("result=%+v", results[0])
+	if events[0].Kind != "action" || events[0].RuleID != "r-global" || !strings.Contains(events[0].Detail, "未找到监测目标，未阻断") {
+		t.Fatalf("event=%+v", events[0])
+	}
+	if results, err := env.store.Results("vendor/unmonitored", "", 10); err != nil || len(results) != 0 {
+		t.Fatalf("rule hit leaked into probe history: %v err=%v", results, err)
 	}
 }
 
@@ -1288,9 +1299,12 @@ func TestSupplierKeepsRuleSnapshotForInFlightRequest(t *testing.T) {
 	if target == nil || target.State == StateFailed {
 		t.Fatalf("in-flight rule snapshot changed: %+v", target)
 	}
-	results, err := env.store.Results("vendor/big", "response-model", 10)
-	if err != nil || len(results) == 0 || results[0].RuleID != "r-record" {
-		t.Fatalf("results=%v err=%v", results, err)
+	events, err := env.store.SupplierEvents(10)
+	if err != nil || len(events) == 0 || events[0].RuleID != "r-record" || events[0].Action != ResponseActionRecord {
+		t.Fatalf("events=%v err=%v", events, err)
+	}
+	if results, err := env.store.Results("vendor/big", "", 10); err != nil || len(results) != 0 {
+		t.Fatalf("rule hit leaked into probe history: %v err=%v", results, err)
 	}
 }
 

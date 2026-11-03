@@ -365,7 +365,7 @@ func (s *Service) recordSupplierResponse(sr *supplierRequest, requested, actual 
 	}
 	// Route isolation removes the selected Magpie member, whose id can differ
 	// from the vendor's returned model (aliases and modelWires).
-	needsSync, err := s.applyResponseRuleForRouteLocked(cfg, requested, actual, requested, target, rule, time.Now().UTC())
+	needsSync, err := s.applyResponseRuleForRouteLocked(cfg, sr.binding.ProviderID, requested, actual, requested, target, rule, time.Now().UTC())
 	if err != nil {
 		return err
 	}
@@ -380,6 +380,20 @@ func (s *Service) recordSupplierResponse(sr *supplierRequest, requested, actual 
 
 func (st *providerProxyState) record(actual string, rule ResponseModelRule) error {
 	return st.svc.recordSupplierResponse(st.supplier, st.requested, actual, st.target, rule)
+}
+
+// logActionError records a failed rule submission so the console explains a
+// 500 without hiding the cause in Health.
+func (st *providerProxyState) logActionError(actual string, rule ResponseModelRule, err error) {
+	st.svc.logSupplierEvent(&SupplierEvent{
+		Kind:        "error",
+		ProviderID:  st.supplier.binding.ProviderID,
+		Model:       st.requested,
+		ActualModel: actual,
+		Action:      string(rule.Action),
+		RuleID:      rule.ID,
+		Detail:      "规则动作提交失败：" + err.Error(),
+	})
 }
 
 // supplierCredentialKey reads the credential Magpie already prepared for the

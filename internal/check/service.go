@@ -241,10 +241,11 @@ func (s *Service) markRunResultSaved(model string) {
 
 // gateTarget is the JSON published into the gate middleware.
 type gateTarget struct {
-	ManualHold bool   `json:"manual_hold"`
-	State      string `json:"state"`
-	AllowUntil int64  `json:"allow_until"`
-	Reason     string `json:"reason"`
+	ManualHold    bool   `json:"manual_hold"`
+	RuleHoldUntil int64  `json:"rule_hold_until"`
+	State         string `json:"state"`
+	AllowUntil    int64  `json:"allow_until"`
+	Reason        string `json:"reason"`
 }
 
 // publishGate atomically rewrites the gate middleware JS file. Magpie picks
@@ -262,10 +263,11 @@ func (s *Service) publishGate() error {
 	gate := map[string]gateTarget{}
 	for _, t := range targets {
 		gate[strings.ToLower(t.Model)] = gateTarget{
-			ManualHold: t.ManualHold,
-			State:      t.State,
-			AllowUntil: t.AllowUntil.Unix(),
-			Reason:     t.Reason,
+			ManualHold:    t.ManualHold,
+			RuleHoldUntil: t.RuleHoldUntil.Unix(),
+			State:         t.State,
+			AllowUntil:    t.AllowUntil.Unix(),
+			Reason:        t.Reason,
 		}
 	}
 	b, _ := json.Marshal(gate)
@@ -284,9 +286,10 @@ export function onRequest(body,ctx){
  const t=targets[id];
  const now=Date.now();
  if(t.allow_until>0&&t.allow_until*1000>now)return body;
- const blocked=t.manual_hold||t.state==="failed"||t.state==="review"||t.state==="unavailable";
+ const ruleHold=t.rule_hold_until>0&&t.rule_hold_until*1000>now;
+ const blocked=t.manual_hold||ruleHold||t.state==="failed"||t.state==="review"||t.state==="unavailable";
  if(!blocked)return body;
- const reason=t.manual_hold||t.state==="review"?"人工禁用":t.state==="unavailable"?"检测不可用（探针请求失败），已保守禁用":"降智检测未通过，模型已禁用";
+ const reason=t.manual_hold||t.state==="review"?"人工禁用":ruleHold?"业务回复模型判断命中规则，已阻断；详情见控制台保护日志":t.state==="unavailable"?"检测不可用（探针请求失败），已保守禁用":"降智检测未通过，模型已禁用";
  return ctx.reject(403,"[MODEL_GUARD_BLOCKED] "+reason+"。目标："+model+"；详情："+(t.reason||"请到 model-guard 控制台查看或重测")+"。本次请求未发往上游。");
 }
 `, string(b), string(a))
@@ -362,10 +365,11 @@ func findTargetForRequest(targets []*Target, model string) *Target {
 // exists; the reply is still intercepted but no target is created.
 var errTargetMissing = errors.New("监测目标不存在")
 
-// disableTargetForResponse blocks a monitored target that returned a model
-// matching a response rule. Errors are returned so the caller can refuse to
-// report a successful action.
-func (s *Service) disableTargetForResponse(t *Target, detail string, now time.Time) error {
+// holdTargetForResponse blocks a monitored target whose reply matched a rule.
+// The probe state machine is left untouched: the hold has its own expiry and a
+// passing probe must not silently lift it. Errors are returned so the caller
+// can refuse to report a successful action.
+func (s *Service) holdTargetForResponse(t *Target, detail string, hold time.Duration, now time.Time) error {
 	if t == nil {
 		return errTargetMissing
 	}
@@ -376,17 +380,11 @@ func (s *Service) disableTargetForResponse(t *Target, detail string, now time.Ti
 	if latest == nil {
 		return errTargetMissing
 	}
-	latest.State = StateFailed
-	latest.Reason = detail
-	latest.CheckedAt = now
-	latest.FailStreak++
-	latest.ScheduleStage = ScheduleStageIsolated
-	latest.AllowUntil = time.Time{}
-	wait := latest.FailRecheckMin
-	if wait <= 0 {
-		wait = 60
+	// A shorter rule hit must not cut an existing longer hold short.
+	if until := now.Add(hold); until.After(latest.RuleHoldUntil) {
+		latest.RuleHoldUntil = until
 	}
-	latest.NextCheckAt = now.Add(time.Duration(wait) * time.Minute)
+	latest.Reason = detail
 	if err := s.store.SaveTarget(latest); err != nil {
 		s.health = err.Error()
 		return err
@@ -394,16 +392,18 @@ func (s *Service) disableTargetForResponse(t *Target, detail string, now time.Ti
 	return s.publishGate()
 }
 
-// applyResponseRuleLocked executes one matched rule and appends the result.
-// Callers hold s.mu. needsSync reports that persisted reroutes must be pushed
-// to route groups; the provider path does that synchronously.
+// applyResponseRuleLocked executes one matched business-reply rule. Callers
+// hold s.mu. needsSync reports that persisted reroutes must be pushed to route
+// groups; the provider path does that synchronously.
 func (s *Service) applyResponseRuleLocked(cfg GuardConfig, requested, actual string, target *Target, rule ResponseModelRule, now time.Time) (bool, error) {
-	return s.applyResponseRuleForRouteLocked(cfg, requested, actual, actual, target, rule, now)
+	return s.applyResponseRuleForRouteLocked(cfg, "", requested, actual, actual, target, rule, now)
 }
 
-// applyResponseRuleForRouteLocked keeps the vendor model in history while
-// isolating the full Magpie model id selected by the supplier request.
-func (s *Service) applyResponseRuleForRouteLocked(cfg GuardConfig, requested, actual, routeModel string, target *Target, rule ResponseModelRule, now time.Time) (bool, error) {
+// applyResponseRuleForRouteLocked records the hit in the protection log only:
+// probe history stays in results, so supplier protection and probe detection
+// remain independent. routeModel isolates the full Magpie model id selected by
+// the supplier request while the log keeps the vendor model actually returned.
+func (s *Service) applyResponseRuleForRouteLocked(cfg GuardConfig, providerID, requested, actual, routeModel string, target *Target, rule ResponseModelRule, now time.Time) (bool, error) {
 	key := responseHitKey(requested, actual, rule)
 	if last, ok := s.responseHits[key]; ok && now.Sub(last) < time.Minute {
 		return false, nil
@@ -420,22 +420,20 @@ func (s *Service) applyResponseRuleForRouteLocked(cfg GuardConfig, requested, ac
 	if target != nil {
 		targetModel = target.Model
 	}
-	verdict := VerdictManual
 	needsSync := false
 	var err error
 	switch rule.Action {
 	case ResponseActionDisable:
 		if target == nil {
-			detail += "，未找到监测目标，未禁用"
+			detail += "，未找到监测目标，未阻断"
 			break
 		}
-		verdict = VerdictFailed
-		detail += "，已禁用目标"
-		err = s.disableTargetForResponse(target, detail, now)
+		hold := time.Duration(cfg.ResponseHoldMin) * time.Minute
+		detail += fmt.Sprintf("，已阻断目标 %d 分钟", cfg.ResponseHoldMin)
+		err = s.holdTargetForResponse(target, detail, hold, now)
 		if errors.Is(err, errTargetMissing) {
 			err = nil
-			verdict = VerdictManual
-			detail = fmt.Sprintf("业务回复模型 %s 命中规则 %s，未找到监测目标，未禁用", actual, rule.Pattern)
+			detail = fmt.Sprintf("业务回复模型 %s 命中规则 %s，未找到监测目标，未阻断", actual, rule.Pattern)
 		}
 	case ResponseActionReroute:
 		detail += "，已加入后续请求改道"
@@ -445,26 +443,57 @@ func (s *Service) applyResponseRuleForRouteLocked(cfg GuardConfig, requested, ac
 		detail += "，仅记录"
 	}
 	if err != nil {
+		// The async caller has no supplier-side logger; record its failure here.
+		// Supplier callers log their own pre/post errors and pass providerID.
+		if providerID == "" {
+			s.logSupplierEventLocked(&SupplierEvent{
+				Kind:        "error",
+				Model:       targetModel,
+				ActualModel: actual,
+				Action:      rule.Action,
+				RuleID:      rule.ID,
+				Detail:      "规则动作提交失败：" + err.Error(),
+				CreatedAt:   now,
+			})
+		}
 		return false, err
 	}
-	res := &Result{
-		ID:          randomHex(8),
+	s.logSupplierEventLocked(&SupplierEvent{
+		Kind:        "action",
+		ProviderID:  providerID,
 		Model:       targetModel,
-		PromptID:    "response-model",
-		Verdict:     verdict,
-		Detail:      detail,
 		ActualModel: actual,
+		Action:      rule.Action,
 		RuleID:      rule.ID,
+		Detail:      detail,
 		CreatedAt:   now,
-		Source:      "response",
-	}
-	if err := s.store.AppendResult(res); err != nil {
-		return false, err
-	}
-	// The dedupe entry is written only after the action and its result persist,
-	// so a failed submission can be retried by the next matching reply.
+	})
+	// The dedupe entry is written only after the action and its log persist, so
+	// a failed submission can be retried by the next matching reply.
 	s.responseHits[key] = now
 	return needsSync, nil
+}
+
+// logSupplierEventLocked appends one protection log entry. Callers hold s.mu;
+// logging must never fail the judged request, so a write error only surfaces
+// in Health.
+func (s *Service) logSupplierEventLocked(ev *SupplierEvent) {
+	if ev == nil {
+		return
+	}
+	if ev.CreatedAt.IsZero() {
+		ev.CreatedAt = time.Now().UTC()
+	}
+	if err := s.store.AppendSupplierEvent(ev); err != nil {
+		s.health = "保护日志写入失败：" + err.Error()
+	}
+}
+
+// logSupplierEvent appends one protection log entry outside s.mu.
+func (s *Service) logSupplierEvent(ev *SupplierEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.logSupplierEventLocked(ev)
 }
 
 func responseHitKey(requested, actual string, rule ResponseModelRule) string {
@@ -1400,6 +1429,7 @@ func (s *Service) UpsertTargetOpt(t *Target, recalculate bool) error {
 			t.IsolationRechecks = 0
 			t.RetryPromptID = ""
 			t.ManualHold = existing.ManualHold
+			t.RuleHoldUntil = existing.RuleHoldUntil
 			t.AllowUntil = existing.AllowUntil
 			t.CheckedAt = existing.CheckedAt
 			t.Reason = existing.Reason
@@ -1422,6 +1452,7 @@ func (s *Service) UpsertTargetOpt(t *Target, recalculate bool) error {
 			t.AllowUntil = existing.AllowUntil
 			t.FailStreak = existing.FailStreak
 			t.ManualHold = existing.ManualHold
+			t.RuleHoldUntil = existing.RuleHoldUntil
 			t.Reason = existing.Reason
 			t.ScheduleStage = existing.ScheduleStage
 			t.RecoveryPasses = existing.RecoveryPasses
@@ -1495,6 +1526,7 @@ func (s *Service) TargetAction(model, action string) error {
 		t.AllowUntil = time.Time{}
 	case "enable":
 		t.ManualHold = false
+		t.RuleHoldUntil = time.Time{}
 		t.State = StateUnknown
 		t.Reason = ""
 		t.FailStreak = 0
@@ -1583,6 +1615,12 @@ func (s *Service) configureLocked(c GuardConfig, recalculate bool) error {
 	if c.ResponseRerouteMin == 0 {
 		c.ResponseRerouteMin = 30
 	}
+	if c.ResponseHoldMin == 0 {
+		c.ResponseHoldMin = old.ResponseHoldMin
+	}
+	if c.ResponseHoldMin == 0 {
+		c.ResponseHoldMin = 30
+	}
 	if c.ResponseRules == nil {
 		c.ResponseRules = old.ResponseRules
 	}
@@ -1630,6 +1668,9 @@ func (s *Service) configureLocked(c GuardConfig, recalculate bool) error {
 	}
 	if c.ResponseRerouteMin < 1 || c.ResponseRerouteMin > 1440 {
 		return errors.New("响应模型改道保持时间须为 1–1440 分钟")
+	}
+	if c.ResponseHoldMin < 1 || c.ResponseHoldMin > 1440 {
+		return errors.New("规则阻断保持时间须为 1–1440 分钟")
 	}
 	if c.ProviderAttempts < 1 || c.ProviderAttempts > 5 {
 		return errors.New("Provider 尝试次数须为 1–5 次")

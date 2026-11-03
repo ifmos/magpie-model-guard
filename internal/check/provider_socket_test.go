@@ -320,8 +320,8 @@ func TestProviderSocketTerminalBadIsNeverDelivered(t *testing.T) {
 		t.Fatalf("creates=%d, want 1", creates)
 	}
 	target, _ := env.store.Target("vendor/big")
-	if target == nil || target.State != StateFailed {
-		t.Fatal("terminal bad reply must still disable the target")
+	if target == nil || !target.Blocked || target.BlockSource != BlockSourceRule || target.RuleHoldUntil.IsZero() {
+		t.Fatalf("terminal bad reply must leave a rule hold: %+v", target)
 	}
 }
 

@@ -30,6 +30,7 @@ func registerAPI(mux *http.ServeMux, s *Service, access *Access, console *Consol
 	mux.Handle("GET /api/state", h(s.apiState))
 	mux.Handle("GET /api/models", h(s.apiModels))
 	mux.Handle("GET /api/suppliers", h(s.apiSuppliers))
+	mux.Handle("GET /api/supplier-events", h(s.apiSupplierEvents))
 	mux.Handle("POST /api/suppliers/protection", h(s.apiSupplierProtection))
 	mux.Handle("POST /api/config", h(s.apiConfig))
 	mux.Handle("POST /api/config/initial", h(s.apiConfigInitial))
@@ -46,6 +47,17 @@ func registerAPI(mux *http.ServeMux, s *Service, access *Access, console *Consol
 	mux.Handle("POST /api/response-model", controlRequired(access, s.apiResponseModel))
 	mux.Handle("POST /api/console", controlRequired(access, s.apiConsoleOpen(console)))
 	mux.Handle("POST /api/console/close", h(s.apiConsoleClose(console)))
+}
+
+// apiSupplierEvents returns the recent supplier protection log.
+func (s *Service) apiSupplierEvents(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	events, err := s.store.SupplierEvents(limit)
+	if err != nil {
+		errJSON(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, events)
 }
 
 func (s *Service) apiState(w http.ResponseWriter, r *http.Request) {

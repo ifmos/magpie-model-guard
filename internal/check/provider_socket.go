@@ -653,6 +653,7 @@ func (ps *providerSocket) judgeAttempt(requested string, target *Target, rules [
 					return flushOnly(nil)
 				case rule.Action == ResponseActionRecord:
 					if err := ps.svc.recordSupplierResponse(ps.supplier, requested, values.Model, target, *rule); err != nil {
+						ps.logActionError(requested, values.Model, *rule, err)
 						ps.actionFailed(err)
 						return providerTurnDone
 					}
@@ -668,6 +669,19 @@ func (ps *providerSocket) judgeAttempt(requested string, target *Target, rules [
 				case attempt < attempts && responseID != "" && sawCreated:
 					if ps.interruptAndWait(responseID) {
 						ps.drainBackendQuiet()
+						providerID := ""
+						if ps.supplier != nil {
+							providerID = ps.supplier.binding.ProviderID
+						}
+						ps.svc.logSupplierEvent(&SupplierEvent{
+							Kind:        "retry",
+							ProviderID:  providerID,
+							Model:       requested,
+							ActualModel: values.Model,
+							Action:      string(rule.Action),
+							RuleID:      rule.ID,
+							Detail:      fmt.Sprintf("第 %d/%d 次尝试返回模型 %s，命中规则 %s，已重试", attempt, attempts, values.Model, rule.Pattern),
+						})
 						return providerTurnRetry
 					}
 					ps.blockTurn(requested, values.Model, target, *rule, attempts)
@@ -1004,6 +1018,7 @@ func (ps *providerSocket) failTurn(status int, code, message string) {
 
 func (ps *providerSocket) blockTurn(requested, actual string, target *Target, rule ResponseModelRule, attempts int) {
 	if err := ps.svc.recordSupplierResponse(ps.supplier, requested, actual, target, rule); err != nil {
+		ps.logActionError(requested, actual, rule, err)
 		ps.actionFailed(err)
 		return
 	}
@@ -1011,6 +1026,22 @@ func (ps *providerSocket) blockTurn(requested, actual string, target *Target, ru
 	ps.sendSocketError(http.StatusServiceUnavailable, "model_guard_blocked", message)
 	_ = ps.client.Close(websocket.StatusInternalError, "model guard blocked")
 	ps.cancel()
+}
+
+func (ps *providerSocket) logActionError(requested, actual string, rule ResponseModelRule, err error) {
+	providerID := ""
+	if ps.supplier != nil {
+		providerID = ps.supplier.binding.ProviderID
+	}
+	ps.svc.logSupplierEvent(&SupplierEvent{
+		Kind:        "error",
+		ProviderID:  providerID,
+		Model:       requested,
+		ActualModel: actual,
+		Action:      string(rule.Action),
+		RuleID:      rule.ID,
+		Detail:      "规则动作提交失败：" + err.Error(),
+	})
 }
 
 func (ps *providerSocket) actionFailed(err error) {
