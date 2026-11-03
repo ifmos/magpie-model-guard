@@ -802,12 +802,21 @@ func TestSupplierValidationLoopsAndEligibility(t *testing.T) {
 			{
 				name:     "vertex preset",
 				provider: map[string]any{"id": "vertex", "preset": "google-vertex", "gemini": "https://us-central1-aiplatform.googleapis.com/v1beta"},
-				conflict: "google-vertex",
+				conflict: "Vertex AI",
 			},
 			{
-				name:     "remote magpie preset",
-				provider: map[string]any{"id": "remote", "preset": "remote-magpie", "chat": "https://other-magpie.example/v1"},
-				conflict: "remote-magpie",
+				name:     "azure preset",
+				provider: map[string]any{"id": "azure", "preset": "azure", "chat": "https://vendor.example/openai/v1"},
+				conflict: "Azure OpenAI",
+			},
+			{
+				name: "remote magpie preset",
+				provider: map[string]any{
+					"id": "remote", "preset": "remote-magpie",
+					"chat": "https://other-magpie.example/v1", "responses": "https://other-magpie.example/v1",
+					"anthropic": "https://other-magpie.example", "gemini": "https://other-magpie.example/v1beta",
+				},
+				conflict: "远程 Magpie",
 			},
 		}
 		for _, tc := range cases {
@@ -820,6 +829,9 @@ func TestSupplierValidationLoopsAndEligibility(t *testing.T) {
 				}
 				if len(list.Providers) != 1 || !strings.Contains(list.Providers[0].Conflict, tc.conflict) {
 					t.Fatalf("list conflict = %#v", list.Providers)
+				}
+				if got := strings.Count(list.Providers[0].Conflict, tc.conflict); got != 1 {
+					t.Fatalf("conflict %q repeated %d times: %q", tc.conflict, got, list.Providers[0].Conflict)
 				}
 				if err := ctrl.setProtection(context.Background(), id, true); err == nil || !strings.Contains(err.Error(), tc.conflict) {
 					t.Fatalf("setProtection err = %v", err)

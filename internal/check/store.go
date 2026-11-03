@@ -179,11 +179,9 @@ type GuardConfig struct {
 	ResponseRules      []ResponseModelRule `json:"response_rules,omitempty"`
 	ResponseRerouteMin int                 `json:"response_reroute_min"` // minutes a rerouted model stays excluded
 
-	// Custom provider endpoint. It speaks OpenAI Chat and forwards to the
-	// configured Magpie gateway, applying response rules and bounded retries.
-	ProviderEnabled  bool   `json:"provider_enabled"`
-	ProviderKey      string `json:"provider_key,omitempty"`
-	ProviderAttempts int    `json:"provider_attempts"`
+	// Response-model retries for supplier protection. The JSON name is kept
+	// for configs saved before the direct-provider mode was removed.
+	ProviderAttempts int `json:"provider_attempts"`
 }
 
 func defaultConfig() GuardConfig {

@@ -23,7 +23,7 @@
     </nav>
     <div class="sidebar-footer">
       <div class="mini-status"><i id="sidebar-status-dot"></i><span id="sidebar-status">后台连接中</span></div>
-      <span class="version-label">MAGPIE PLUGIN · 0.6.0</span>
+      <span class="version-label">MAGPIE PLUGIN · 0.7.0</span>
     </div>
   </aside>
 
@@ -348,7 +348,7 @@
 <div class="field" style="margin-top:16px">
   <label for="cfg-provider-attempts">最多尝试次数 <em>次</em></label>
   <input id="cfg-provider-attempts" type="number" min="1" max="5" value="2">
-  <small class="field-hint">供应商保护与下方「高级：客户端直连 Guard」共用此设置。含首次请求；仅当回复命中 disable / reroute 且尚未交付时，使用同一凭据重试同一目标。record 首次命中即记录，不重试；Ollama 输出不携带真实模型，无法执行回复判断。</small>
+  <small class="field-hint">供应商保护重试次数，含首次请求；仅当回复命中 disable / reroute 且尚未交付时，使用同一凭据重试同一目标。record 首次命中即记录，不重试；Ollama 输出不携带真实模型，无法执行回复判断。</small>
 </div>
 <div class="policy-note-box">
   <div class="note-title">⚠ 停用或卸载前先恢复地址</div>
@@ -357,27 +357,6 @@
     <li>若曾直接编辑 <code>providers.json</code> 中受保护的地址，列表会显示冲突且不会覆盖你的改动。</li>
     <li>存在供应商保护时，无法通过回复 ID 关联的 group / auto 回复暂停异步判断，以免重复执行动作；组内受保护供应商仍同步检查。未保护供应商的直接请求仍可异步判断。</li>
   </ul>
-</div>
-<div class="settings-divider"></div>
-<div class="panel-heading compact"><div><span class="eyebrow">ADVANCED · DIRECT PROVIDER</span><h2>高级：客户端直连 Guard</h2></div></div>
-<p class="supplier-lede">可选功能，默认关闭。与上方供应商保护不同：启用后需要手动把客户端 Base URL 和 Key 改为下面的 Guard 地址，而不是继续使用 Magpie 原地址；保存设置不会自动开启。回复重试次数与上方共用同一个「最多尝试次数」设置。</p>
-<div class="field">
-  <label class="check-row"><input id="cfg-provider-enabled" type="checkbox"><span>启用 Provider 端点（可选）</span></label>
-  <small class="field-hint">启用后，客户端可把守卫当作原生 Magpie 网关入口：四种对话协议、模型目录、媒体与音频调用都经本机 Magpie 转发。启用期间业务回复判断只在 Guard 入口同步执行，Magpie 异步观察暂停；关闭后恢复异步观察。直接访问 Magpie 的请求仍有模型门禁，但不做本轮回复判断。</small>
-</div>
-<div class="field">
-  <label for="cfg-provider-key">Provider Key</label>
-  <input id="cfg-provider-key" type="text" readonly autocomplete="off" spellcheck="false">
-  <small class="field-hint">客户端 API Key 填这个值；它只用于本机 Provider 端点，不是 Magpie 网关 Key。Bearer、X-Api-Key、api-key、Gemini X-Goog-Api-Key 或 query key 均可，同时提供不同值会被拒绝。</small>
-</div>
-<div class="field">
-  <label>Provider Base URL</label>
-  <div class="provider-base-list">
-    <div class="provider-base-row"><span>OpenAI / Responses</span><code id="cfg-provider-url" class="provider-url"></code><button type="button" class="secondary-button-sm provider-copy" data-copy="cfg-provider-url">复制</button></div>
-    <div class="provider-base-row"><span>Anthropic / Ollama</span><code id="cfg-provider-url-native" class="provider-url"></code><button type="button" class="secondary-button-sm provider-copy" data-copy="cfg-provider-url-native">复制</button></div>
-    <div class="provider-base-row"><span>Gemini</span><code id="cfg-provider-url-gemini" class="provider-url"></code><button type="button" class="secondary-button-sm provider-copy" data-copy="cfg-provider-url-gemini">复制</button></div>
-  </div>
-  <small class="field-hint">供应商、多 Key、代理、headers、extraBody、fallback、模型与价格仍在 Magpie 原生供应商编辑器维护。模型目录原样来自原生网关；reroute 只对能与原生成员 ID 精确匹配的实际模型生效。控制台经隧道访问时，请让客户端使用本机后台地址。</small>
 </div>
 <button id="save-config" class="primary-button">保存并验证 <span>→</span></button><p id="config-msg" class="form-message"></p></section><aside class="panel guide-panel"><div class="guide-icon">◎</div><span class="eyebrow">HOW IT WORKS</span><h2>保护你的模型路由</h2><p>Model Guard 用独立探针检查回复质量；供应商保护只在转发时临时使用 Magpie 已保存的凭据，不复制到检测记录。</p><div class="guide-step"><b>01</b><span>按计划发送检测题</span></div><div class="guide-step"><b>02</b><span>自动判分并记录回答</span></div><div class="guide-step"><b>03</b><span>异常时阻断模型请求</span></div></aside></div>
       </section>

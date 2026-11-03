@@ -1,7 +1,6 @@
 package check
 
 import (
-	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
@@ -124,7 +123,7 @@ func (s *Service) apiSupplier(w http.ResponseWriter, r *http.Request) {
 	}
 	if matched.endpoint.ws && isProviderUpgrade(r) {
 		sr.target, sr.transport = targetURL, transport
-		s.serveSupplierSocket(w, r, cfg, matched, sr, targetURL, transport)
+		s.serveProviderSocket(w, r, matched, sr)
 		return
 	}
 	var state *providerProxyState
@@ -165,7 +164,7 @@ func (s *Service) apiSupplier(w http.ResponseWriter, r *http.Request) {
 		if attempts < 1 || attempts > 5 {
 			attempts = 2
 		}
-		state = &providerProxyState{svc: s, cfg: cfg, proto: proto, spool: spool, requested: requested, target: target, rules: rules, attempts: attempts, supplier: sr}
+		state = &providerProxyState{svc: s, proto: proto, spool: spool, requested: requested, target: target, rules: rules, attempts: attempts, supplier: sr}
 	}
 	var rt http.RoundTripper = transport
 	if state != nil {
@@ -380,10 +379,7 @@ func (s *Service) recordSupplierResponse(sr *supplierRequest, requested, actual 
 }
 
 func (st *providerProxyState) record(actual string, rule ResponseModelRule) error {
-	if st.supplier != nil {
-		return st.svc.recordSupplierResponse(st.supplier, st.requested, actual, st.target, rule)
-	}
-	return st.svc.recordProviderResponse(st.requested, actual, st.target, rule)
+	return st.svc.recordSupplierResponse(st.supplier, st.requested, actual, st.target, rule)
 }
 
 // supplierCredentialKey reads the credential Magpie already prepared for the
@@ -406,18 +402,6 @@ func supplierCredentialKey(r *http.Request) string {
 	return key
 }
 
-// supplierContext keeps the binding available while a Responses socket lives.
-func supplierContext(ctx context.Context, sr *supplierRequest) context.Context {
-	return context.WithValue(ctx, supplierContextKey{}, sr)
-}
-
-type supplierContextKey struct{}
-
-func (s *Service) serveSupplierSocket(w http.ResponseWriter, r *http.Request, cfg GuardConfig, matched providerMatch, sr *supplierRequest, target *url.URL, transport *http.Transport) {
-	sr.target, sr.transport = target, transport
-	s.serveProviderSocket(w, r.WithContext(supplierContext(r.Context(), sr)), cfg, matched)
-}
-
 func supplierSocketHeaders(r *http.Request) http.Header {
 	h := r.Header.Clone()
 	for _, name := range strings.Split(h.Get("Connection"), ",") {
@@ -428,20 +412,6 @@ func supplierSocketHeaders(r *http.Request) http.Header {
 	}
 	stripSupplierHeaders(h)
 	return h
-}
-
-func (ps *providerSocket) modeEnabled(cfg GuardConfig) bool {
-	if ps.supplier != nil {
-		return ps.supplier.live() == nil
-	}
-	return cfg.ProviderEnabled
-}
-
-func (ps *providerSocket) record(requested, actual string, target *Target, rule ResponseModelRule) error {
-	if ps.supplier != nil {
-		return ps.svc.recordSupplierResponse(ps.supplier, requested, actual, target, rule)
-	}
-	return ps.svc.recordProviderResponse(requested, actual, target, rule)
 }
 
 // probeSession fits Magpie's 128-byte session limit even for long model ids.

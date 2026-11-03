@@ -2,25 +2,18 @@ package check
 
 import (
 	"bytes"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
-)
-
-const (
-	providerModelsPath = "/provider/v1/models"
-	providerChatPath   = "/provider/v1/chat/completions"
 )
 
 // Limits are variables so tests can shrink them without allocating hundreds of
@@ -130,22 +123,16 @@ func buildProviderRoutes() map[string]providerEndpoint {
 	return routes
 }
 
-// providerPrefixOwned reports whether a request belongs to the provider.
-func providerPrefixOwned(path string) bool {
-	return path == "/provider" || strings.HasPrefix(path, "/provider/")
-}
-
-// registerProvider composes the provider prefix ahead of the guard mux. A
-// plain "/provider/" pattern would conflict with the console catch-all
-// ("GET /"), so the prefix is dispatched here instead of being registered.
-func registerProvider(mux *http.ServeMux, s *Service) http.Handler {
+// registerGuardRoutes dispatches the supplier takeover prefix ahead of the
+// guard mux. The console's catch-all ("GET /") would otherwise take it.
+func registerGuardRoutes(mux *http.ServeMux, s *Service) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/upstream" || strings.HasPrefix(r.URL.Path, "/upstream/") {
-			s.apiSupplier(w, r)
+		if r.URL.Path == "/provider" || strings.HasPrefix(r.URL.Path, "/provider/") {
+			http.NotFound(w, r)
 			return
 		}
-		if providerPrefixOwned(r.URL.Path) {
-			s.apiProvider(w, r)
+		if r.URL.Path == "/upstream" || strings.HasPrefix(r.URL.Path, "/upstream/") {
+			s.apiSupplier(w, r)
 			return
 		}
 		mux.ServeHTTP(w, r)
@@ -324,122 +311,6 @@ func guessProviderProtocol(path string) providerProtocol {
 	return providerProtoChat
 }
 
-// apiProvider authenticates, classifies and proxies one provider request.
-func (s *Service) apiProvider(w http.ResponseWriter, r *http.Request) {
-	cfg, err := s.store.LoadConfig()
-	if err != nil {
-		writeProviderError(w, providerProtoChat, http.StatusInternalServerError, "读取 Provider 配置失败", false)
-		return
-	}
-	if !cfg.ProviderEnabled {
-		http.NotFound(w, r)
-		return
-	}
-	parts, ok := parseProviderPath(r.URL)
-	if !ok {
-		writeProviderError(w, guessProviderProtocol(r.URL.Path), http.StatusNotFound, "未知的 Provider 路径", false)
-		return
-	}
-	matched := matchProviderEndpoint(r.Method, parts)
-	proto := matched.endpoint.proto
-	if proto == "" {
-		proto = guessProviderProtocol(parts.escapedRest)
-	}
-	if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
-		s.providerPreflight(w, r, cfg, parts, matched)
-		return
-	}
-	if !s.providerAuthorized(w, r, cfg, proto) {
-		return
-	}
-	if !matched.known {
-		writeProviderError(w, proto, http.StatusNotFound, "未知的 Provider 路径", false)
-		return
-	}
-	if !matched.allowed {
-		w.Header().Set("Allow", matched.allow)
-		writeProviderError(w, proto, http.StatusMethodNotAllowed, "请求方法不允许", false)
-		return
-	}
-	if ValidateGateway(cfg.GatewayURL) != nil || strings.TrimSpace(cfg.GatewayKey) == "" {
-		writeProviderError(w, proto, http.StatusServiceUnavailable, "Magpie 网关尚未配置", false)
-		return
-	}
-	if matched.endpoint.ws && r.Method == http.MethodGet && isProviderUpgrade(r) {
-		s.serveProviderSocket(w, r, cfg, matched)
-		return
-	}
-	if !matched.endpoint.gate || r.Method != http.MethodPost {
-		s.proxyProvider(w, r, cfg, matched, nil)
-		return
-	}
-
-	spool, values, status, message := s.spoolProviderRequest(w, r)
-	if status != 0 {
-		writeProviderError(w, proto, status, message, false)
-		return
-	}
-	defer spool.Close()
-
-	requested := strings.TrimSpace(values.Model)
-	if matched.endpoint.modelPath {
-		requested = strings.TrimSpace(matched.pathModel)
-	}
-	targets, err := s.store.Targets()
-	if err != nil {
-		writeProviderError(w, proto, http.StatusInternalServerError, "读取监测目标失败", false)
-		return
-	}
-	target := findTargetForRequest(targets, requested)
-	if target != nil && target.blockedAt(time.Now()) {
-		writeProviderError(w, proto, http.StatusForbidden, "该模型已被守卫禁用", false)
-		return
-	}
-	rules := effectiveResponseRules(cfg, target)
-	if !matched.endpoint.judge || !hasActiveResponseRules(rules) {
-		rules = nil
-	}
-	if values.Compaction {
-		// Native compaction is a single-shot link; retrying it would replay it.
-		rules = nil
-	}
-	attempts := cfg.ProviderAttempts
-	if attempts < 1 || attempts > 5 {
-		attempts = 2
-	}
-	state := &providerProxyState{
-		svc:       s,
-		cfg:       cfg,
-		proto:     proto,
-		spool:     spool,
-		requested: requested,
-		target:    target,
-		rules:     rules,
-		attempts:  attempts,
-	}
-	s.proxyProvider(w, r, cfg, matched, state)
-}
-
-// providerPreflight forwards CORS preflight for allowlisted paths only. The
-// native gateway decides the origin policy; the guard adds no allowlist.
-func (s *Service) providerPreflight(w http.ResponseWriter, r *http.Request, cfg GuardConfig, parts providerPathParts, matched providerMatch) {
-	requestedMethod := strings.ToUpper(strings.TrimSpace(r.Header.Get("Access-Control-Request-Method")))
-	if !matched.known {
-		writeProviderError(w, guessProviderProtocol(parts.escapedRest), http.StatusNotFound, "未知的 Provider 路径", false)
-		return
-	}
-	if !providerMethodAllowed(matched.endpoint.methods, requestedMethod) {
-		w.Header().Set("Allow", matched.allow)
-		writeProviderError(w, matched.endpoint.proto, http.StatusMethodNotAllowed, "预检请求方法不在允许范围", false)
-		return
-	}
-	if ValidateGateway(cfg.GatewayURL) != nil || strings.TrimSpace(cfg.GatewayKey) == "" {
-		writeProviderError(w, matched.endpoint.proto, http.StatusServiceUnavailable, "Magpie 网关尚未配置", false)
-		return
-	}
-	s.proxyProvider(w, r, cfg, matched, nil)
-}
-
 func hasActiveResponseRules(rules []ResponseModelRule) bool {
 	for _, rule := range rules {
 		if !rule.Disabled {
@@ -449,60 +320,9 @@ func hasActiveResponseRules(rules []ResponseModelRule) bool {
 	return false
 }
 
-// providerAuthorized admits exactly one non-empty credential from the
-// supported header/query locations. Conflicting credentials are rejected
-// instead of guessing a precedence; keyless clients (Ollama) are not exempt.
-func (s *Service) providerAuthorized(w http.ResponseWriter, r *http.Request, cfg GuardConfig, proto providerProtocol) bool {
-	token, ok := providerRequestToken(r)
-	if !ok || token == "" {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="model-guard"`)
-		writeProviderError(w, proto, http.StatusUnauthorized, "缺少有效的 Provider key", false)
-		return false
-	}
-	if cfg.ProviderKey == "" || subtle.ConstantTimeCompare([]byte(token), []byte(cfg.ProviderKey)) != 1 {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="model-guard"`)
-		writeProviderError(w, proto, http.StatusUnauthorized, "Provider key 无效", false)
-		return false
-	}
-	return true
-}
-
-func providerRequestToken(r *http.Request) (string, bool) {
-	var tokens []string
-	add := func(value string) {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			return
-		}
-		for _, existing := range tokens {
-			if existing == value {
-				return
-			}
-		}
-		tokens = append(tokens, value)
-	}
-	if raw := strings.TrimSpace(r.Header.Get("Authorization")); raw != "" {
-		if !strings.HasPrefix(strings.ToLower(raw), "bearer ") {
-			return "", false
-		}
-		add(raw[len("Bearer "):])
-	}
-	for _, key := range []string{"X-Api-Key", "Api-Key", "X-Goog-Api-Key"} {
-		for _, value := range r.Header.Values(key) {
-			add(value)
-		}
-	}
-	add(r.URL.Query().Get("key"))
-	if len(tokens) != 1 {
-		return "", false
-	}
-	return tokens[0], true
-}
-
 // providerProxyState carries one judged request through its attempts.
 type providerProxyState struct {
 	svc       *Service
-	cfg       GuardConfig
 	proto     providerProtocol
 	spool     *providerSpool
 	requested string
@@ -510,168 +330,6 @@ type providerProxyState struct {
 	rules     []ResponseModelRule
 	attempts  int
 	supplier  *supplierRequest
-}
-
-// proxyProvider wires the standard reverse proxy for one request. Judged
-// requests get a retrying transport; everything else streams untouched.
-func (s *Service) proxyProvider(w http.ResponseWriter, r *http.Request, cfg GuardConfig, matched providerMatch, state *providerProxyState) {
-	target, err := s.providerUpstreamTarget(cfg, r)
-	if err != nil {
-		var loop *providerLoopError
-		if errors.As(err, &loop) {
-			writeProviderError(w, matched.endpoint.proto, http.StatusBadGateway,
-				"上游网关指向 Provider 自身，请修正 Magpie 网关地址以避免请求环", false)
-			return
-		}
-		writeProviderError(w, matched.endpoint.proto, http.StatusBadGateway, "上游网关地址无效："+err.Error(), false)
-		return
-	}
-	var rt http.RoundTripper = providerUpstreamTransport
-	if state != nil {
-		rt = &providerTransport{base: providerUpstreamTransport, state: state}
-	}
-	proto := matched.endpoint.proto
-	proxy := &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			rewriteProviderRequest(pr, cfg, target, state)
-		},
-		Transport:     rt,
-		FlushInterval: -1,
-		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
-			var local *providerLocalError
-			if errors.As(err, &local) {
-				writeProviderError(rw, proto, local.status, local.message, local.retryAfter)
-				return
-			}
-			if req.Context().Err() != nil {
-				return
-			}
-			writeProviderError(rw, proto, http.StatusBadGateway, "上游模型请求失败："+err.Error(), false)
-		},
-	}
-	proxy.ServeHTTP(w, r)
-}
-
-func rewriteProviderRequest(pr *httputil.ProxyRequest, cfg GuardConfig, target *url.URL, state *providerProxyState) {
-	pr.Out.URL = target
-	pr.Out.Host = target.Host
-	stripProviderClientHeaders(pr.Out.Header)
-	pr.Out.Header.Set("Authorization", "Bearer "+cfg.GatewayKey)
-	if state != nil && len(state.rules) > 0 {
-		// Magpie must report the vendor model; its default reply naming would
-		// replace it with the requested model and defeat the judgment.
-		pr.Out.Header.Set("X-Magpie-Response-Model", "vendor")
-		pr.Out.Header.Set("Accept-Encoding", "identity")
-	}
-	if state != nil {
-		pr.Out.Body = nil
-		pr.Out.GetBody = nil
-		pr.Out.ContentLength = state.spool.Size()
-	}
-}
-
-// stripProviderClientHeaders removes every client credential plus forwarding
-// headers. Magpie must only see the guard gateway key.
-func stripProviderClientHeaders(h http.Header) {
-	for _, key := range []string{
-		"Authorization", "X-Api-Key", "Api-Key", "X-Goog-Api-Key",
-		"Cookie", "Proxy-Authorization", "Proxy-Authenticate",
-		"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto",
-		"X-Real-Ip", "Content-Length",
-	} {
-		h.Del(key)
-	}
-}
-
-// providerLoopError marks an upstream configuration that points back at the
-// guard's own provider prefix.
-type providerLoopError struct{}
-
-func (*providerLoopError) Error() string { return "provider loop" }
-
-func sameProviderHost(a, b string) bool {
-	ah, ap, err := net.SplitHostPort(a)
-	if err != nil {
-		return false
-	}
-	bh, bp, err := net.SplitHostPort(b)
-	if err != nil || ap != bp {
-		return false
-	}
-	normalize := func(host string) string {
-		host = strings.ToLower(strings.Trim(host, "[]"))
-		switch host {
-		case "127.0.0.1", "::1", "localhost":
-			return "loopback"
-		}
-		return host
-	}
-	return normalize(ah) == normalize(bh)
-}
-
-// providerUpstreamTarget builds the native URL from the configured gateway
-// root plus the escaped path after /provider. Model ids keep their exact
-// escapes; only the guard credential query parameter is removed.
-func (s *Service) providerUpstreamTarget(cfg GuardConfig, r *http.Request) (*url.URL, error) {
-	root, err := url.Parse(strings.TrimSpace(cfg.GatewayURL))
-	if err != nil || (root.Scheme != "http" && root.Scheme != "https") || root.Host == "" || root.User != nil {
-		return nil, errors.New("gateway url is invalid")
-	}
-	parts, ok := parseProviderPath(r.URL)
-	if !ok {
-		return nil, errors.New("path is invalid")
-	}
-	base := strings.TrimSuffix(root.EscapedPath(), "/")
-	base = strings.TrimSuffix(base, "/v1")
-	escapedRest := parts.escapedRest
-	if escapedRest == "" {
-		escapedRest = "/"
-	}
-	joined := base + escapedRest
-	decoded, err := url.PathUnescape(joined)
-	if err != nil {
-		return nil, err
-	}
-	out := *root
-	out.Path = decoded
-	if decoded != joined {
-		out.RawPath = joined
-	} else {
-		out.RawPath = ""
-	}
-	out.RawQuery = stripProviderQueryKey(r.URL.RawQuery)
-	out.Fragment = ""
-	out.User = nil
-	if s.providerOrigin != "" {
-		if origin, err := url.Parse(s.providerOrigin); err == nil && strings.EqualFold(origin.Scheme, out.Scheme) && sameProviderHost(origin.Host, out.Host) {
-			if out.Path == "/provider" || strings.HasPrefix(out.Path, "/provider/") {
-				return nil, &providerLoopError{}
-			}
-		}
-	}
-	return &out, nil
-}
-
-func stripProviderQueryKey(raw string) string {
-	if raw == "" {
-		return ""
-	}
-	parts := strings.Split(raw, "&")
-	out := parts[:0]
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-		name := part
-		if idx := strings.IndexByte(part, '='); idx >= 0 {
-			name = part[:idx]
-		}
-		if decoded, err := url.QueryUnescape(name); err == nil && decoded == "key" {
-			continue
-		}
-		out = append(out, part)
-	}
-	return strings.Join(out, "&")
 }
 
 // providerLocalError is a guard-generated failure rendered with the client's
@@ -684,11 +342,11 @@ type providerLocalError struct {
 
 func (e *providerLocalError) Error() string { return e.message }
 
-var errProviderModeChanged = errors.New("provider mode changed")
+var errProviderModeChanged = errors.New("supplier protection changed")
 
 func providerActionError(err error) error {
 	if errors.Is(err, errProviderModeChanged) {
-		return &providerLocalError{status: http.StatusNotFound, message: "Provider 已关闭，未执行响应动作"}
+		return &providerLocalError{status: http.StatusNotFound, message: "供应商保护已关闭，未执行响应动作"}
 	}
 	return &providerLocalError{status: http.StatusInternalServerError, message: "规则动作提交失败：" + err.Error()}
 }
@@ -760,21 +418,13 @@ func (t *providerTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	return nil, &providerLocalError{status: http.StatusBadGateway, message: "上游模型请求失败"}
 }
 
-// liveCheck re-reads mode and block state before every attempt so a mid-flight
-// console change stops further upstream calls.
+// liveCheck re-reads supplier state and block state before every attempt so a
+// mid-flight console change stops further upstream calls.
 func (st *providerProxyState) liveCheck() error {
-	cfg, err := st.svc.store.LoadConfig()
-	if err != nil {
-		return &providerLocalError{status: http.StatusInternalServerError, message: "读取 Provider 配置失败"}
+	if err := st.supplier.live(); err != nil {
+		return &providerLocalError{status: http.StatusServiceUnavailable, message: "供应商保护已关闭或配置冲突"}
 	}
-	if st.supplier != nil {
-		if err := st.supplier.live(); err != nil {
-			return &providerLocalError{status: http.StatusServiceUnavailable, message: "供应商保护已关闭或配置冲突"}
-		}
-	} else if !cfg.ProviderEnabled {
-		return &providerLocalError{status: http.StatusNotFound, message: "Provider 已关闭"}
-	}
-	if st.supplier != nil && st.supplier.probe {
+	if st.supplier.probe {
 		return nil
 	}
 	if st.target != nil {

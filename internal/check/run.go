@@ -135,7 +135,7 @@ func Run(o Options) error {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	registerConsole(mux, access)
-	srv := &http.Server{Handler: securityHeaders(registerProvider(mux, svc)), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Handler: securityHeaders(registerGuardRoutes(mux, svc)), ReadHeaderTimeout: 10 * time.Second}
 
 	ln, addr, err := listenBackend(store, o.Addr)
 	if err != nil {
@@ -146,11 +146,6 @@ func Run(o Options) error {
 
 	// The tunnel needs the final local origin; set it now that the port is known.
 	console.SetLocal(origin)
-	svc.mu.Lock()
-	svc.providerBase = origin + "/provider/v1"
-	svc.providerRoot = origin + "/provider"
-	svc.providerOrigin = origin
-	svc.mu.Unlock()
 	if o.MagpieConfig != "" {
 		svc.suppliers = newSupplierController(store, o.MagpieConfig, origin)
 		// Conflicts stay visible in the console; never overwrite external edits.

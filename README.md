@@ -7,7 +7,6 @@ Magpie 插件：**模型级别**的降智检测与禁用。定时用可自动判
 - 支持原有固定间隔与 codex-guard 风格的分阶段检测；全局默认、单模型覆盖和每日探针预算。
 - 支持按业务回复中上游实际返回的模型（含 Gemini `modelVersion`）配置规则，命中后禁用、改道后续请求或仅记录。
 - 供应商侧保护：在控制台接管选定自定义供应商的地址，客户端继续使用 Magpie 原地址、Key 和模型 ID；Guard 在交付回复前判定并重试，可恢复原始供应商地址。
-- 可选原生 Provider 端点：需要客户端直连 Guard 时，提供独立回环入口和 Provider Key。
 - Go 后台（单二进制，内嵌 Web 控制台）+ Magpie JS 插件宿主 + 网关门禁中间件。
 
 ## 工作流程
@@ -58,13 +57,13 @@ Windows AMD64 五个平台的预编译后台，运行机器不需要安装 Go �
 若旧版本提示“找不到 Go 后台二进制”，请更新插件；若安装缓存未刷新，移除后重新添加，
 再重启 Magpie 或关闭后重新启用插件。此修复不修改用户的数据目录。
 
+`0.7.0` 移除「客户端直连 Guard」模式及其 Provider Key、开关和 `/provider` 入口；需要当前请求判定与重试时统一使用「供应商保护」。同版本修复供应商冲突原因按协议重复显示，并修正不支持接管范围的说明（Azure OpenAI、Google Vertex AI 等）。
+
 `0.6.0` 新增「供应商保护」：接管并恢复选定自定义供应商的协议地址，客户端继续使用 Magpie 原地址、Key 和模型 ID。Guard 在回复交付前同步判断并有界重试，支持四种对话协议、恢复探针、崩溃恢复与外部修改冲突提示；供应商凭据和代理配置不复制到恢复账本。
 
 同版本按回复 ID 避免同步判断后的重复异步动作；无法关联的 `group` / `auto` 回复在供应商保护期间暂停异步判断，避免重复执行。
 
-`0.5.0` 新增业务回复模型判断：检查业务回复里上游实际返回的模型，按 exact / contains / glob / regex 规则禁用目标、改道后续路由组或仅记录；全局规则与目标自定义覆盖并存。降智检测探针保持独立，不参与响应模型判断。Provider 端点升级为原生 Magpie 网关组合：保留 Chat、Responses（含 WebSocket）、Anthropic、Gemini、目录与媒体能力，保留原始模型 ID，支持有界同目标重试与同步动作提交；后台监听地址持久化，可用 `backendAddr` 覆盖。
-
-同版本新增「供应商保护」：接管并恢复选定自定义供应商的协议地址，客户端配置保持不变；持久化写前账本处理崩溃恢复，外部受管字段变更显示冲突，已禁用模型的恢复探针仍可穿过保护入口。供应商凭据与代理设置不复制到恢复账本。
+`0.5.0` 新增业务回复模型判断：检查业务回复里上游实际返回的模型，按 exact / contains / glob / regex 规则禁用目标、改道后续路由组或仅记录；全局规则与目标自定义覆盖并存。降智检测探针保持独立，不参与响应模型判断。Provider 端点升级为原生 Magpie 网关组合（该模式已于 `0.7.0` 移除）：保留 Chat、Responses（含 WebSocket）、Anthropic、Gemini、目录与媒体能力，保留原始模型 ID，支持有界同目标重试与同步动作提交；后台监听地址持久化，可用 `backendAddr` 覆盖。
 
 `0.4.0` 新增临时远程控制台：插件入口可经 Cloudflare Quick Tunnel 签发一次性 HTTPS 管理链接（十分钟有效、仅可使用一次，通道最长 30 分钟），首次使用自动下载经 SHA-256 校验的官方 `cloudflared`。控制台鉴权同时改为票据换会话 Cookie；旧版本 `#token=` 链接随本次发布停用，请从插件入口重新打开。
 
@@ -198,7 +197,7 @@ sh scripts/build.sh
 - 「连接设置 → 业务回复模型判断」配置全局模式、全局规则和改道保持时长；监测目标的「策略」弹窗可选择继承全局或自定义覆盖。
 - 规则只判断业务回复，不判断降智探针：降智是持续性问题，定时探针仍有意义；上游实际模型路由是不确定的，单次探针只代表当次，不能用来推断下一次业务请求会落到哪个成员。
 - 未接管的业务回复通过 Magpie 异步 `onResponse` 钩子上报，守卫进程在 `dataDir` 写入权限为 `0600` 的 `response-hook.json` 提供本地回环地址和控制 token；规则未启用时钩子直接跳过。宿主不支持 `magpie.hooks` 时，探针检测、直接门禁和供应商侧同步保护仍可运行。
-- 异步钩子只能观察已完成的回复，`disable` / `reroute` 影响后续请求。需要当前请求先重试时，在「供应商保护」接管选定供应商；高级 Provider 入口也支持同步判定。
+- 异步钩子只能观察已完成的回复，`disable` / `reroute` 影响后续请求。需要当前请求先重试时，在「供应商保护」接管选定供应商。
 - 改道集合默认保留 30 分钟（可设 1–1440 分钟），到期后路由组自动恢复；检测记录会显示实际模型与命中规则。
 
 ### 供应商保护（客户端配置不变）
@@ -212,46 +211,19 @@ sh scripts/build.sh
 客户端继续使用 Magpie 原有的 Base URL、Key 和模型 ID。Guard 只接管 `providers.json` 中显式配置的自定义协议地址，以及一个用于识别恢复探针的 header；供应商凭据、模型、自定义 headers、`extraBody`、fallback、affinity 和代理配置仍由 Magpie 管理。Guard 转发 Magpie 已准备好的请求，重试保持同一已选凭据与请求体，不切换账号。
 
 - 支持 Chat、Responses、Anthropic、Gemini 回复模型判定；辅助接口直接转发到该供应商原地址。`decide` 地址也可接管转发，不执行回复模型判断。
-- 「最多尝试次数」包含首次请求，范围 1–5，与高级 Provider 共用。`disable` / `reroute` 命中时在尚未交付的范围内重试；`record` 首次命中即记录，不重试。Responses WebSocket 只在可确认中断当前响应时重试；终态坏回复会被拦截并关闭连接，需要客户端重连。
-- 重试耗尽后提交禁用或改道动作，再返回可重试错误；Magpie 仍可按其原生 fallback 规则选择其他供应商。供应商模式的改道隔离原请求实际选中的 `provider/model`，检测记录保留供应商返回的真实模型名。
+- 「最多尝试次数」包含首次请求，范围 1–5。`disable` / `reroute` 命中时在尚未交付的范围内重试；`record` 首次命中即记录，不重试。Responses WebSocket 只在可确认中断当前响应时重试；终态坏回复会被拦截并关闭连接，需要客户端重连。
+- 重试耗尽后提交禁用或改道动作，再返回可重试错误；Magpie 仍可按其原生 fallback 规则选择其他供应商。供应商保护的改道隔离原请求实际选中的 `provider/model`，检测记录保留供应商返回的真实模型名。
 - 单模型判断支持 `modelIDs` / `modelWires` 映射；多个监测目标映射到同一 wire 名时使用全局规则，避免错误禁用其中一个。恢复探针凭会话标记绕过业务拦截，标记在发给供应商前移除。
 - Guard 使用供应商当前代理、每 Key 代理和 TLS 设置，未指定时沿用 Magpie 全局代理、环境变量或系统代理。账本仅保存受管地址和恢复元数据，不复制供应商 Key 或代理凭据。
 - 地址修改使用持久化写前账本和原子替换；重启时恢复未完成事务，并在端口显式更换时重绑受管地址。外部修改受管字段会显示冲突并停止该入口转发，保留用户修改及恢复信息。
 - 同步判断过的回复按回复 ID 去重，避免 Magpie 异步钩子再次执行动作。已保护供应商的直接请求统一跳过异步判断，即使供应商未返回 ID、Magpie 生成了新 ID。原生钩子没有实际供应商信息；供应商未返回 ID、ID 被转换或超出前缀窗口时无法可靠关联。因此存在供应商保护期间，无法关联的 `group` / `auto` 回复暂停异步判断；组内受保护供应商仍同步判断，未保护供应商的直接请求仍可异步判断。
-- 订阅类插件、没有显式自定义协议地址的供应商不在接管范围。地址中的查询参数、用户信息或片段会被拒绝，避免凭据写入恢复账本；依赖原始主机的 Azure OpenAI（非 preset）、Bedrock、OpenCode、远程 Magpie，以及 Vercel / Cloudflare 决策端点也暂不支持接管，控制台会显示原因。额外尝试会在供应商侧计费，但不会作为独立调用计入 Magpie 的用量统计。
+- 订阅类插件、没有显式自定义协议地址的供应商不在接管范围。地址中的查询参数、用户信息或片段会被拒绝，避免凭据写入恢复账本；Azure OpenAI、Google Vertex AI、Bedrock、OpenCode、远程 Magpie，以及 Vercel / Cloudflare 决策端点也暂不支持接管，控制台会显示原因。额外尝试会在供应商侧计费，但不会作为独立调用计入 Magpie 的用量统计。
 
 **停用或卸载前，先点击每个已保护供应商的「恢复原始地址」。** Guard 停止运行时，仍指向 Guard 的供应商会连接失败；不会自动绕过保护。恢复只撤销 Guard 管理的字段，保留其他配置更改。建议先在一个供应商上验证，再逐个启用。
 
-### 高级：客户端直连 Guard（可选）
-
-Provider 不是另建一套供应商实现，而是把**原生 Magpie 网关**组合到守卫的回环地址下：供应商、Key、代理、headers、`extraBody`、fallback、affinity、限流、模型与价格仍由 Magpie 原生配置管理；守卫只负责请求门禁、业务回复判定与有界重试，不复制供应商凭据或协议转换。管理、签发密钥、调试、重启与 MCP 接口不在 Provider 路径中。
-
-「连接设置 → 高级：客户端直连 Guard」展示三个入口（同一 Provider Key）：
-
-```text
-OpenAI / Responses: http://127.0.0.1:<后台端口>/provider/v1
-Anthropic / Ollama: http://127.0.0.1:<后台端口>/provider
-Gemini:             http://127.0.0.1:<后台端口>/provider/v1beta
-API Key:            连接设置中自动生成的 Provider Key
-```
-
-支持 Bearer、`X-Api-Key`、`api-key`、Gemini `X-Goog-Api-Key` 与 query `key`；同时提供多个不同凭据会返回 `401`。客户端凭据、Cookie、`Proxy-Authorization` 与转发来源头不会发往 Magpie，上游仅使用网关 Key。CORS 预检按原生配置转发，实际请求仍必须携带 Provider Key。
-
-已纳入的原生路径：Chat、Responses（含原生 WebSocket 续接）、Anthropic Messages、Gemini generate/stream、模型目录与元数据、count_tokens、System One、alpha search、图片/embeddings/rerank/音频/视频、Ollama 兼容目录与 NDJSON 生成、Codex 模型与 Responses。其他路径返回 `404`，已知路径的错误方法返回 `405` 并写 `Allow`。
-
-判定与重试：
-
-- 请求保留原始模型 ID，不再改写为探针别名；模型目录与元数据原样来自原生网关，未监测但原生可用的模型也能调用。
-- 有监测目标且已阻断时立即返回 `403`；未监测模型使用全局规则。`Provider 尝试次数` 含首次请求（默认 2，可设 1–5）；仅命中 `disable` / `reroute` 且响应尚未交付时重试同一目标。`record` 首次命中即记录并交付原响应，不重试。
-- 判定请求强制 `X-Magpie-Response-Model: vendor`，避免 Magpie 默认把响应模型名改写为请求模型；非流式 JSON 与 SSE/NDJSON 都在交付前提取真实模型。次数用尽后 `disable` / `reroute` 同步提交记录并返回 `503` + `Retry-After: 1`；提交失败返回 `500`，不会伪报成功。
-- Ollama 的 JSON/NDJSON 输出始终回显请求模型名，无法据此判断真实模型：只执行请求目标门禁并透明转发，不执行回复动作或守卫重试。
-- `reroute` 只把实际模型名与原生成员 ID（含已识别 effort 后缀）精确匹配；匹配不到成员时仍记录命中，但不会改变路由组。
-- 启用 Provider 期间，业务回复判断只在 Guard 入口同步执行，Magpie 异步观察暂停；某次响应已开始交付后不会被撤销。关闭 Provider 后恢复异步观察。直接访问 Magpie 的请求仍受模型门禁，但此模式不做回复模型判断。
-- 原生 Responses WebSocket 在同一前端连接上续接 `previous_response_id`；`generate:false` 预热原样透传。Guard 在同一条后端连接上最多重试同一次 `response.create`；内部中断未确认、已出现 terminal、`response.id` 缺失或客户端自身中断时不会重放。坏回复已 terminal 时只返回守卫错误并关闭连接，不交付坏结果。
+## 数据与安全
 
 后台监听地址默认在首次启动时随机分配并持久化到 `dataDir`，重启复用；已保存端口被占用时启动失败而不是漂移。多实例或端口冲突可在插件包选项中设置 `backendAddr`：`127.0.0.1:<端口>`、`localhost:<端口>` 或 `[::1]:<端口>`（1–65535）。
-
-## 数据与安全
 
 - 状态存于 `~/.config/magpie-model-guard/model-guard.db`（SQLite）；
 - 管理 API 仅监听回环地址；插件宿主持有控制 token，控制台通过一次性票据链接换取 30 分钟 HttpOnly 会话 Cookie，管理域名不匹配时拒绝票据；
@@ -261,17 +233,16 @@ API Key:            连接设置中自动生成的 Provider Key
 - 同步使用插件侧文件锁、写前字节检查和原子替换；Magpie 原生配置写入不共享此锁，因此应避免同时编辑正在同步的组。原生程序在最后检查与替换之间的并发写入仍存在竞争窗口。
 - 临时保存的自动组在隔离期间使用保存的成员列表；完全恢复后返回 Magpie 动态发现。禁用或卸载插件前，先解除禁用或删除相关监测目标，等待路由同步恢复；直接退出后台会保留隔离配置。
 - 业务回复模型判断的钩子只上报请求模型、实际模型、协议和 agent，不上报消息正文或凭据；本地握手文件 `response-hook.json` 权限为 `0600`，只用于本机回环 API。
-- Provider 端点复用管理后台的回环监听，使用独立的自动生成 Key，不会把客户端的 API Key 转发给 Magpie；Provider Key 保存在本地配置中，并显示在受会话保护的连接设置里。
 
 ## 验证
 
 `go test ./...` 覆盖状态转换、配置迁移、恢复账本、锁竞争恢复、并发提交与控制台票据（一次性票据、会话 Cookie、
-Cloudflare 临时隧道的启动 / 复用 / 失败与清理）以及 Provider 的鉴权、原生路由透传、非流式/流式/WebSocket 判定与规则动作；`node --test tests/*.test.mjs` 检查门禁、无需 Go 的安装启动，
+Cloudflare 临时隧道的启动 / 复用 / 失败与清理）以及供应商接管的同步判定、重试与规则动作；`node --test tests/*.test.mjs` 检查门禁、无需 Go 的安装启动，
 以及 Go 后台与完整插件宿主两层的管道退出行为，并验证本机票据入口换取会话后可访问管理 API。插件宿主测试在
 输入结束后保持宿主进程存活，验证后台确实被插件关闭；可设置 `MAGPIE_BUN_TEST_BINARY` 同时使用 Magpie 的 Bun 运行该场景。
-构建后运行 `node scripts/verify-auto-routing.mjs`，可使用真实 Magpie、完整插件包和两个本地测试上游验证显式组、自动组、直接请求门禁、探针、全组禁用与重启恢复。`MAGPIE_TEST_BINARY=/Applications/magpie.app/Contents/MacOS/magpie MODEL_GUARD_TEST_BINARY=<仓库>/bin/model-guard node scripts/verify-native-provider.mjs` 使用固定基线版本的真实 Magpie 验证原生供应商组合：四种对话协议、流式工具调用、多 Key fallback、模型目录、媒体/音频/视频、Ollama、Responses WebSocket 续接与重试，以及控制台地址展示。两个脚本都使用独立临时 XDG/HOME，完成后清理进程和数据。
+构建后运行 `node scripts/verify-auto-routing.mjs`，可使用真实 Magpie、完整插件包和两个本地测试上游验证显式组、自动组、直接请求门禁、探针、全组禁用与重启恢复。`MAGPIE_TEST_BINARY=/Applications/magpie.app/Contents/MacOS/magpie MODEL_GUARD_TEST_BINARY=<仓库>/bin/model-guard node scripts/verify-native-provider.mjs` 使用固定基线版本的真实 Magpie 验证客户端配置不变的供应商接管：四种原生供应商协议的同步重试、仅记录、禁用后的恢复探针、异步去重、后台重启和原地址恢复。两个脚本都使用独立临时 XDG/HOME，完成后清理进程和数据。
 
-`verify-native-provider.mjs` 还验证客户端配置不变的供应商接管：四种原生供应商协议的同步重试、仅记录、禁用后的恢复探针、后台重启和原地址恢复。`go test -race ./internal/check -run TestSupplier` 检查供应商路径的并发行为；控制台操作需在真实浏览器验证启用、恢复和共享重试设置的保存。
+`go test -race ./internal/check -run TestSupplier` 检查供应商路径的并发行为；控制台操作需在真实浏览器验证启用、恢复和重试设置的保存。
 
 ## 致谢
 

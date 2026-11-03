@@ -345,8 +345,6 @@
     loadSuppliers();
     return api("GET", "/api/state").then(function (snap) {
       state.config = snap.config || {};
-      state.provider_base = snap.provider_base || "";
-      state.provider_root = snap.provider_root || "";
       state.targets = snap.targets || [];
       state.prompts = snap.prompts || [];
       state.checking = snap.checking || [];
@@ -1642,7 +1640,7 @@
     "cfg-schedule-mode", "cfg-recalculate-schedule",
     "cfg-tp-normal", "cfg-tp-retry", "cfg-tp-iso-first", "cfg-tp-iso-later", "cfg-tp-rec-confirm", "cfg-tp-unavail",
     "cfg-response-mode", "cfg-response-reroute",
-    "cfg-provider-enabled", "cfg-provider-attempts"
+    "cfg-provider-attempts"
   ].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) {
@@ -1711,20 +1709,8 @@
     if (responseRerouteEl) responseRerouteEl.value = c.response_reroute_min || 30;
     renderResponseRules(document.getElementById("cfg-response-rules"), c.response_rules || []);
 
-    var providerEnabledEl = document.getElementById("cfg-provider-enabled");
-    if (providerEnabledEl) providerEnabledEl.checked = !!c.provider_enabled;
-    var providerKeyEl = document.getElementById("cfg-provider-key");
-    if (providerKeyEl) providerKeyEl.value = c.provider_key || "";
     var providerAttemptsEl = document.getElementById("cfg-provider-attempts");
     if (providerAttemptsEl) providerAttemptsEl.value = c.provider_attempts || 2;
-    var providerBase = state.provider_base || (window.location.origin + "/provider/v1");
-    var providerRoot = state.provider_root || providerBase.replace(/\/v1$/, "");
-    var providerURLel = document.getElementById("cfg-provider-url");
-    if (providerURLel) providerURLel.textContent = providerBase;
-    var providerNativeEl = document.getElementById("cfg-provider-url-native");
-    if (providerNativeEl) providerNativeEl.textContent = providerRoot;
-    var providerGeminiEl = document.getElementById("cfg-provider-url-gemini");
-    if (providerGeminiEl) providerGeminiEl.textContent = providerRoot + "/v1beta";
 
     var tp = c.timing_policy || defaultTimingPolicy;
     var tpNormal = document.getElementById("cfg-tp-normal");
@@ -1791,8 +1777,6 @@
         response_model_mode: document.getElementById("cfg-response-mode").value,
         response_reroute_min: parseInt(document.getElementById("cfg-response-reroute").value, 10),
         response_rules: responseRules,
-        provider_enabled: document.getElementById("cfg-provider-enabled").checked,
-        provider_key: document.getElementById("cfg-provider-key").value,
         provider_attempts: parseInt(document.getElementById("cfg-provider-attempts").value, 10),
         recalculate_schedule: recalc
       });
@@ -1823,32 +1807,6 @@
       });
     });
   }
-
-  function fallbackCopy(text, done) {
-    var area = document.createElement("textarea");
-    area.value = text;
-    area.setAttribute("readonly", "");
-    area.style.position = "fixed";
-    area.style.opacity = "0";
-    document.body.appendChild(area);
-    area.select();
-    try { document.execCommand("copy"); done(); } catch (err) { toast("复制失败，请手动选择地址"); }
-    document.body.removeChild(area);
-  }
-
-  Array.prototype.forEach.call(document.querySelectorAll(".provider-copy"), function (btn) {
-    btn.addEventListener("click", function () {
-      var el = document.getElementById(btn.getAttribute("data-copy"));
-      if (!el) return;
-      var text = el.textContent || "";
-      var done = function () { toast("已复制 Base URL"); };
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(done, function () { fallbackCopy(text, done); });
-      } else {
-        fallbackCopy(text, done);
-      }
-    });
-  });
 
   var topRefreshBtn = document.getElementById("top-refresh");
   if (topRefreshBtn) {

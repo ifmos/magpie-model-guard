@@ -55,7 +55,6 @@ type providerBackendEvent struct {
 
 type providerSocket struct {
 	svc     *Service
-	cfg     GuardConfig
 	backend *websocket.Conn
 	client  *websocket.Conn
 	ctx     context.Context
@@ -72,9 +71,9 @@ type providerSocket struct {
 	supplier     *supplierRequest
 }
 
-// serveProviderSocket connects one front-end Responses socket to one native
-// Magpie socket and judges each turn on that connection.
-func (s *Service) serveProviderSocket(w http.ResponseWriter, r *http.Request, cfg GuardConfig, matched providerMatch) {
+// serveProviderSocket connects one front-end Responses socket to one taken-over
+// supplier socket and judges each turn on that connection.
+func (s *Service) serveProviderSocket(w http.ResponseWriter, r *http.Request, matched providerMatch, sr *supplierRequest) {
 	// Same-origin only, using the same rule as websocket.Accept: the Origin
 	// host must be the request host. Native clients without Origin pass.
 	if origin := r.Header.Get("Origin"); origin != "" {
@@ -84,33 +83,18 @@ func (s *Service) serveProviderSocket(w http.ResponseWriter, r *http.Request, cf
 			return
 		}
 	}
-	var target *url.URL
-	var err error
-	sr, _ := r.Context().Value(supplierContextKey{}).(*supplierRequest)
-	if sr != nil {
-		copyURL := *sr.target
-		target = &copyURL
-	} else {
-		target, err = s.providerUpstreamTarget(cfg, r)
-	}
-	if err != nil {
-		writeProviderError(w, matched.endpoint.proto, http.StatusBadGateway, "上游网关地址无效："+err.Error(), false)
-		return
-	}
-	switch target.Scheme {
+	target := *sr.target
+	targetURL := &target
+	switch targetURL.Scheme {
 	case "https":
-		target.Scheme = "wss"
+		targetURL.Scheme = "wss"
 	default:
-		target.Scheme = "ws"
+		targetURL.Scheme = "ws"
 	}
-	headers := providerSocketHeaders(r, cfg)
-	var httpClient *http.Client
-	if sr != nil {
-		headers = supplierSocketHeaders(r)
-		httpClient = &http.Client{Transport: sr.transport, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect refused") }}
-	}
+	headers := supplierSocketHeaders(r)
+	httpClient := &http.Client{Transport: sr.transport, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect refused") }}
 	dialCtx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	backend, resp, err := websocket.Dial(dialCtx, target.String(), &websocket.DialOptions{
+	backend, resp, err := websocket.Dial(dialCtx, targetURL.String(), &websocket.DialOptions{
 		HTTPHeader:      headers,
 		HTTPClient:      httpClient,
 		Subprotocols:    providerClientSubprotocols(r),
@@ -143,7 +127,6 @@ func (s *Service) serveProviderSocket(w http.ResponseWriter, r *http.Request, cf
 	ctx, cancelCtx := context.WithCancel(r.Context())
 	ps := &providerSocket{
 		svc:       s,
-		cfg:       cfg,
 		backend:   backend,
 		client:    client,
 		ctx:       ctx,
@@ -171,32 +154,6 @@ func providerClientSubprotocols(r *http.Request) []string {
 		}
 	}
 	return out
-}
-
-// providerSocketHeaders keeps end-to-end headers (beta, session, turn state)
-// and replaces every client credential with the guard gateway key.
-func providerSocketHeaders(r *http.Request, cfg GuardConfig) http.Header {
-	h := r.Header.Clone()
-	for _, token := range strings.Split(r.Header.Get("Connection"), ",") {
-		if token = strings.TrimSpace(token); token != "" {
-			h.Del(token)
-		}
-	}
-	for _, key := range []string{
-		"Connection", "Upgrade", "Sec-Websocket-Key", "Sec-Websocket-Version",
-		"Sec-Websocket-Protocol", "Sec-Websocket-Extensions", "Host", "Origin",
-		"Cookie", "Proxy-Authorization", "Proxy-Authenticate", "Content-Length",
-		"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-Ip",
-		"Authorization", "X-Api-Key", "Api-Key", "X-Goog-Api-Key", "Accept-Encoding",
-	} {
-		h.Del(key)
-	}
-	h.Set("Authorization", "Bearer "+cfg.GatewayKey)
-	// The socket judges each turn by the vendor's model id. Without this,
-	// Magpie names every reply after the requested model and a rule can never
-	// see what actually answered.
-	h.Set("X-Magpie-Response-Model", "vendor")
-	return h
 }
 
 func copyProviderFailureResponse(w http.ResponseWriter, resp *http.Response) {
@@ -494,24 +451,16 @@ func (ps *providerSocket) runTurn(ev providerClientEvent) {
 	ps.drainInterrupts()
 
 	cfg, err := ps.svc.store.LoadConfig()
-	if err != nil || !ps.modeEnabled(cfg) {
-		_ = ps.client.Close(websocket.StatusPolicyViolation, "provider disabled")
+	if err != nil || ps.supplier.live() != nil {
+		_ = ps.client.Close(websocket.StatusPolicyViolation, "supplier protection disabled")
 		ps.cancel()
 		return
 	}
-	targets, err := ps.svc.store.Targets()
-	if err != nil {
-		ps.failTurn(http.StatusInternalServerError, "model_guard_action_failed", "读取监测目标失败")
-		return
-	}
 	model := strings.TrimSpace(ev.scan.Model)
-	target := findTargetForRequest(targets, model)
-	if ps.supplier != nil {
-		model, target, err = ps.svc.supplierModel(ps.supplier.binding.ProviderID, model)
-		if err != nil {
-			ps.failTurn(500, "model_guard_action_failed", "读取模型配置失败")
-			return
-		}
+	model, target, err := ps.svc.supplierModel(ps.supplier.binding.ProviderID, model)
+	if err != nil {
+		ps.failTurn(500, "model_guard_action_failed", "读取模型配置失败")
+		return
 	}
 	if target != nil && target.blockedAt(time.Now()) {
 		ps.sendSocketError(http.StatusForbidden, "model_guard_blocked", "该模型已被守卫禁用")
@@ -533,21 +482,16 @@ func (ps *providerSocket) runTurn(ev providerClientEvent) {
 	}
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if attempt > 1 {
-			cfg, err := ps.svc.store.LoadConfig()
-			if err != nil {
-				ps.failTurn(http.StatusInternalServerError, "model_guard_action_failed", "读取 Provider 配置失败")
+			if ps.supplier.live() != nil {
+				ps.failTurn(http.StatusServiceUnavailable, "model_guard_disabled", "供应商保护已关闭")
 				return
 			}
-			if !ps.modeEnabled(cfg) {
-				ps.failTurn(http.StatusServiceUnavailable, "model_guard_disabled", "Provider 已关闭")
-				return
-			}
-			targets, err := ps.svc.store.Targets()
+			latest, err := ps.svc.store.Target(model)
 			if err != nil {
 				ps.failTurn(http.StatusInternalServerError, "model_guard_action_failed", "读取监测目标失败")
 				return
 			}
-			if latest := findTargetForRequest(targets, model); latest != nil && latest.blockedAt(time.Now()) {
+			if latest != nil && latest.blockedAt(time.Now()) {
 				ps.sendSocketError(http.StatusForbidden, "model_guard_blocked", "该模型已被守卫禁用")
 				_ = ps.client.Close(websocket.StatusPolicyViolation, "model disabled")
 				ps.cancel()
@@ -708,7 +652,7 @@ func (ps *providerSocket) judgeAttempt(requested string, target *Target, rules [
 					}
 					return flushOnly(nil)
 				case rule.Action == ResponseActionRecord:
-					if err := ps.record(requested, values.Model, target, *rule); err != nil {
+					if err := ps.svc.recordSupplierResponse(ps.supplier, requested, values.Model, target, *rule); err != nil {
 						ps.actionFailed(err)
 						return providerTurnDone
 					}
@@ -1059,7 +1003,7 @@ func (ps *providerSocket) failTurn(status int, code, message string) {
 }
 
 func (ps *providerSocket) blockTurn(requested, actual string, target *Target, rule ResponseModelRule, attempts int) {
-	if err := ps.record(requested, actual, target, rule); err != nil {
+	if err := ps.svc.recordSupplierResponse(ps.supplier, requested, actual, target, rule); err != nil {
 		ps.actionFailed(err)
 		return
 	}

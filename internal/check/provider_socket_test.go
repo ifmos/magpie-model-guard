@@ -14,9 +14,9 @@ import (
 	"github.com/coder/websocket"
 )
 
-func newSocketEnv(t *testing.T, handler func(ctx context.Context, c *websocket.Conn)) *providerEnv {
+func newSocketEnv(t *testing.T, handler func(ctx context.Context, c *websocket.Conn)) *supplierEnv {
 	t.Helper()
-	return newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+	return newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		if !isProviderUpgrade(r) {
 			http.Error(w, "upgrade required", http.StatusBadRequest)
 			return
@@ -38,11 +38,10 @@ func newSocketEnv(t *testing.T, handler func(ctx context.Context, c *websocket.C
 	})
 }
 
-func dialGuardSocket(t *testing.T, env *providerEnv, path, origin string) *websocket.Conn {
+func dialGuardSocket(t *testing.T, env *supplierEnv, target, origin string) *websocket.Conn {
 	t.Helper()
-	target := "ws" + strings.TrimPrefix(env.guard.URL, "http") + path
+	target = "ws" + strings.TrimPrefix(target, "http")
 	header := http.Header{}
-	header.Set("Authorization", "Bearer provider-key")
 	if origin != "" {
 		header.Set("Origin", origin)
 	}
@@ -87,7 +86,7 @@ func socketFrameType(t *testing.T, data []byte) string {
 	return values.Type
 }
 
-func configureSocketRule(t *testing.T, env *providerEnv, rule ResponseModelRule) {
+func configureSocketRule(t *testing.T, env *supplierEnv, rule ResponseModelRule) {
 	t.Helper()
 	if err := env.store.SaveTarget(&Target{
 		Model: "vendor/big", Enabled: true,
@@ -116,7 +115,7 @@ func TestProviderSocketRelaysTurnInOrder(t *testing.T) {
 			_ = c.Write(ctx, websocket.MessageText, []byte(frame))
 		}
 	})
-	client := dialGuardSocket(t, env, "/provider/v1/responses", "")
+	client := dialGuardSocket(t, env, env.path("responses", "/responses"), "")
 	writeSocketJSON(t, client, `{"type":"response.create","model":"vendor/big","input":[]}`)
 	want := []string{"response.created", "response.output_text.delta", "response.completed"}
 	for i, kind := range want {
@@ -127,9 +126,6 @@ func TestProviderSocketRelaysTurnInOrder(t *testing.T) {
 	}
 	if env.rec.count() != 1 {
 		t.Fatalf("native upgrades=%d", env.rec.count())
-	}
-	if got := env.rec.last().header.Get("X-Magpie-Response-Model"); got != "vendor" {
-		t.Fatalf("socket must ask for the vendor model, got %q", got)
 	}
 }
 
@@ -175,7 +171,7 @@ func TestProviderSocketRetriesBadTurnAfterInterrupt(t *testing.T) {
 		t.Fatal(err)
 	}
 	env.svc.mu.Unlock()
-	client := dialGuardSocket(t, env, "/provider/v1/responses", "")
+	client := dialGuardSocket(t, env, env.path("responses", "/responses"), "")
 	writeSocketJSON(t, client, `{"type":"response.create","model":"vendor/big","input":[]}`)
 	first := readSocketMessage(t, client, 2*time.Second)
 	if got := providerFrameValues(first); got.Type != "response.created" || got.ResponseID != "resp_2" {
@@ -196,6 +192,66 @@ func TestProviderSocketRetriesBadTurnAfterInterrupt(t *testing.T) {
 	target, _ := env.store.Target("vendor/big")
 	if target == nil || target.State == StateFailed {
 		t.Fatalf("good retry must leave the target usable: %+v", target)
+	}
+}
+
+func TestProviderSocketRetryStopsWhenTargetBecomesBlocked(t *testing.T) {
+	var env *supplierEnv
+	var mu sync.Mutex
+	creates := 0
+	env = newSocketEnv(t, func(ctx context.Context, c *websocket.Conn) {
+		for {
+			_, data, err := c.Read(ctx)
+			if err != nil {
+				return
+			}
+			if providerFrameValues(data).Type == "response.interrupt" {
+				_ = c.Write(ctx, websocket.MessageText, []byte(`{"type":"response.interrupt.accepted","response_id":"resp_1"}`))
+				_ = c.Write(ctx, websocket.MessageText, []byte(`{"type":"response.incomplete","response":{"id":"resp_1","status":"incomplete"}}`))
+				continue
+			}
+			if providerFrameValues(data).Type != "response.create" {
+				continue
+			}
+			mu.Lock()
+			creates++
+			n := creates
+			mu.Unlock()
+			if n > 1 {
+				_ = c.Write(ctx, websocket.MessageText, []byte(socketCreated("resp_2", "vendor/big")))
+				_ = c.Write(ctx, websocket.MessageText, []byte(`{"type":"response.completed","response":{"id":"resp_2","model":"vendor/big","status":"completed"}}`))
+				continue
+			}
+			// The target did not exist when the turn started. Adding and
+			// disabling it before the judged retry must stop the replay.
+			if err := env.store.SaveTarget(&Target{Model: "vendor/big", Enabled: true, ManualHold: true}); err != nil {
+				t.Errorf("SaveTarget: %v", err)
+				return
+			}
+			_ = c.Write(ctx, websocket.MessageText, []byte(socketCreated("resp_1", "vendor/flash")))
+		}
+	})
+	cfg := mustConfig(t, env.store)
+	cfg.GatewayURL = env.vendor.URL
+	cfg.GatewayKey = "gw-key"
+	cfg.ProviderAttempts = 2
+	cfg.ResponseModelMode = ResponseModelOn
+	cfg.ResponseRules = []ResponseModelRule{{
+		ID: "r-flash", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionDisable,
+	}}
+	if err := env.svc.Configure(cfg); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	client := dialGuardSocket(t, env, env.path("responses", "/responses"), "")
+	writeSocketJSON(t, client, `{"type":"response.create","model":"big","input":[]}`)
+	frame := readSocketMessage(t, client, 3*time.Second)
+	if got := providerFrameValues(frame); got.Type != "error" {
+		t.Fatalf("expected guard error, got %s", frame)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if creates != 1 {
+		t.Fatalf("blocked target was replayed: creates=%d", creates)
 	}
 }
 
@@ -233,7 +289,7 @@ func TestProviderSocketTerminalBadIsNeverDelivered(t *testing.T) {
 		t.Fatal(err)
 	}
 	env.svc.mu.Unlock()
-	client := dialGuardSocket(t, env, "/provider/v1/responses", "")
+	client := dialGuardSocket(t, env, env.path("responses", "/responses"), "")
 	writeSocketJSON(t, client, `{"type":"response.create","model":"vendor/big","input":[]}`)
 	frame := readSocketMessage(t, client, 3*time.Second)
 	values := providerFrameValues(frame)
@@ -294,7 +350,7 @@ func TestProviderSocketJudgesModelNamedLate(t *testing.T) {
 		t.Fatal(err)
 	}
 	env.svc.mu.Unlock()
-	client := dialGuardSocket(t, env, "/provider/v1/responses", "")
+	client := dialGuardSocket(t, env, env.path("responses", "/responses"), "")
 	writeSocketJSON(t, client, `{"type":"response.create","model":"vendor/big","input":[]}`)
 	frame := readSocketMessage(t, client, 3*time.Second)
 	values := providerFrameValues(frame)
@@ -365,7 +421,7 @@ func TestProviderSocketNoRetryWhenInterruptRejectedOrMissingID(t *testing.T) {
 				t.Fatal(err)
 			}
 			env.svc.mu.Unlock()
-			client := dialGuardSocket(t, env, "/provider/v1/responses", "")
+			client := dialGuardSocket(t, env, env.path("responses", "/responses"), "")
 			writeSocketJSON(t, client, `{"type":"response.create","model":"vendor/big","input":[]}`)
 			frame := readSocketMessage(t, client, 3*time.Second)
 			if got := socketFrameType(t, frame); got != "error" {
@@ -426,7 +482,7 @@ func TestProviderSocketClientInterruptStopsRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	env.svc.mu.Unlock()
-	client := dialGuardSocket(t, env, "/provider/v1/responses", "")
+	client := dialGuardSocket(t, env, env.path("responses", "/responses"), "")
 	writeSocketJSON(t, client, `{"type":"response.create","model":"vendor/big","input":[]}`)
 	select {
 	case <-createSeen:
@@ -466,7 +522,7 @@ func TestProviderSocketWarmupIsPassthrough(t *testing.T) {
 		t.Fatal(err)
 	}
 	env.svc.mu.Unlock()
-	client := dialGuardSocket(t, env, "/provider/v1/responses", "")
+	client := dialGuardSocket(t, env, env.path("responses", "/responses"), "")
 	writeSocketJSON(t, client, `{"type":"response.create","model":"vendor/big","generate":false,"input":[]}`)
 	if got := socketFrameType(t, readSocketMessage(t, client, 2*time.Second)); got != "response.created" {
 		t.Fatalf("warmup created type=%q", got)
@@ -511,7 +567,7 @@ func TestProviderSocketLargeSlowMessageStreamsBeforeEnd(t *testing.T) {
 		}
 		_ = c.Write(ctx, websocket.MessageText, []byte(`{"type":"response.completed","response":{"id":"resp_2","model":"vendor/big","status":"completed"}}`))
 	})
-	client := dialGuardSocket(t, env, "/provider/v1/responses", "")
+	client := dialGuardSocket(t, env, env.path("responses", "/responses"), "")
 	writeSocketJSON(t, client, `{"type":"response.create","model":"vendor/big","input":[]}`)
 	<-paused
 
@@ -566,7 +622,7 @@ func TestProviderSocketAcceptsLargeClientFrame(t *testing.T) {
 			_ = c.Write(ctx, websocket.MessageText, []byte(`{"type":"response.completed","response":{"id":"resp_1","model":"vendor/big","status":"completed"}}`))
 		}
 	})
-	client := dialGuardSocket(t, env, "/provider/v1/responses", "")
+	client := dialGuardSocket(t, env, env.path("responses", "/responses"), "")
 	frame := `{"type":"response.create","model":"vendor/big","pad":"` + strings.Repeat("y", 40<<10) + `","input":[]}`
 	writeSocketJSON(t, client, frame)
 	if kind := socketFrameType(t, readSocketMessage(t, client, 2*time.Second)); kind != "response.completed" {
@@ -586,9 +642,8 @@ func TestProviderSocketOriginPolicy(t *testing.T) {
 		}
 		_ = c.Write(ctx, websocket.MessageText, []byte(`{"type":"response.completed","response":{"id":"resp_1","model":"vendor/big","status":"completed"}}`))
 	})
-	target := "ws" + strings.TrimPrefix(env.guard.URL, "http") + "/provider/v1/responses"
+	target := "ws" + strings.TrimPrefix(env.path("responses", "/responses"), "http")
 	header := http.Header{}
-	header.Set("Authorization", "Bearer provider-key")
 	header.Set("Origin", "https://evil.example")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -602,7 +657,7 @@ func TestProviderSocketOriginPolicy(t *testing.T) {
 
 	// The request host is the allowed origin.
 	origin := strings.Replace(env.guard.URL, "http://", "http://", 1)
-	client := dialGuardSocket(t, env, "/provider/v1/responses", origin)
+	client := dialGuardSocket(t, env, env.path("responses", "/responses"), origin)
 	writeSocketJSON(t, client, `{"type":"response.create","model":"vendor/big","input":[]}`)
 	if kind := socketFrameType(t, readSocketMessage(t, client, 2*time.Second)); kind != "response.completed" {
 		t.Fatalf("same-origin turn=%q", kind)
@@ -610,17 +665,15 @@ func TestProviderSocketOriginPolicy(t *testing.T) {
 }
 
 func TestProviderSocketBackendFailureIsHTTP(t *testing.T) {
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte(`{"error":"native down"}`))
 	})
-	target := "ws" + strings.TrimPrefix(env.guard.URL, "http") + "/provider/v1/responses"
-	header := http.Header{}
-	header.Set("Authorization", "Bearer provider-key")
+	target := "ws" + strings.TrimPrefix(env.path("responses", "/responses"), "http")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_, resp, err := websocket.Dial(ctx, target, &websocket.DialOptions{HTTPHeader: header})
+	_, resp, err := websocket.Dial(ctx, target, nil)
 	if err == nil {
 		t.Fatal("a failed backend upgrade must not be accepted")
 	}
@@ -638,16 +691,12 @@ func TestProviderSocketModeOffClosesNextTurn(t *testing.T) {
 			_ = c.Write(ctx, websocket.MessageText, []byte(`{"type":"response.completed","response":{"id":"resp_1","model":"vendor/big","status":"completed"}}`))
 		}
 	})
-	client := dialGuardSocket(t, env, "/provider/v1/responses", "")
+	client := dialGuardSocket(t, env, env.path("responses", "/responses"), "")
 	writeSocketJSON(t, client, `{"type":"response.create","model":"vendor/big","input":[]}`)
 	if kind := socketFrameType(t, readSocketMessage(t, client, 2*time.Second)); kind != "response.completed" {
 		t.Fatalf("first turn=%q", kind)
 	}
-	cfg := mustConfig(t, env.store)
-	cfg.ProviderEnabled = false
-	if err := env.svc.Configure(cfg); err != nil {
-		t.Fatal(err)
-	}
+	env.disableProtection(t)
 	writeSocketJSON(t, client, `{"type":"response.create","model":"vendor/big","input":[]}`)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -668,7 +717,7 @@ func TestProviderSocketPreviousResponseIDPassesThrough(t *testing.T) {
 			_ = c.Write(ctx, websocket.MessageText, []byte(`{"type":"response.completed","response":{"id":"resp_2","model":"vendor/big","status":"completed"}}`))
 		}
 	})
-	client := dialGuardSocket(t, env, "/provider/v1/responses", "")
+	client := dialGuardSocket(t, env, env.path("responses", "/responses"), "")
 	frame := `{"type":"response.create","model":"vendor/big","previous_response_id":"resp_1","input":[{"type":"message","role":"user","content":"hi"}]}`
 	writeSocketJSON(t, client, frame)
 	_ = readSocketMessage(t, client, 2*time.Second)
@@ -687,7 +736,7 @@ func TestProviderSocketBinaryFrameCloses1003(t *testing.T) {
 			}
 		}
 	})
-	client := dialGuardSocket(t, env, "/provider/v1/responses", "")
+	client := dialGuardSocket(t, env, env.path("responses", "/responses"), "")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := client.Write(ctx, websocket.MessageBinary, []byte{1, 2, 3}); err != nil {
@@ -746,7 +795,7 @@ func TestProviderSocketJudgedTerminalReleasesTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	env.svc.mu.Unlock()
-	client := dialGuardSocket(t, env, "/provider/v1/responses", "")
+	client := dialGuardSocket(t, env, env.path("responses", "/responses"), "")
 	for turn := 1; turn <= 2; turn++ {
 		writeSocketJSON(t, client, `{"type":"response.create","model":"vendor/big","input":[]}`)
 		for _, want := range []string{"response.created", "response.completed"} {
@@ -774,7 +823,7 @@ func TestProviderSocketLargeTerminalReleasesNextTurn(t *testing.T) {
 			_ = c.Write(ctx, websocket.MessageText, []byte(fmt.Sprintf(`{"response":{"id":%q,"model":"vendor/big","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":%q}]}]},"type":"response.completed"}`, id, big)))
 		}
 	})
-	client := dialGuardSocket(t, env, "/provider/v1/responses", "")
+	client := dialGuardSocket(t, env, env.path("responses", "/responses"), "")
 	for turn := 1; turn <= 2; turn++ {
 		writeSocketJSON(t, client, `{"type":"response.create","model":"vendor/big","input":[]}`)
 		for _, want := range []string{"response.created", "response.completed"} {

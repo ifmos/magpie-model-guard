@@ -4,11 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -62,36 +66,162 @@ func (n *nativeRecorder) count() int {
 
 type nativeHandler func(w http.ResponseWriter, r *http.Request, body []byte)
 
-type providerEnv struct {
-	svc    *Service
-	store  *Store
-	native *httptest.Server
-	guard  *httptest.Server
-	rec    *nativeRecorder
+// supplierEnv drives the supplier takeover endpoint. Magpie itself is not part
+// of these tests: the vendor server plays the role of the prepared upstream,
+// and the managed providers.json base URLs are used exactly as Magpie would.
+type supplierEnv struct {
+	svc       *Service
+	store     *Store
+	vendor    *httptest.Server
+	guard     *httptest.Server
+	rec       *nativeRecorder
+	configDir string
+	bases     map[string]string
 }
 
-func newProviderEnv(t *testing.T, handler nativeHandler) *providerEnv {
+var supplierVendorPaths = map[string]string{
+	"chat":      "/chat/v1",
+	"responses": "/responses/v1",
+	"anthropic": "/anthropic",
+	"gemini":    "/gemini/v1beta",
+}
+
+func newSupplierEnv(t *testing.T, handler nativeHandler) *supplierEnv {
 	t.Helper()
 	svc, store := newRuleTestService(t)
 	rec := &nativeRecorder{}
-	native := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	vendor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		rec.record(r, body)
 		handler(w, r, body)
 	}))
-	t.Cleanup(native.Close)
-	cfg := mustConfig(t, store)
-	cfg.GatewayURL = native.URL
-	cfg.GatewayKey = "gw-key"
-	cfg.ProviderEnabled = true
-	cfg.ProviderKey = "provider-key"
-	cfg.ProviderAttempts = 2
-	if err := svc.Configure(cfg); err != nil {
+	t.Cleanup(vendor.Close)
+
+	configDir := filepath.Join(t.TempDir(), "magpie")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	providers := map[string]any{"providers": []any{map[string]any{
+		"id":        "vendor",
+		"name":      "Vendor",
+		"preset":    "custom",
+		"chat":      vendor.URL + "/chat/v1",
+		"responses": vendor.URL + "/responses/v1",
+		"anthropic": vendor.URL + "/anthropic/v1",
+		"gemini":    vendor.URL + "/gemini/v1beta",
+		"models":    []any{"vendor/big"},
+	}}}
+	raw, err := json.MarshalIndent(providers, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal providers: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "providers.json"), append(raw, '\n'), 0o600); err != nil {
+		t.Fatalf("write providers: %v", err)
+	}
+	// Magpie's wire name is a vendor-specific mapping; keep it equal to the
+	// monitored model prefix so business requests can select a target.
+	if err := os.WriteFile(filepath.Join(configDir, "settings.json"),
+		[]byte(`{"modelWires":{"vendor/*":"vendor/*"}}`), 0o600); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	guard := httptest.NewServer(registerGuardRoutes(http.NewServeMux(), svc))
+	t.Cleanup(guard.Close)
+	svc.suppliers = newSupplierController(store, configDir, guard.URL)
+	if err := svc.suppliers.setProtection(context.Background(), "vendor", true); err != nil {
+		t.Fatalf("enable protection: %v", err)
+	}
+	managed, err := os.ReadFile(filepath.Join(configDir, "providers.json"))
+	if err != nil {
+		t.Fatalf("read managed providers: %v", err)
+	}
+	var snapshot struct {
+		Providers []struct {
+			Chat      string `json:"chat"`
+			Responses string `json:"responses"`
+			Anthropic string `json:"anthropic"`
+			Gemini    string `json:"gemini"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(managed, &snapshot); err != nil {
+		t.Fatalf("unmarshal managed providers: %v", err)
+	}
+	if len(snapshot.Providers) != 1 {
+		t.Fatalf("managed providers=%d", len(snapshot.Providers))
+	}
+	provider := snapshot.Providers[0]
+	env := &supplierEnv{
+		svc: svc, store: store, vendor: vendor, guard: guard, rec: rec, configDir: configDir,
+		bases: map[string]string{
+			"chat":      provider.Chat,
+			"responses": provider.Responses,
+			"anthropic": provider.Anthropic,
+			"gemini":    provider.Gemini,
+		},
+	}
+	env.configure(t, 2, nil)
+	return env
+}
+
+func (e *supplierEnv) configure(t *testing.T, attempts int, mutate func(*GuardConfig)) {
+	t.Helper()
+	cfg := mustConfig(t, e.store)
+	cfg.GatewayURL = e.vendor.URL
+	cfg.GatewayKey = "gateway-key"
+	cfg.ResponseModelMode = ResponseModelOn
+	cfg.ProviderAttempts = attempts
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	if err := e.svc.Configure(cfg); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
-	guard := httptest.NewServer(registerProvider(http.NewServeMux(), svc))
-	t.Cleanup(guard.Close)
-	return &providerEnv{svc: svc, store: store, native: native, guard: guard, rec: rec}
+}
+
+func (e *supplierEnv) path(protocol, suffix string) string {
+	return e.bases[protocol] + suffix
+}
+
+func (e *supplierEnv) token(t *testing.T) string {
+	t.Helper()
+	rest := strings.TrimPrefix(e.bases["chat"], e.guard.URL+"/upstream/")
+	token, _, ok := strings.Cut(rest, "/")
+	if !ok || token == "" {
+		t.Fatalf("managed chat base %q has no route token", e.bases["chat"])
+	}
+	return token
+}
+
+func (e *supplierEnv) saveTarget(t *testing.T, target *Target) {
+	t.Helper()
+	e.svc.mu.Lock()
+	defer e.svc.mu.Unlock()
+	if err := e.store.SaveTarget(target); err != nil {
+		t.Fatalf("SaveTarget: %v", err)
+	}
+}
+
+func (e *supplierEnv) disableProtection(t *testing.T) {
+	t.Helper()
+	if err := e.svc.suppliers.setProtection(context.Background(), "vendor", false); err != nil {
+		t.Fatalf("disable protection: %v", err)
+	}
+}
+
+func (e *supplierEnv) call(t *testing.T, method, target string, body []byte, headers map[string]string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, target, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
 }
 
 func jsonOK(w http.ResponseWriter, body string) {
@@ -99,188 +229,104 @@ func jsonOK(w http.ResponseWriter, body string) {
 	_, _ = io.WriteString(w, body)
 }
 
-func providerCall(t *testing.T, env *providerEnv, method, path string, body []byte, headers map[string]string) *http.Response {
+func customTarget(model string, rule ResponseModelRule) *Target {
+	return &Target{
+		Model: model, Enabled: true,
+		ResponseRuleMode:   ResponseRuleCustom,
+		ResponseModelRules: []ResponseModelRule{rule},
+	}
+}
+
+func newSupplierRuleEnv(t *testing.T, handler nativeHandler, rule ResponseModelRule, attempts int) *supplierEnv {
 	t.Helper()
-	req, err := http.NewRequest(method, env.guard.URL+path, bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for key, value := range headers {
-		req.Header.Set(key, value)
-	}
-	if req.Header.Get("Authorization") == "" && req.Header.Get("X-Goog-Api-Key") == "" {
-		if !strings.Contains(path, "key=provider-key") {
-			req.Header.Set("Authorization", "Bearer provider-key")
-		}
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return resp
+	env := newSupplierEnv(t, handler)
+	env.saveTarget(t, customTarget("vendor/big", rule))
+	env.configure(t, attempts, nil)
+	return env
 }
 
-func providerChatRequest(t *testing.T, url, key string, stream bool) *http.Response {
-	t.Helper()
-	body := fmt.Sprintf(`{"model":"vendor/big","stream":%v,"messages":[{"role":"user","content":"hi"}]}`, stream)
-	req, err := http.NewRequest(http.MethodPost, url+providerChatPath, strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+key)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return resp
-}
-
-type fakeProviderUpstream struct {
-	models []string
-	stream bool
-	calls  atomic.Int32
-	t      *testing.T
-}
-
-func (f *fakeProviderUpstream) handler(w http.ResponseWriter, r *http.Request, _ []byte) {
-	if r.URL.Path == "/v1/models" {
-		jsonOK(w, `{"object":"list","data":[{"id":"vendor/big","object":"model"}]}`)
-		return
-	}
-	i := int(f.calls.Add(1)) - 1
-	model := f.models[len(f.models)-1]
-	if i < len(f.models) {
-		model = f.models[i]
-	}
-	if f.stream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		flusher, _ := w.(http.Flusher)
-		_, _ = fmt.Fprintf(w, "data: {\"model\":%q,\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n", model)
-		if flusher != nil {
-			flusher.Flush()
-		}
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"model": model,
-		"choices": []any{map[string]any{
-			"message":       map[string]string{"content": "ok"},
-			"finish_reason": "stop",
-		}},
-	})
-}
-
-func newProviderTestService(t *testing.T, upstream *fakeProviderUpstream, attempts int) (*Service, *Store, *httptest.Server) {
-	t.Helper()
-	env := newProviderEnv(t, upstream.handler)
-	env.svc.mu.Lock()
-	_ = env.store.SaveTarget(&Target{
-		Model: "vendor/big", Enabled: true, IntervalMin: 30,
-		ResponseRuleMode: ResponseRuleCustom,
-		ResponseModelRules: []ResponseModelRule{{
-			ID: "r-flash", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionDisable,
-		}},
-	})
-	env.svc.mu.Unlock()
-	cfg := mustConfig(t, env.store)
-	cfg.ProviderAttempts = attempts
-	if err := env.svc.Configure(cfg); err != nil {
-		t.Fatalf("Configure: %v", err)
-	}
-	return env.svc, env.store, env.guard
-}
-
-// routeCase exercises the native wire mapping for one allowlisted endpoint.
+// routeCase exercises the vendor wire mapping Magpie prepares for one endpoint.
 type routeCase struct {
-	clientPath string
-	nativePath string
-	method     string
-	body       string
-	query      string
+	name         string
+	protocol     string
+	suffix       string
+	nativeSuffix string
+	method       string
+	body         string
+	query        string
 }
 
-func TestProviderRoutesForwardNatively(t *testing.T) {
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+func TestSupplierProxyForwardsNativeRoutes(t *testing.T) {
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		jsonOK(w, `{"ok":true}`)
 	})
 	cases := []routeCase{
-		{providerChatPath, "/v1/chat/completions", http.MethodPost, `{"model":"vendor/ok"}`, ""},
-		{"/provider/chat/completions", "/chat/completions", http.MethodPost, `{"model":"vendor/ok"}`, ""},
-		{"/provider/v1/responses", "/v1/responses", http.MethodPost, `{"model":"vendor/ok","input":"hi"}`, ""},
-		{"/provider/backend-api/codex/responses", "/backend-api/codex/responses", http.MethodPost, `{"model":"vendor/ok"}`, ""},
-		{"/provider/v1/messages", "/v1/messages", http.MethodPost, `{"model":"vendor/ok"}`, ""},
-		{"/provider/v1beta/models/gemini-2.5-flash:generateContent", "/v1beta/models/gemini-2.5-flash:generateContent", http.MethodPost, `{"contents":[]}`, ""},
-		{"/provider/v1beta/models/google%2Fgemini:streamGenerateContent", "/v1beta/models/google%2Fgemini:streamGenerateContent", http.MethodPost, `{"contents":[]}`, "alt=sse"},
-		{"/provider/v1beta/models/google/gemini:generateContent", "/v1beta/models/google/gemini:generateContent", http.MethodPost, `{"contents":[]}`, ""},
-		{"/provider/v1/messages/count_tokens", "/v1/messages/count_tokens", http.MethodPost, `{"model":"vendor/ok"}`, ""},
-		{"/provider/v1beta/models/gemini-2.5-flash:countTokens", "/v1beta/models/gemini-2.5-flash:countTokens", http.MethodPost, `{"contents":[]}`, ""},
-		{"/provider/v1/systemone", "/v1/systemone", http.MethodPost, `{}`, ""},
-		{"/provider/v1/alpha/search", "/v1/alpha/search", http.MethodPost, `{}`, ""},
-		{"/provider/alpha/search", "/alpha/search", http.MethodPost, `{}`, ""},
-		{"/provider/v1/images/generations", "/v1/images/generations", http.MethodPost, `{}`, ""},
-		{"/provider/v1/images/edits", "/v1/images/edits", http.MethodPost, "raw-bytes", ""},
-		{"/provider/v1/embeddings", "/v1/embeddings", http.MethodPost, `{}`, ""},
-		{"/provider/v1/rerank", "/v1/rerank", http.MethodPost, `{}`, ""},
-		{"/provider/v1/audio/transcriptions", "/v1/audio/transcriptions", http.MethodPost, "audio", ""},
-		{"/provider/v1/audio/translations", "/v1/audio/translations", http.MethodPost, "audio", ""},
-		{"/provider/v1/audio/speech", "/v1/audio/speech", http.MethodPost, `{}`, ""},
-		{"/provider/audio/speech", "/audio/speech", http.MethodPost, `{}`, ""},
-		{"/provider/v1/videos", "/v1/videos", http.MethodPost, `{}`, ""},
-		{"/provider/videos", "/videos", http.MethodPost, `{}`, ""},
-		{"/provider/v1/videos/vid_123", "/v1/videos/vid_123", http.MethodGet, "", ""},
-		{"/provider/v1/videos/vid_123/content", "/v1/videos/vid_123/content", http.MethodGet, "", ""},
-		{"/provider/videos/vid_123/content", "/videos/vid_123/content", http.MethodGet, "", ""},
-		{"/provider/", "/", http.MethodGet, "", ""},
-		{"/provider/v1", "/v1", http.MethodGet, "", ""},
-		{"/provider/v1/", "/v1/", http.MethodGet, "", ""},
-		{"/provider/v1/models", "/v1/models", http.MethodGet, "", ""},
-		{"/provider/models", "/models", http.MethodGet, "", ""},
-		{"/provider/v1/models/vendor/extra", "/v1/models/vendor/extra", http.MethodGet, "", ""},
-		{"/provider/v1beta/models", "/v1beta/models", http.MethodGet, "", ""},
-		{"/provider/v1/codex/models", "/v1/codex/models", http.MethodGet, "", ""},
-		{"/provider/backend-api/codex/models", "/backend-api/codex/models", http.MethodGet, "", ""},
-		{"/provider/muse-code/models", "/muse-code/models", http.MethodGet, "", ""},
-		{"/provider/api/hello", "/api/hello", http.MethodGet, "", ""},
-		{"/provider/api/version", "/api/version", http.MethodGet, "", ""},
-		{"/provider/api/tags", "/api/tags", http.MethodGet, "", ""},
-		{"/provider/api/show", "/api/show", http.MethodPost, `{"model":"vendor/ok"}`, ""},
-		{"/provider/api/chat", "/api/chat", http.MethodPost, `{"model":"vendor/ok","messages":[]}`, ""},
-		{"/provider/api/generate", "/api/generate", http.MethodPost, `{"model":"vendor/ok","prompt":"hi"}`, ""},
-		{"/provider/backend-api/codex/responses/compact", "/backend-api/codex/responses/compact", http.MethodPost, `{"model":"vendor/ok"}`, ""},
-		{"/provider/backend-api/codex/alpha/search", "/backend-api/codex/alpha/search", http.MethodPost, `{}`, ""},
+		{name: "chat completions", protocol: "chat", suffix: "/chat/completions", nativeSuffix: "/chat/completions", method: http.MethodPost, body: `{"model":"vendor/ok","messages":[]}`},
+		{name: "responses", protocol: "responses", suffix: "/responses", nativeSuffix: "/responses", method: http.MethodPost, body: `{"model":"vendor/ok","input":"hi"}`},
+		{name: "responses compact", protocol: "responses", suffix: "/responses/compact", nativeSuffix: "/responses/compact", method: http.MethodPost, body: `{"model":"vendor/ok"}`},
+		{name: "anthropic messages", protocol: "anthropic", suffix: "/v1/messages", nativeSuffix: "/v1/messages", method: http.MethodPost, body: `{"model":"vendor/ok","messages":[]}`},
+		{name: "anthropic count tokens", protocol: "anthropic", suffix: "/v1/messages/count_tokens", nativeSuffix: "/v1/messages/count_tokens", method: http.MethodPost, body: `{"model":"vendor/ok"}`},
+		{name: "gemini generate", protocol: "gemini", suffix: "/models/gemini-2.5-flash:generateContent", nativeSuffix: "/models/gemini-2.5-flash:generateContent", method: http.MethodPost, body: `{"contents":[]}`},
+		{name: "gemini escaped stream", protocol: "gemini", suffix: "/models/google%2Fgemini:streamGenerateContent", nativeSuffix: "/models/google/gemini:streamGenerateContent", method: http.MethodPost, body: `{"contents":[]}`, query: "alt=sse"},
+		{name: "gemini count tokens", protocol: "gemini", suffix: "/models/gemini-2.5-flash:countTokens", nativeSuffix: "/models/gemini-2.5-flash:countTokens", method: http.MethodPost, body: `{"contents":[]}`},
+		{name: "system one", protocol: "responses", suffix: "/systemone", nativeSuffix: "/systemone", method: http.MethodPost, body: `{}`},
+		{name: "alpha search", protocol: "chat", suffix: "/alpha/search", nativeSuffix: "/alpha/search", method: http.MethodPost, body: `{}`},
+		{name: "images generations", protocol: "chat", suffix: "/images/generations", nativeSuffix: "/images/generations", method: http.MethodPost, body: `{}`},
+		{name: "images edits", protocol: "chat", suffix: "/images/edits", nativeSuffix: "/images/edits", method: http.MethodPost, body: "raw-multipart-bytes"},
+		{name: "embeddings", protocol: "chat", suffix: "/embeddings", nativeSuffix: "/embeddings", method: http.MethodPost, body: `{}`},
+		{name: "rerank", protocol: "chat", suffix: "/rerank", nativeSuffix: "/rerank", method: http.MethodPost, body: `{}`},
+		{name: "audio transcriptions", protocol: "chat", suffix: "/audio/transcriptions", nativeSuffix: "/audio/transcriptions", method: http.MethodPost, body: "audio-bytes"},
+		{name: "audio speech", protocol: "chat", suffix: "/audio/speech", nativeSuffix: "/audio/speech", method: http.MethodPost, body: `{}`},
+		{name: "videos create", protocol: "chat", suffix: "/videos", nativeSuffix: "/videos", method: http.MethodPost, body: `{}`},
+		{name: "video poll", protocol: "chat", suffix: "/videos/vid_123", nativeSuffix: "/videos/vid_123", method: http.MethodGet},
+		{name: "video content", protocol: "chat", suffix: "/videos/vid_123/content", nativeSuffix: "/videos/vid_123/content", method: http.MethodGet},
+		{name: "models catalog", protocol: "chat", suffix: "/models", nativeSuffix: "/models", method: http.MethodGet},
+		{name: "model by escaped id", protocol: "chat", suffix: "/models/vendor%2Fextra", nativeSuffix: "/models/vendor/extra", method: http.MethodGet},
+		{name: "codex models", protocol: "chat", suffix: "/codex/models", nativeSuffix: "/codex/models", method: http.MethodGet},
 	}
 	for _, tc := range cases {
-		t.Run(strings.ReplaceAll(tc.clientPath, "/", "_"), func(t *testing.T) {
-			url := tc.clientPath
+		t.Run(tc.name, func(t *testing.T) {
+			target := env.path(tc.protocol, tc.suffix)
 			if tc.query != "" {
-				url += "?" + tc.query
+				target += "?" + tc.query
 			}
-			resp := providerCall(t, env, tc.method, url, []byte(tc.body), map[string]string{
-				"Content-Type":        "application/json",
-				"Cookie":              "mg_session=secret",
-				"Proxy-Authorization": "Basic x",
-				"X-Forwarded-For":     "10.0.0.1",
-				"Anthropic-Version":   "2023-06-01",
-				"X-Magpie-Session":    "session-1",
-			})
+			headers := map[string]string{
+				"Content-Type":          "application/json",
+				"Authorization":         "Bearer vendor-key",
+				"Cookie":                "vendor-session=selected",
+				"Proxy-Authorization":   "Basic x",
+				"X-Forwarded-For":       "10.0.0.1",
+				"Anthropic-Version":     "2023-06-01",
+				"X-Magpie-Session":      "session-1",
+				"X-Model-Guard-Session": "must-not-leak",
+			}
+			if tc.name == "images edits" || tc.name == "audio transcriptions" {
+				headers["Content-Type"] = "multipart/form-data; boundary=abc123"
+			}
+			before := env.rec.count()
+			resp := env.call(t, tc.method, target, []byte(tc.body), headers)
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("%s %s status=%d", tc.method, url, resp.StatusCode)
+				t.Fatalf("%s %s status=%d", tc.method, target, resp.StatusCode)
+			}
+			if got := env.rec.count(); got != before+1 {
+				t.Fatalf("native calls=%d, want %d", got, before+1)
 			}
 			got := env.rec.last()
-			if got.method != tc.method || got.escaped != tc.nativePath {
-				t.Fatalf("native got %s %s, want %s %s", got.method, got.escaped, tc.method, tc.nativePath)
+			wantPath := supplierVendorPaths[tc.protocol] + tc.nativeSuffix
+			if got.method != tc.method || got.path != wantPath {
+				t.Fatalf("native got %s %s, want %s %s", got.method, got.path, tc.method, wantPath)
 			}
-			if got.query != tc.query && !(tc.query == "" && got.query == "") {
+			if got.query != tc.query {
 				t.Fatalf("native query=%q, want %q", got.query, tc.query)
 			}
-			if got.header.Get("Authorization") != "Bearer gw-key" {
-				t.Fatalf("native Authorization=%q", got.header.Get("Authorization"))
+			if got.header.Get("Authorization") != "Bearer vendor-key" {
+				t.Fatalf("vendor Authorization=%q", got.header.Get("Authorization"))
 			}
-			for _, removed := range []string{"Cookie", "Proxy-Authorization", "X-Forwarded-For"} {
+			if got.header.Get("Cookie") != "vendor-session=selected" {
+				t.Fatalf("vendor Cookie=%q", got.header.Get("Cookie"))
+			}
+			for _, removed := range []string{"Proxy-Authorization", "X-Forwarded-For", "X-Model-Guard-Session"} {
 				if value := got.header.Get(removed); value != "" {
 					t.Fatalf("%s leaked upstream: %q", removed, value)
 				}
@@ -288,7 +334,7 @@ func TestProviderRoutesForwardNatively(t *testing.T) {
 			if got.header.Get("Anthropic-Version") != "2023-06-01" || got.header.Get("X-Magpie-Session") != "session-1" {
 				t.Fatalf("end-to-end headers dropped: %v", got.header)
 			}
-			if tc.method == http.MethodPost && got.body != nil && string(got.body) != tc.body {
+			if tc.method == http.MethodPost && !bytes.Equal(got.body, []byte(tc.body)) {
 				t.Fatalf("native body=%q, want %q", got.body, tc.body)
 			}
 			if strings.Contains(string(got.body), ProbeAliasPrefix) {
@@ -298,39 +344,56 @@ func TestProviderRoutesForwardNatively(t *testing.T) {
 	}
 }
 
-func TestProviderModelQueryCredentialIsStripped(t *testing.T) {
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
-		jsonOK(w, `{"object":"list","data":[]}`)
+func TestSupplierProxyBinaryResponsesPassThrough(t *testing.T) {
+	video := []byte{0x00, 0x01, 0x02, 0xff, 0xfe}
+	audio := []byte("ID3-audio-bytes")
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/content"):
+			if r.Header.Get("Range") != "bytes=0-4" {
+				t.Errorf("Range dropped: %q", r.Header.Get("Range"))
+			}
+			w.Header().Set("Content-Type", "video/mp4")
+			w.Header().Set("Content-Range", "bytes 0-4/5")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(video)
+		default:
+			w.Header().Set("Content-Type", "audio/mpeg")
+			_, _ = w.Write(audio)
+		}
 	})
-	resp := providerCall(t, env, http.MethodGet, "/provider/v1/models?format=json&key=provider-key", nil, nil)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status=%d", resp.StatusCode)
+	resp := env.call(t, http.MethodGet, env.path("chat", "/videos/vid_123/content"), nil, map[string]string{"Range": "bytes=0-4"})
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(body, video) {
+		t.Fatalf("video status=%d len=%d", resp.StatusCode, len(body))
 	}
-	got := env.rec.last()
-	if got.query != "format=json" {
-		t.Fatalf("native query=%q, want format=json", got.query)
+	if resp.Header.Get("Content-Range") != "bytes 0-4/5" {
+		t.Fatalf("Content-Range=%q", resp.Header.Get("Content-Range"))
 	}
-	if got.header.Get("Authorization") != "Bearer gw-key" {
-		t.Fatalf("native auth=%q", got.header.Get("Authorization"))
+	resp = env.call(t, http.MethodPost, env.path("chat", "/audio/speech"), []byte(`{}`), map[string]string{"Content-Type": "application/json"})
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !bytes.Equal(body, audio) || resp.Header.Get("Content-Type") != "audio/mpeg" {
+		t.Fatalf("audio status=%d type=%q body=%q", resp.StatusCode, resp.Header.Get("Content-Type"), body)
 	}
 }
 
-func TestProviderRejectsUnknownAndManagementPaths(t *testing.T) {
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
-		t.Errorf("unknown path reached native: %s", r.URL.Path)
+func TestSupplierProxyRejectsUnboundUpstreamPaths(t *testing.T) {
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+		t.Errorf("unbound path reached vendor: %s", r.URL.Path)
 	})
-	paths := []string{
-		"/provider/v1/magpie/keys", "/provider/v1/magpie/restart", "/provider/v1/heap",
-		"/provider/mcp/tools", "/provider/v1/chat%2Fcompletions", "/provider/v1/../admin",
-		"/provider/api/../v1/magpie/keys",
-	}
-	for _, path := range paths {
+	token := env.token(t)
+	for _, path := range []string{
+		"/upstream",
+		"/upstream/" + token,
+		"/upstream/not-a-token/chat/v1/models",
+		"/upstream/" + token + "/decide/v1/models",
+	} {
 		req, err := http.NewRequest(http.MethodGet, env.guard.URL+path, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		req.Header.Set("Authorization", "Bearer provider-key")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -341,37 +404,20 @@ func TestProviderRejectsUnknownAndManagementPaths(t *testing.T) {
 		}
 	}
 	if got := env.rec.count(); got != 0 {
-		t.Fatalf("native calls=%d, want 0", got)
+		t.Fatalf("vendor calls=%d, want 0", got)
 	}
 }
 
-func TestProviderMethodNotAllowed(t *testing.T) {
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
-		t.Errorf("wrong method reached native")
-	})
-	resp := providerCall(t, env, http.MethodGet, providerChatPath, nil, nil)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("status=%d", resp.StatusCode)
-	}
-	if allow := resp.Header.Get("Allow"); !strings.Contains(allow, http.MethodPost) {
-		t.Fatalf("Allow=%q", allow)
-	}
-	if env.rec.count() != 0 {
-		t.Fatal("wrong method must not reach native")
-	}
-}
-
-func TestProviderCatalogPassthrough(t *testing.T) {
+func TestSupplierCatalogPassthrough(t *testing.T) {
 	catalog := `{"object":"list","data":[{"id":"vendor/unknown","object":"model","context_window":128000,` +
 		`"modalities":["text","image"],"reasoning_levels":["low","high"],"native_endpoints":{"chat":true},` +
 		`"pricing":{"input":1},"service_tiers":["flex"],"future_field":{"nested":true}}],"has_more":false}`
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Extra", "keep")
 		_, _ = io.WriteString(w, catalog)
 	})
-	resp := providerCall(t, env, http.MethodGet, providerModelsPath, nil, nil)
+	resp := env.call(t, http.MethodGet, env.path("chat", "/models"), nil, nil)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != catalog {
@@ -382,9 +428,9 @@ func TestProviderCatalogPassthrough(t *testing.T) {
 	}
 }
 
-func TestProviderNativeErrorsPassThrough(t *testing.T) {
+func TestSupplierNativeErrorsPassThrough(t *testing.T) {
 	for _, status := range []int{http.StatusUnauthorized, http.StatusTooManyRequests, http.StatusNotFound} {
-		env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+		env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 			w.Header().Set("Content-Type", "application/json")
 			if status == http.StatusTooManyRequests {
 				w.Header().Set("Retry-After", "7")
@@ -392,7 +438,7 @@ func TestProviderNativeErrorsPassThrough(t *testing.T) {
 			w.WriteHeader(status)
 			_, _ = io.WriteString(w, `{"error":{"message":"native"}}`)
 		})
-		resp := providerCall(t, env, http.MethodGet, providerModelsPath, nil, nil)
+		resp := env.call(t, http.MethodGet, env.path("chat", "/models"), nil, nil)
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode != status || !strings.Contains(string(body), "native") {
@@ -404,55 +450,50 @@ func TestProviderNativeErrorsPassThrough(t *testing.T) {
 	}
 }
 
-func TestProviderUnmonitoredModelIsCallable(t *testing.T) {
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+func TestSupplierUnmonitoredModelIsCallable(t *testing.T) {
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		jsonOK(w, `{"model":"vendor/other"}`)
 	})
-	env.svc.mu.Lock()
-	if err := env.store.SaveTarget(&Target{Model: "vendor/big", Enabled: true}); err != nil {
-		t.Fatal(err)
-	}
-	env.svc.mu.Unlock()
-	resp := providerCall(t, env, http.MethodPost, providerChatPath, []byte(`{"model":"vendor/other"}`), nil)
+	env.saveTarget(t, &Target{Model: "vendor/big", Enabled: true})
+	body := []byte(`{"model":"vendor/other"}`)
+	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"), body, nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
-	if got := env.rec.last().body; string(got) != `{"model":"vendor/other"}` {
+	if got := env.rec.last().body; string(got) != string(body) {
 		t.Fatalf("model rewritten: %s", got)
 	}
 }
 
-func TestProviderBlockedTargetStopsBeforeUpstream(t *testing.T) {
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
-		t.Errorf("blocked target reached native")
+func TestSupplierBlockedTargetStopsBeforeUpstream(t *testing.T) {
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+		t.Errorf("blocked target reached vendor")
 	})
-	env.svc.mu.Lock()
-	if err := env.store.SaveTarget(&Target{Model: "vendor/big", Enabled: true, State: StateFailed}); err != nil {
-		t.Fatal(err)
-	}
-	env.svc.mu.Unlock()
-	resp := providerCall(t, env, http.MethodPost, providerChatPath, []byte(`{"model":"vendor/big"}`), nil)
+	env.saveTarget(t, &Target{Model: "vendor/big", Enabled: true, State: StateFailed})
+	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+		[]byte(`{"model":"vendor/big"}`), nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
 	if env.rec.count() != 0 {
-		t.Fatal("blocked target must not call upstream")
+		t.Fatal("blocked target must not call vendor")
 	}
 }
 
-func TestProviderProtocolsJudgeVendorModel(t *testing.T) {
+func TestSupplierProtocolsJudgeVendorModel(t *testing.T) {
 	type protocolCase struct {
-		name    string
-		path    string
-		request string
-		respond func(w http.ResponseWriter, model string)
-		want    string
+		name     string
+		protocol string
+		suffix   string
+		request  string
+		respond  func(w http.ResponseWriter, model string)
+		want     string
 	}
 	cases := []protocolCase{
 		{
-			name: "chat", path: providerChatPath,
+			name: "chat", protocol: "chat", suffix: "/chat/completions",
 			request: `{"model":"vendor/big","messages":[]}`,
 			respond: func(w http.ResponseWriter, model string) {
 				jsonOK(w, fmt.Sprintf(`{"model":%q,"choices":[{"message":{"content":"ok"}}]}`, model))
@@ -460,7 +501,7 @@ func TestProviderProtocolsJudgeVendorModel(t *testing.T) {
 			want: `"vendor/big"`,
 		},
 		{
-			name: "responses", path: "/provider/v1/responses",
+			name: "responses", protocol: "responses", suffix: "/responses",
 			request: `{"model":"vendor/big","input":"hi"}`,
 			respond: func(w http.ResponseWriter, model string) {
 				jsonOK(w, fmt.Sprintf(`{"object":"response","response":{"model":%q}}`, model))
@@ -468,7 +509,7 @@ func TestProviderProtocolsJudgeVendorModel(t *testing.T) {
 			want: `"vendor/big"`,
 		},
 		{
-			name: "anthropic", path: "/provider/v1/messages",
+			name: "anthropic", protocol: "anthropic", suffix: "/v1/messages",
 			request: `{"model":"vendor/big","messages":[]}`,
 			respond: func(w http.ResponseWriter, model string) {
 				jsonOK(w, fmt.Sprintf(`{"type":"message","message":{"model":%q}}`, model))
@@ -476,7 +517,7 @@ func TestProviderProtocolsJudgeVendorModel(t *testing.T) {
 			want: `"vendor/big"`,
 		},
 		{
-			name: "gemini", path: "/provider/v1beta/models/vendor%2Fbig:generateContent",
+			name: "gemini", protocol: "gemini", suffix: "/models/vendor%2Fbig:generateContent",
 			request: `{"contents":[]}`,
 			respond: func(w http.ResponseWriter, model string) {
 				jsonOK(w, fmt.Sprintf(`{"modelVersion":%q,"candidates":[]}`, model))
@@ -487,11 +528,11 @@ func TestProviderProtocolsJudgeVendorModel(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls atomic.Int32
-			env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+			var env *supplierEnv
+			env = newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 				calls.Add(1)
 				if r.Header.Get("X-Magpie-Response-Model") != "vendor" {
-					tc.respond(w, "vendor/big")
-					return
+					t.Errorf("vendor naming preference lost: %q", r.Header.Get("X-Magpie-Response-Model"))
 				}
 				if r.Header.Get("Accept-Encoding") != "identity" {
 					t.Errorf("judged request must ask for identity encoding, got %q", r.Header.Get("Accept-Encoding"))
@@ -502,18 +543,12 @@ func TestProviderProtocolsJudgeVendorModel(t *testing.T) {
 				}
 				tc.respond(w, "vendor/big")
 			})
-			env.svc.mu.Lock()
-			if err := env.store.SaveTarget(&Target{
-				Model: "vendor/big", Enabled: true,
-				ResponseRuleMode: ResponseRuleCustom,
-				ResponseModelRules: []ResponseModelRule{{
-					ID: "r-flash", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionDisable,
-				}},
-			}); err != nil {
-				t.Fatal(err)
-			}
-			env.svc.mu.Unlock()
-			resp := providerCall(t, env, http.MethodPost, tc.path, []byte(tc.request), nil)
+			env.saveTarget(t, customTarget("vendor/big", ResponseModelRule{
+				ID: "r-flash", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionDisable,
+			}))
+			env.configure(t, 2, nil)
+			resp := env.call(t, http.MethodPost, env.path(tc.protocol, tc.suffix),
+				[]byte(tc.request), map[string]string{"X-Magpie-Response-Model": "vendor"})
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), tc.want) {
@@ -530,36 +565,37 @@ func TestProviderProtocolsJudgeVendorModel(t *testing.T) {
 	}
 }
 
-func TestProviderRecordDoesNotRetry(t *testing.T) {
+func TestSupplierRecordDoesNotRetry(t *testing.T) {
 	var calls atomic.Int32
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+	env := newSupplierRuleEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		calls.Add(1)
 		jsonOK(w, `{"model":"vendor/flash"}`)
-	})
-	env.svc.mu.Lock()
-	if err := env.store.SaveTarget(&Target{
-		Model: "vendor/big", Enabled: true,
-		ResponseRuleMode: ResponseRuleCustom,
-		ResponseModelRules: []ResponseModelRule{{
-			ID: "r-record", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionRecord,
-		}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	env.svc.mu.Unlock()
-	resp := providerCall(t, env, http.MethodPost, providerChatPath, []byte(`{"model":"vendor/big"}`), nil)
+	}, ResponseModelRule{
+		ID: "r-record", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionRecord,
+	}, 2)
+	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+		[]byte(`{"model":"vendor/big"}`), nil)
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || calls.Load() != 1 {
 		t.Fatalf("status=%d calls=%d body=%s", resp.StatusCode, calls.Load(), body)
 	}
+	target, _ := env.store.Target("vendor/big")
+	if target == nil || target.State == StateFailed {
+		t.Fatalf("record must not disable: %+v", target)
+	}
 }
 
-func TestProviderDisablesAfterAttempts(t *testing.T) {
-	up := &fakeProviderUpstream{models: []string{"vendor/flash", "vendor/flash"}}
-	_, store, ts := newProviderTestService(t, up, 2)
-
-	resp := providerChatRequest(t, ts.URL, "provider-key", false)
+func TestSupplierDisablesAfterAttempts(t *testing.T) {
+	var calls atomic.Int32
+	env := newSupplierRuleEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+		calls.Add(1)
+		jsonOK(w, `{"model":"vendor/flash"}`)
+	}, ResponseModelRule{
+		ID: "r-flash", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionDisable,
+	}, 2)
+	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+		[]byte(`{"model":"vendor/big"}`), nil)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), "已尝试 2 次") {
@@ -568,27 +604,54 @@ func TestProviderDisablesAfterAttempts(t *testing.T) {
 	if resp.Header.Get("Retry-After") != "1" {
 		t.Fatalf("Retry-After=%q", resp.Header.Get("Retry-After"))
 	}
-	if got := up.calls.Load(); got != 2 {
-		t.Fatalf("upstream calls=%d, want 2", got)
+	if calls.Load() != 2 {
+		t.Fatalf("vendor calls=%d, want 2", calls.Load())
 	}
-	target, _ := store.Target("vendor/big")
+	target, _ := env.store.Target("vendor/big")
 	if target == nil || target.State != StateFailed {
 		t.Fatalf("target not disabled: %+v", target)
 	}
 }
 
-func TestProviderRetriesStreaming(t *testing.T) {
-	up := &fakeProviderUpstream{models: []string{"vendor/flash", "vendor/big"}, stream: true}
-	_, _, ts := newProviderTestService(t, up, 2)
-
-	resp := providerChatRequest(t, ts.URL, "provider-key", true)
+func TestSupplierRetriesStreaming(t *testing.T) {
+	var calls atomic.Int32
+	env := newSupplierRuleEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+		n := calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		model := "vendor/flash"
+		if n > 1 {
+			model = "vendor/big"
+		}
+		_, _ = fmt.Fprintf(w, "data: {\"model\":%q,\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n", model)
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}, ResponseModelRule{
+		ID: "r-flash", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionDisable,
+	}, 2)
+	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+		[]byte(`{"model":"vendor/big","stream":true}`), nil)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `"vendor/big"`) || !strings.Contains(string(body), "[DONE]") {
 		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
 	}
-	if got := up.calls.Load(); got != 2 {
-		t.Fatalf("upstream calls=%d, want 2", got)
+	if calls.Load() != 2 {
+		t.Fatalf("vendor calls=%d, want 2", calls.Load())
+	}
+}
+
+func TestSupplierProtectionOffReturnsNotFound(t *testing.T) {
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+		t.Errorf("disabled protection reached vendor")
+	})
+	target := env.path("chat", "/models")
+	env.disableProtection(t)
+	resp := env.call(t, http.MethodGet, target, nil, nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("disabled protection status=%d, want 404", resp.StatusCode)
+	}
+	if env.rec.count() != 0 {
+		t.Fatal("disabled protection forwarded a request")
 	}
 }
 
@@ -610,99 +673,6 @@ func TestProviderJSONModelVariants(t *testing.T) {
 		if got := providerJSONModel([]byte(tc.body)); got != tc.want {
 			t.Fatalf("providerJSONModel(%s)=%q, want %q", tc.body, got, tc.want)
 		}
-	}
-}
-
-func TestProviderGatewayBaseV1IsStripped(t *testing.T) {
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
-		jsonOK(w, `{"ok":true}`)
-	})
-	cfg := mustConfig(t, env.store)
-	cfg.GatewayURL = env.native.URL + "/v1"
-	cfg.GatewayKey = "gw-key"
-	cfg.ProviderEnabled = true
-	cfg.ProviderKey = "provider-key"
-	if err := env.svc.Configure(cfg); err != nil {
-		t.Fatalf("Configure: %v", err)
-	}
-	resp := providerCall(t, env, http.MethodPost, "/provider/v1/chat/completions", []byte(`{"model":"vendor/ok"}`), nil)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status=%d", resp.StatusCode)
-	}
-	if got := env.rec.last().path; got != "/v1/chat/completions" {
-		t.Fatalf("native path=%q, want /v1/chat/completions", got)
-	}
-}
-
-func TestProviderAuthAndModelList(t *testing.T) {
-	up := &fakeProviderUpstream{models: []string{"vendor/big"}}
-	_, _, ts := newProviderTestService(t, up, 2)
-
-	resp, err := http.Get(ts.URL + providerModelsPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("missing key status=%d", resp.StatusCode)
-	}
-
-	req, _ := http.NewRequest(http.MethodGet, ts.URL+providerModelsPath, nil)
-	req.Header.Set("X-Api-Key", "provider-key")
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	var list struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != http.StatusOK || len(list.Data) != 1 || list.Data[0].ID != "vendor/big" {
-		t.Fatalf("status=%d list=%+v", resp.StatusCode, list)
-	}
-}
-
-func TestProviderCredentialConflicts(t *testing.T) {
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
-		t.Errorf("conflicting credentials reached native")
-	})
-	resp := providerCall(t, env, http.MethodGet, providerModelsPath, nil, map[string]string{
-		"Authorization":  "Bearer provider-key",
-		"X-Api-Key":      "other-key",
-		"X-Goog-Api-Key": "provider-key",
-	})
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status=%d", resp.StatusCode)
-	}
-	if env.rec.count() != 0 {
-		t.Fatal("conflicting credentials must not reach native")
-	}
-}
-
-func TestProviderDisabledReturnsNotFound(t *testing.T) {
-	up := &fakeProviderUpstream{models: []string{"vendor/big"}}
-	svc, store, ts := newProviderTestService(t, up, 2)
-	cfg := mustConfig(t, store)
-	cfg.ProviderEnabled = false
-	if err := svc.Configure(cfg); err != nil {
-		t.Fatal(err)
-	}
-	req, _ := http.NewRequest(http.MethodGet, ts.URL+providerModelsPath, nil)
-	req.Header.Set("Authorization", "Bearer provider-key")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("disabled provider status=%d, want 404", resp.StatusCode)
 	}
 }
 
@@ -736,26 +706,26 @@ func (b *testBody) Close() error {
 }
 
 func TestProviderUnsupportedEncoding(t *testing.T) {
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
-		t.Errorf("unsupported encoding reached native")
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+		t.Errorf("unsupported encoding reached vendor")
 	})
-	resp := providerCall(t, env, http.MethodPost, providerChatPath, []byte(`{"model":"vendor/big"}`), map[string]string{
-		"Content-Encoding": "br",
-	})
+	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+		[]byte(`{"model":"vendor/big"}`), map[string]string{"Content-Encoding": "br"})
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnsupportedMediaType {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
 	if env.rec.count() != 0 {
-		t.Fatal("unsupported encoding must not reach native")
+		t.Fatal("unsupported encoding must not reach vendor")
 	}
 }
 
 func TestProviderBadJSON(t *testing.T) {
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
-		t.Errorf("bad JSON reached native")
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+		t.Errorf("bad JSON reached vendor")
 	})
-	resp := providerCall(t, env, http.MethodPost, providerChatPath, []byte(`{"model":`), nil)
+	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+		[]byte(`{"model":`), nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status=%d", resp.StatusCode)
@@ -767,17 +737,17 @@ func TestProviderBodyLimit(t *testing.T) {
 	providerBodyLimit = 1024
 	t.Cleanup(func() { providerBodyLimit = old })
 
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
-		t.Errorf("oversized body reached native")
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+		t.Errorf("oversized body reached vendor")
 	})
 	body := []byte(`{"model":"vendor/big","pad":"` + strings.Repeat("a", 2048) + `"}`)
-	resp := providerCall(t, env, http.MethodPost, providerChatPath, body, nil)
+	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"), body, nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
 	if env.rec.count() != 0 {
-		t.Fatal("oversized body must not reach native")
+		t.Fatal("oversized body must not reach vendor")
 	}
 }
 
@@ -786,20 +756,19 @@ func TestProviderIdleTimeout(t *testing.T) {
 	providerIdleRead = 50 * time.Millisecond
 	t.Cleanup(func() { providerIdleRead = old })
 
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
-		t.Errorf("timed out body reached native")
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+		t.Errorf("timed out body reached vendor")
 	})
 	body := &testBody{data: []byte(`{"model":"vendor/big"`), block: true, closed: make(chan struct{})}
-	req := httptest.NewRequest(http.MethodPost, "/provider/v1/chat/completions", body)
-	req.Header.Set("Authorization", "Bearer provider-key")
+	req := httptest.NewRequest(http.MethodPost, env.path("chat", "/chat/completions"), body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
-	env.svc.apiProvider(rec, req)
+	env.svc.apiSupplier(rec, req)
 	if rec.Code != http.StatusRequestTimeout {
 		t.Fatalf("status=%d, want 408", rec.Code)
 	}
 	if env.rec.count() != 0 {
-		t.Fatal("timed out body must not reach native")
+		t.Fatal("timed out body must not reach vendor")
 	}
 }
 
@@ -825,7 +794,7 @@ func zstdBytes(t *testing.T, data []byte) []byte {
 }
 
 func TestProviderRequestEncodingReplayedVerbatim(t *testing.T) {
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		jsonOK(w, `{"model":"vendor/big"}`)
 	})
 	inner := []byte(`{"model":"vendor/big","tools":[{"type":"function","function":{"name":"x"}}],"signature":"abc+/=","unknown":{"deep":[1,2,3]}}`)
@@ -838,9 +807,8 @@ func TestProviderRequestEncodingReplayedVerbatim(t *testing.T) {
 		{"zstd", "zstd", zstdBytes(t, inner)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			resp := providerCall(t, env, http.MethodPost, providerChatPath, tc.body, map[string]string{
-				"Content-Encoding": tc.encoding,
-			})
+			resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"), tc.body,
+				map[string]string{"Content-Encoding": tc.encoding, "Content-Type": "application/json"})
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
 				body, _ := io.ReadAll(resp.Body)
@@ -848,7 +816,7 @@ func TestProviderRequestEncodingReplayedVerbatim(t *testing.T) {
 			}
 			got := env.rec.last()
 			if !bytes.Equal(got.body, tc.body) {
-				t.Fatalf("upstream received re-encoded body")
+				t.Fatalf("vendor received re-encoded body")
 			}
 			if got.header.Get("Content-Encoding") != tc.encoding {
 				t.Fatalf("Content-Encoding=%q", got.header.Get("Content-Encoding"))
@@ -858,12 +826,12 @@ func TestProviderRequestEncodingReplayedVerbatim(t *testing.T) {
 }
 
 func TestProviderLargeBodyBeyond32MiB(t *testing.T) {
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		jsonOK(w, `{"model":"vendor/big"}`)
 	})
 	pad := strings.Repeat("b", 33<<20)
 	body := []byte(`{"model":"vendor/big","pad":"` + pad + `"}`)
-	resp := providerCall(t, env, http.MethodPost, providerChatPath, body, nil)
+	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"), body, nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		got, _ := io.ReadAll(resp.Body)
@@ -875,6 +843,10 @@ func TestProviderLargeBodyBeyond32MiB(t *testing.T) {
 }
 
 func TestProviderStreamPrefixVariants(t *testing.T) {
+	oldWait := providerPrefixWait
+	providerPrefixWait = 100 * time.Millisecond
+	t.Cleanup(func() { providerPrefixWait = oldWait })
+
 	cases := []struct {
 		name   string
 		stream string
@@ -894,18 +866,25 @@ func TestProviderStreamPrefixVariants(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+			env := newSupplierRuleEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				_, _ = io.WriteString(w, tc.stream)
-			})
-			resp := providerCall(t, env, http.MethodPost, providerChatPath, []byte(`{"model":"vendor/big"}`), nil)
+			}, ResponseModelRule{
+				ID: "r-none", Match: ResponseMatchContains, Pattern: "never", Action: ResponseActionRecord,
+			}, 2)
+			resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+				[]byte(`{"model":"vendor/big"}`), nil)
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if resp.StatusCode != http.StatusOK || string(body) != tc.stream {
 				t.Fatalf("status=%d body=%q", resp.StatusCode, body)
 			}
 			if env.rec.count() != 1 {
-				t.Fatalf("calls=%d, want 1 (no model or no rule must not retry)", env.rec.count())
+				t.Fatalf("calls=%d, want 1 (no matching model must not retry)", env.rec.count())
+			}
+			target, _ := env.store.Target("vendor/big")
+			if target == nil || target.State == StateFailed {
+				t.Fatalf("unmatched stream changed target: %+v", target)
 			}
 		})
 	}
@@ -917,11 +896,14 @@ func TestProviderStreamOversizeEventPassesThrough(t *testing.T) {
 	t.Cleanup(func() { providerPrefixLimit = old })
 
 	stream := "data: {\"model\":\"vendor/big\",\"pad\":\"" + strings.Repeat("x", 1024) + "\"}\n\n"
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+	env := newSupplierRuleEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, stream)
-	})
-	resp := providerCall(t, env, http.MethodPost, providerChatPath, []byte(`{"model":"vendor/big"}`), nil)
+	}, ResponseModelRule{
+		ID: "r-none", Match: ResponseMatchContains, Pattern: "never", Action: ResponseActionRecord,
+	}, 2)
+	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+		[]byte(`{"model":"vendor/big"}`), nil)
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || string(body) != stream {
@@ -986,7 +968,8 @@ func TestProviderStreamFlushesChunks(t *testing.T) {
 	var releaseOnce, doneOnce sync.Once
 	releaseUpstream := func() { releaseOnce.Do(func() { close(release) }) }
 	finishUpstream := func() { doneOnce.Do(func() { close(done) }) }
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+	env := newSupplierRuleEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		defer close(finished)
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher := w.(http.Flusher)
@@ -996,21 +979,16 @@ func TestProviderStreamFlushesChunks(t *testing.T) {
 		_, _ = io.WriteString(w, "data: {\"model\":\"vendor/big\",\"marker\":\"second\"}\n\n")
 		flusher.Flush()
 		<-done
-	}))
+	}, ResponseModelRule{
+		ID: "r-none", Match: ResponseMatchContains, Pattern: "never", Action: ResponseActionRecord,
+	}, 2)
 	defer func() {
 		releaseUpstream()
 		finishUpstream()
-		upstream.Close()
 	}()
 
-	svc, store, ts := newProviderTestService(t, &fakeProviderUpstream{models: []string{"vendor/big"}}, 2)
-	cfg := mustConfig(t, store)
-	cfg.GatewayURL = upstream.URL
-	if err := svc.Configure(cfg); err != nil {
-		t.Fatalf("Configure: %v", err)
-	}
-
-	resp := providerChatRequest(t, ts.URL, "provider-key", true)
+	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+		[]byte(`{"model":"vendor/big","stream":true}`), nil)
 	defer resp.Body.Close()
 	reader := bufio.NewReader(resp.Body)
 	readUntil := func(marker string) string {
@@ -1037,7 +1015,7 @@ func TestProviderStreamFlushesChunks(t *testing.T) {
 			}
 			return line
 		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for %q before upstream EOF", marker)
+			t.Fatalf("timed out waiting for %q before vendor EOF", marker)
 			return ""
 		}
 	}
@@ -1050,31 +1028,21 @@ func TestProviderStreamFlushesChunks(t *testing.T) {
 	select {
 	case <-finished:
 	case <-time.After(2 * time.Second):
-		t.Fatal("upstream did not finish")
+		t.Fatal("vendor did not finish")
 	}
 }
 
-func TestProviderActionFailureReturns500(t *testing.T) {
-	var calls atomic.Int32
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
-		calls.Add(1)
+func TestSupplierActionFailureReturns500(t *testing.T) {
+	env := newSupplierRuleEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		jsonOK(w, `{"model":"vendor/flash"}`)
-	})
-	env.svc.mu.Lock()
-	if err := env.store.SaveTarget(&Target{
-		Model: "vendor/big", Enabled: true,
-		ResponseRuleMode: ResponseRuleCustom,
-		ResponseModelRules: []ResponseModelRule{{
-			ID: "r-flash", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionDisable,
-		}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	env.svc.mu.Unlock()
+	}, ResponseModelRule{
+		ID: "r-flash", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionDisable,
+	}, 2)
 	if _, err := env.store.db.Exec(`CREATE TRIGGER fail_results BEFORE INSERT ON results BEGIN SELECT RAISE(ABORT,'boom'); END`); err != nil {
 		t.Fatal(err)
 	}
-	resp := providerCall(t, env, http.MethodPost, providerChatPath, []byte(`{"model":"vendor/big"}`), nil)
+	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+		[]byte(`{"model":"vendor/big"}`), nil)
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusInternalServerError || !strings.Contains(string(body), "规则动作提交失败") {
@@ -1095,7 +1063,8 @@ func TestProviderActionFailureReturns500(t *testing.T) {
 	if _, err := env.store.db.Exec(`DROP TRIGGER fail_results`); err != nil {
 		t.Fatal(err)
 	}
-	resp = providerCall(t, env, http.MethodPost, providerChatPath, []byte(`{"model":"vendor/big"}`), nil)
+	resp = env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+		[]byte(`{"model":"vendor/big"}`), nil)
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
@@ -1107,23 +1076,12 @@ func TestProviderActionFailureReturns500(t *testing.T) {
 	}
 }
 
-func TestProviderRerouteFailurePreservesExistingKVs(t *testing.T) {
-	var current atomic.Value
-	current.Store("vendor/flash")
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
-		jsonOK(w, fmt.Sprintf(`{"model":%q}`, current.Load().(string)))
-	})
-	env.svc.mu.Lock()
-	if err := env.store.SaveTarget(&Target{
-		Model: "vendor/big", Enabled: true,
-		ResponseRuleMode: ResponseRuleCustom,
-		ResponseModelRules: []ResponseModelRule{{
-			ID: "r-reroute", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionReroute,
-		}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	env.svc.mu.Unlock()
+func TestSupplierRerouteFailurePreservesExistingKVs(t *testing.T) {
+	env := newSupplierRuleEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+		jsonOK(w, `{"model":"vendor/flash"}`)
+	}, ResponseModelRule{
+		ID: "r-reroute", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionReroute,
+	}, 2)
 	if err := env.store.AddResponseReroute("vendor/keep", time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
@@ -1135,7 +1093,8 @@ func TestProviderRerouteFailurePreservesExistingKVs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	resp := providerCall(t, env, http.MethodPost, providerChatPath, []byte(`{"model":"vendor/big"}`), nil)
+	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+		[]byte(`{"model":"vendor/big"}`), nil)
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusInternalServerError || !strings.Contains(string(body), "规则动作提交失败") {
@@ -1154,8 +1113,8 @@ func TestProviderRerouteFailurePreservesExistingKVs(t *testing.T) {
 	if _, err := env.store.db.Exec(`DROP TRIGGER rr_update`); err != nil {
 		t.Fatal(err)
 	}
-	current.Store("vendor/flash2")
-	resp = providerCall(t, env, http.MethodPost, providerChatPath, []byte(`{"model":"vendor/big"}`), nil)
+	resp = env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+		[]byte(`{"model":"vendor/big"}`), nil)
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") != "1" {
@@ -1166,36 +1125,22 @@ func TestProviderRerouteFailurePreservesExistingKVs(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(routes, ",")
-	if !strings.Contains(joined, "vendor/keep") || !strings.Contains(joined, "vendor/flash2") {
+	if !strings.Contains(joined, "vendor/keep") || !strings.Contains(joined, "vendor/big") {
 		t.Fatalf("reroutes=%v", routes)
 	}
 }
 
-func TestProviderDecodesCompressedResponseOnlyWithRules(t *testing.T) {
+func TestSupplierDecodesCompressedResponseOnlyWithRules(t *testing.T) {
 	inner := []byte(`{"model":"vendor/big","choices":[]}`)
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
-		if r.Header.Get("Accept-Encoding") == "identity" {
-			w.Header().Set("Content-Encoding", "gzip")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write(gzipBytes(t, inner))
-			return
-		}
+	env := newSupplierRuleEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		w.Header().Set("Content-Encoding", "gzip")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(gzipBytes(t, inner))
-	})
-	env.svc.mu.Lock()
-	if err := env.store.SaveTarget(&Target{
-		Model: "vendor/big", Enabled: true,
-		ResponseRuleMode: ResponseRuleCustom,
-		ResponseModelRules: []ResponseModelRule{{
-			ID: "r-record", Match: ResponseMatchContains, Pattern: "none", Action: ResponseActionRecord,
-		}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	env.svc.mu.Unlock()
-	resp := providerCall(t, env, http.MethodPost, providerChatPath, []byte(`{"model":"vendor/big"}`), nil)
+	}, ResponseModelRule{
+		ID: "r-none", Match: ResponseMatchContains, Pattern: "none", Action: ResponseActionRecord,
+	}, 2)
+	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+		[]byte(`{"model":"vendor/big"}`), nil)
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || !bytes.Equal(body, inner) {
@@ -1206,20 +1151,15 @@ func TestProviderDecodesCompressedResponseOnlyWithRules(t *testing.T) {
 	}
 }
 
-func TestProviderTransparentPathKeepsCompression(t *testing.T) {
+func TestSupplierTransparentPathKeepsCompression(t *testing.T) {
 	inner := []byte(`{"model":"vendor/big","choices":[]}`)
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		w.Header().Set("Content-Encoding", "gzip")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(gzipBytes(t, inner))
 	})
-	req, _ := http.NewRequest(http.MethodPost, env.guard.URL+providerChatPath, bytes.NewReader([]byte(`{"model":"vendor/big"}`)))
-	req.Header.Set("Authorization", "Bearer provider-key")
-	req.Header.Set("Accept-Encoding", "gzip")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+		[]byte(`{"model":"vendor/big"}`), map[string]string{"Accept-Encoding": "gzip"})
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.Header.Get("Content-Encoding") != "gzip" || !bytes.Equal(raw, gzipBytes(t, inner)) {
@@ -1227,95 +1167,35 @@ func TestProviderTransparentPathKeepsCompression(t *testing.T) {
 	}
 }
 
-func TestProviderHeadSemantics(t *testing.T) {
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+func TestSupplierHeadSemantics(t *testing.T) {
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		jsonOK(w, `{"object":"list","data":[]}`)
 	})
-	resp := providerCall(t, env, http.MethodHead, providerModelsPath, nil, nil)
+	resp := env.call(t, http.MethodHead, env.path("chat", "/models"), nil, nil)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || len(body) != 0 {
 		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
 	}
 	if got := env.rec.last(); got.method != http.MethodHead {
-		t.Fatalf("native method=%s", got.method)
+		t.Fatalf("vendor method=%s", got.method)
 	}
 }
 
-func TestProviderCORSPreflight(t *testing.T) {
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
-		if r.Method != http.MethodOptions {
-			t.Errorf("preflight reached a non-OPTIONS handler")
-		}
-		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
-		w.Header().Set("Access-Control-Allow-Methods", "POST")
-		w.WriteHeader(http.StatusNoContent)
-	})
-	req, _ := http.NewRequest(http.MethodOptions, env.guard.URL+providerChatPath, nil)
-	req.Header.Set("Origin", "https://allowed.example")
-	req.Header.Set("Access-Control-Request-Method", http.MethodPost)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent || resp.Header.Get("Access-Control-Allow-Origin") != "https://allowed.example" {
-		t.Fatalf("preflight status=%d headers=%v", resp.StatusCode, resp.Header)
-	}
-	if env.rec.count() != 1 {
-		t.Fatalf("preflight calls=%d, want 1", env.rec.count())
-	}
-
-	// Unknown paths cannot be probed through OPTIONS.
-	req, _ = http.NewRequest(http.MethodOptions, env.guard.URL+"/provider/v1/magpie/keys", nil)
-	req.Header.Set("Origin", "https://allowed.example")
-	req.Header.Set("Access-Control-Request-Method", http.MethodPost)
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("unknown preflight status=%d", resp.StatusCode)
-	}
-	// A method that the route does not serve is rejected before the gateway.
-	req, _ = http.NewRequest(http.MethodOptions, env.guard.URL+providerChatPath, nil)
-	req.Header.Set("Origin", "https://allowed.example")
-	req.Header.Set("Access-Control-Request-Method", http.MethodGet)
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("bad preflight method status=%d", resp.StatusCode)
-	}
-	if env.rec.count() != 1 {
-		t.Fatalf("rejected preflights reached native: calls=%d", env.rec.count())
-	}
-}
-
-func TestProviderOllamaNeverJudgesResponseModel(t *testing.T) {
+func TestSupplierOllamaNeverJudgesResponseModel(t *testing.T) {
 	stream := `{"model":"vendor/bad","message":{"role":"assistant","content":"ok"},"done":false}` + "\n" +
 		`{"model":"vendor/bad","done":true}` + "\n"
 	var calls atomic.Int32
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/x-ndjson")
 		_, _ = io.WriteString(w, stream)
 	})
-	env.svc.mu.Lock()
-	if err := env.store.SaveTarget(&Target{
-		Model: "vendor/bad", Enabled: true,
-		ResponseRuleMode: ResponseRuleCustom,
-		ResponseModelRules: []ResponseModelRule{{
-			ID: "r-bad", Match: ResponseMatchContains, Pattern: "vendor/bad", Action: ResponseActionDisable,
-		}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	env.svc.mu.Unlock()
-	resp := providerCall(t, env, http.MethodPost, "/provider/api/chat",
+	env.saveTarget(t, customTarget("vendor/bad", ResponseModelRule{
+		ID: "r-bad", Match: ResponseMatchContains, Pattern: "vendor/bad", Action: ResponseActionDisable,
+	}))
+	env.configure(t, 2, nil)
+	resp := env.call(t, http.MethodPost, env.path("chat", "/api/chat"),
 		[]byte(`{"model":"vendor/bad","messages":[]}`), nil)
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
@@ -1334,30 +1214,20 @@ func TestProviderOllamaNeverJudgesResponseModel(t *testing.T) {
 	}
 }
 
-func TestProviderUnmonitoredRequestUsesOnlyGlobalRules(t *testing.T) {
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+func TestSupplierUnmonitoredRequestUsesOnlyGlobalRules(t *testing.T) {
+	env := newSupplierEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		jsonOK(w, `{"model":"vendor/flash"}`)
 	})
-	env.svc.mu.Lock()
-	if err := env.store.SaveTarget(&Target{
-		Model: "vendor/monitored", Enabled: true,
-		ResponseRuleMode: ResponseRuleCustom,
-		ResponseModelRules: []ResponseModelRule{{
-			ID: "r-other", Match: ResponseMatchContains, Pattern: "xyz", Action: ResponseActionDisable,
-		}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	env.svc.mu.Unlock()
-	cfg := mustConfig(t, env.store)
-	cfg.ResponseModelMode = ResponseModelOn
-	cfg.ResponseRules = []ResponseModelRule{{
-		ID: "r-global", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionDisable,
-	}}
-	if err := env.svc.Configure(cfg); err != nil {
-		t.Fatal(err)
-	}
-	resp := providerCall(t, env, http.MethodPost, providerChatPath, []byte(`{"model":"vendor/unmonitored"}`), nil)
+	env.saveTarget(t, customTarget("vendor/monitored", ResponseModelRule{
+		ID: "r-other", Match: ResponseMatchContains, Pattern: "xyz", Action: ResponseActionDisable,
+	}))
+	env.configure(t, 2, func(cfg *GuardConfig) {
+		cfg.ResponseRules = []ResponseModelRule{{
+			ID: "r-global", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionDisable,
+		}}
+	})
+	resp := env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+		[]byte(`{"model":"unmonitored"}`), nil)
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
@@ -1376,10 +1246,10 @@ func TestProviderUnmonitoredRequestUsesOnlyGlobalRules(t *testing.T) {
 	}
 }
 
-func TestProviderKeepsRuleSnapshotForInFlightRequest(t *testing.T) {
+func TestSupplierKeepsRuleSnapshotForInFlightRequest(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	env := newProviderEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+	env := newSupplierRuleEnv(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		select {
 		case <-started:
 		default:
@@ -1387,36 +1257,24 @@ func TestProviderKeepsRuleSnapshotForInFlightRequest(t *testing.T) {
 		}
 		<-release
 		jsonOK(w, `{"model":"vendor/flash"}`)
-	})
-	env.svc.mu.Lock()
-	if err := env.store.SaveTarget(&Target{
-		Model: "vendor/big", Enabled: true,
-		ResponseRuleMode: ResponseRuleCustom,
-		ResponseModelRules: []ResponseModelRule{{
-			ID: "r-record", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionRecord,
-		}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	env.svc.mu.Unlock()
+	}, ResponseModelRule{
+		ID: "r-record", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionRecord,
+	}, 2)
 
 	done := make(chan *http.Response, 1)
 	go func() {
-		done <- providerCall(t, env, http.MethodPost, providerChatPath, []byte(`{"model":"vendor/big"}`), nil)
+		done <- env.call(t, http.MethodPost, env.path("chat", "/chat/completions"),
+			[]byte(`{"model":"vendor/big"}`), nil)
 	}()
 	select {
 	case <-started:
 	case <-time.After(2 * time.Second):
-		t.Fatal("request did not reach native")
+		t.Fatal("request did not reach vendor")
 	}
 	// The rule changes while the request is in flight; the snapshot must win.
-	if err := env.store.SaveTarget(&Target{
-		Model: "vendor/big", Enabled: true,
-		ResponseRuleMode: ResponseRuleCustom,
-		ResponseModelRules: []ResponseModelRule{{
-			ID: "r-disable", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionDisable,
-		}},
-	}); err != nil {
+	if err := env.store.SaveTarget(customTarget("vendor/big", ResponseModelRule{
+		ID: "r-disable", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionDisable,
+	})); err != nil {
 		t.Fatal(err)
 	}
 	close(release)
@@ -1547,5 +1405,99 @@ func TestProviderJSONScannerSurvivesRefills(t *testing.T) {
 		if values.Model != tc.want {
 			t.Fatalf("model %s=%q, want %q", tc.body, values.Model, tc.want)
 		}
+	}
+}
+
+// The backend address persists independently of response-name judgment, so
+// these checks survive the removed provider mode.
+func freePort(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
+}
+
+func TestListenBackendPersistsAddress(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ln, addr, err := listenBackend(store, "")
+	if err != nil {
+		t.Fatalf("first bind: %v", err)
+	}
+	_ = ln.Close()
+	saved, ok, err := store.BackendAddr()
+	if err != nil || !ok || saved != addr {
+		t.Fatalf("saved=%q ok=%v err=%v, want %q", saved, ok, err, addr)
+	}
+
+	ln, addr2, err := listenBackend(store, "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("second bind: %v", err)
+	}
+	defer ln.Close()
+	if addr2 != addr {
+		t.Fatalf("second bind addr=%q, want persisted %q", addr2, addr)
+	}
+}
+
+func TestListenBackendSavedPortInUseFails(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	if err := store.SaveBackendAddr(occupied.Addr().String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := listenBackend(store, ""); err == nil || !strings.Contains(err.Error(), occupied.Addr().String()) {
+		t.Fatalf("occupied saved port must fail with the saved address, got %v", err)
+	}
+
+	// An explicit override restores service and becomes the new saved address.
+	replacement := freePort(t)
+	ln, addr, err := listenBackend(store, replacement)
+	if err != nil {
+		t.Fatalf("explicit recovery: %v", err)
+	}
+	defer ln.Close()
+	if addr != replacement {
+		t.Fatalf("addr=%q, want %q", addr, replacement)
+	}
+	saved, _, err := store.BackendAddr()
+	if err != nil || saved != replacement {
+		t.Fatalf("saved=%q err=%v, want %q", saved, err, replacement)
+	}
+}
+
+func TestListenBackendUnreadableStateDoesNotOverwrite(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.db.Exec(`DROP TABLE kv`); err != nil {
+		t.Fatal(err)
+	}
+	ln, addr, err := listenBackend(store, "127.0.0.1:0")
+	if err != nil || addr == "" {
+		t.Fatalf("bind with unreadable kv: addr=%q err=%v", addr, err)
+	}
+	_ = ln.Close()
+	if _, _, err := store.BackendAddr(); err == nil {
+		t.Fatal("kv must stay unwritable, not recreated")
 	}
 }

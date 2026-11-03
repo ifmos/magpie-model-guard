@@ -54,7 +54,7 @@ func TestSupplierRetriesKeepVendorCredentialAndWireBody(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte(`{"modelIDs":{"vendor/alias":"local"},"modelWires":{"vendor/*":"wire-*"}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	guard := httptest.NewServer(registerProvider(http.NewServeMux(), svc))
+	guard := httptest.NewServer(registerGuardRoutes(http.NewServeMux(), svc))
 	defer guard.Close()
 	svc.suppliers = newSupplierController(store, dir, guard.URL)
 	if err := svc.suppliers.setProtection(context.Background(), "vendor", true); err != nil {
@@ -63,7 +63,6 @@ func TestSupplierRetriesKeepVendorCredentialAndWireBody(t *testing.T) {
 	cfg := mustConfig(t, store)
 	cfg.GatewayURL = vendor.URL
 	cfg.GatewayKey = "gateway-key"
-	cfg.ProviderEnabled = false
 	cfg.ProviderAttempts = 2
 	cfg.ResponseModelMode = ResponseModelOn
 	cfg.ResponseRules = []ResponseModelRule{{ID: "disable", Match: ResponseMatchExact, Pattern: "bad", Action: ResponseActionDisable}}
@@ -210,7 +209,7 @@ func TestSupplierSocketJudgesWithProviderDisabled(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "providers.json"), []byte(raw), 0600); err != nil {
 		t.Fatal(err)
 	}
-	guard := httptest.NewServer(registerProvider(http.NewServeMux(), svc))
+	guard := httptest.NewServer(registerGuardRoutes(http.NewServeMux(), svc))
 	defer guard.Close()
 	svc.suppliers = newSupplierController(store, dir, guard.URL)
 	if err := svc.suppliers.setProtection(context.Background(), "vendor", true); err != nil {
@@ -219,7 +218,6 @@ func TestSupplierSocketJudgesWithProviderDisabled(t *testing.T) {
 	cfg := mustConfig(t, store)
 	cfg.GatewayURL = vendor.URL
 	cfg.GatewayKey = "gateway-key"
-	cfg.ProviderEnabled = false
 	cfg.ProviderAttempts = 2
 	if err := svc.Configure(cfg); err != nil {
 		t.Fatal(err)
@@ -252,6 +250,22 @@ func TestSupplierSocketJudgesWithProviderDisabled(t *testing.T) {
 	latest, err := store.Target("vendor/big")
 	if err != nil || latest.State != StateFailed {
 		t.Fatal("supplier socket did not disable selected target")
+	}
+}
+
+func TestRemovedDirectProviderEndpointReturns404(t *testing.T) {
+	svc, _ := newRuleTestService(t)
+	guard := httptest.NewServer(registerGuardRoutes(http.NewServeMux(), svc))
+	defer guard.Close()
+	for _, path := range []string{"/provider", "/provider/v1/models", "/provider/v1/chat/completions"} {
+		resp, err := http.Get(guard.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s status=%d, want 404", path, resp.StatusCode)
+		}
 	}
 }
 

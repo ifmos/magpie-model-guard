@@ -924,6 +924,9 @@ func supplierProtocolsFromSnapshot(snapshot supplierManagedSnapshot) []string {
 func supplierProtocolInfo(provider map[string]json.RawMessage, origin *url.URL) ([]string, []string) {
 	protocols := make([]string, 0, len(supplierProtocolOrder))
 	var problems []string
+	if reason := supplierLockedPresetReason(supplierRawStringField(provider, "preset")); reason != "" {
+		problems = append(problems, reason)
+	}
 	for _, proto := range supplierProtocolOrder {
 		raw, ok := provider[proto]
 		if !ok {
@@ -951,7 +954,7 @@ func supplierProtocolInfo(provider map[string]json.RawMessage, origin *url.URL) 
 			problems = append(problems, fmt.Sprintf("%s 地址无效: %v", proto, err))
 			continue
 		}
-		if err := supplierValidateOriginalURL(proto, value, supplierRawStringField(provider, "preset")); err != nil {
+		if err := supplierValidateOriginalURL(proto, value); err != nil {
 			problems = append(problems, err.Error())
 			continue
 		}
@@ -959,7 +962,7 @@ func supplierProtocolInfo(provider map[string]json.RawMessage, origin *url.URL) 
 			problems = append(problems, fmt.Sprintf("%s 地址指回 Guard: %v", proto, err))
 		}
 	}
-	return protocols, problems
+	return protocols, supplierUniqueStrings(problems)
 }
 
 // supplierStrictOriginalSnapshot validates every protected address, records
@@ -970,7 +973,9 @@ func supplierProtocolInfo(provider map[string]json.RawMessage, origin *url.URL) 
 func supplierStrictOriginalSnapshot(provider map[string]json.RawMessage, origin *url.URL) (supplierManagedSnapshot, string, error) {
 	original := make(supplierManagedSnapshot)
 	protocolCount := 0
-	preset := supplierRawStringField(provider, "preset")
+	if reason := supplierLockedPresetReason(supplierRawStringField(provider, "preset")); reason != "" {
+		return nil, "", errors.New(reason)
+	}
 	for _, proto := range supplierProtocolOrder {
 		raw, ok := provider[proto]
 		if !ok {
@@ -985,7 +990,7 @@ func supplierStrictOriginalSnapshot(provider map[string]json.RawMessage, origin 
 			if strings.TrimSpace(value) == "" {
 				return nil, "", fmt.Errorf("%s 地址为空", proto)
 			}
-			if err := supplierValidateOriginalURL(proto, value, preset); err != nil {
+			if err := supplierValidateOriginalURL(proto, value); err != nil {
 				return nil, "", err
 			}
 			normalized, err := supplierNormalizeVendorBase(proto, value)
@@ -1012,13 +1017,21 @@ func supplierStrictOriginalSnapshot(provider map[string]json.RawMessage, origin 
 	return original, headerState, nil
 }
 
-// supplierLockedPresets take their request shape or signature from the preset
-// rather than the addresses alone. Replacing their bases would change how
-// Magpie signs or rewrites requests, so takeover refuses them instead of
-// silently changing authentication.
-var supplierLockedPresets = map[string]bool{
-	"azure": true, "bedrock": true, "bedrock-mantle": true,
-	"google-vertex": true, "remote-magpie": true,
+// supplierLockedPresetReason reports why a preset cannot be taken over. These
+// request shapes and signatures come from the preset or the original host;
+// replacing the bases would silently change authentication or routing.
+func supplierLockedPresetReason(preset string) string {
+	switch preset {
+	case "azure":
+		return "Azure OpenAI 依赖原生请求改写与 api-key 鉴权，暂不支持接管"
+	case "bedrock", "bedrock-mantle":
+		return "Bedrock 依赖 AWS 请求签名，暂不支持接管"
+	case "google-vertex":
+		return "Google Vertex AI 依赖项目地址与签名，暂不支持接管"
+	case "remote-magpie":
+		return "远程 Magpie 依赖原生端点重写，暂不支持接管"
+	}
+	return ""
 }
 
 func supplierRawStringField(provider map[string]json.RawMessage, key string) string {
@@ -1044,7 +1057,7 @@ func supplierParseRawURL(raw string) (*url.URL, error) {
 // supplierValidateOriginalURL rejects bases whose takeover would copy a
 // credential into the ledger or change native host-based authentication,
 // signing or decision-envelope selection.
-func supplierValidateOriginalURL(proto, raw, preset string) error {
+func supplierValidateOriginalURL(proto, raw string) error {
 	parsed, err := supplierParseRawURL(raw)
 	if err != nil {
 		return fmt.Errorf("%s 地址无效: %w", proto, err)
@@ -1053,9 +1066,6 @@ func supplierValidateOriginalURL(proto, raw, preset string) error {
 		return fmt.Errorf("%s 地址不能包含用户信息、查询参数或片段；请把凭据放到供应商 Key 字段", proto)
 	}
 	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
-	if supplierLockedPresets[preset] {
-		return fmt.Errorf("供应商 preset %q 依赖原生请求签名或主机分类，暂不支持接管", preset)
-	}
 	if (proto == "chat" || proto == "responses") && supplierAzureHost(host) {
 		return errors.New("Azure OpenAI 供应商依赖原始主机选择 api-key 鉴权，暂不支持接管")
 	}
@@ -1071,6 +1081,19 @@ func supplierValidateOriginalURL(proto, raw, preset string) error {
 		}
 	}
 	return nil
+}
+
+func supplierUniqueStrings(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	out := values[:0]
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func supplierAzureHost(host string) bool {

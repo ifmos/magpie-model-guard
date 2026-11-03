@@ -76,15 +76,14 @@ func (s *Service) apiModels(w http.ResponseWriter, r *http.Request) {
 func (s *Service) apiConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		GuardConfig
-		ProviderEnabled     *bool `json:"provider_enabled"`
-		RecalculateSchedule bool  `json:"recalculate_schedule"`
+		RecalculateSchedule bool `json:"recalculate_schedule"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
 		errJSON(w, 400, "请求体无效")
 		return
 	}
 	recalc := req.RecalculateSchedule || r.URL.Query().Get("recalculate_schedule") == "true"
-	if err := s.configure(req.GuardConfig, recalc, req.ProviderEnabled); err != nil {
+	if err := s.configure(req.GuardConfig, recalc); err != nil {
 		errJSON(w, 400, err.Error())
 		return
 	}
@@ -95,14 +94,13 @@ func (s *Service) apiConfig(w http.ResponseWriter, r *http.Request) {
 func (s *Service) apiConfigInitial(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		GuardConfig
-		ProviderEnabled     *bool `json:"provider_enabled"`
-		RecalculateSchedule bool  `json:"recalculate_schedule"`
+		RecalculateSchedule bool `json:"recalculate_schedule"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
 		errJSON(w, 400, "请求体无效")
 		return
 	}
-	if err := s.ConfigureInitial(req.GuardConfig, req.ProviderEnabled); err != nil {
+	if err := s.ConfigureInitial(req.GuardConfig); err != nil {
 		errJSON(w, 400, err.Error())
 		return
 	}
@@ -247,11 +245,6 @@ func (s *Service) apiResponseModel(w http.ResponseWriter, r *http.Request) {
 	var ev ResponseModelEvent
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&ev); err != nil {
 		errJSON(w, 400, "请求体无效")
-		return
-	}
-	if cfg, err := s.store.LoadConfig(); err == nil && cfg.ProviderEnabled {
-		// Provider mode judges at its own entry; do not queue async actions.
-		writeJSON(w, map[string]any{"accepted": true, "skipped": "provider_enabled"})
 		return
 	}
 	go func() {
