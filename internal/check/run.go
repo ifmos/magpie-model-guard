@@ -151,6 +151,11 @@ func Run(o Options) error {
 	svc.providerRoot = origin + "/provider"
 	svc.providerOrigin = origin
 	svc.mu.Unlock()
+	if o.MagpieConfig != "" {
+		svc.suppliers = newSupplierController(store, o.MagpieConfig, origin)
+		// Conflicts stay visible in the console; never overwrite external edits.
+		_ = svc.suppliers.reconcile(ownerCtx)
+	}
 
 	var info StartupInfo
 	info.Origin = origin

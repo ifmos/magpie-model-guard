@@ -13,6 +13,11 @@
   var hasCheckingResults = false;
   var activePollTimer = null;
   var activePollInFlight = false;
+  var supplierData = null;
+  var supplierLoadPromise = null;
+  var supplierReloadQueued = false;
+  var supplierLoadSeq = 0;
+  var supplierPending = Object.create(null);
 
   var sectionName = { targets: "监测目标", prompts: "检测题库", results: "检测记录", settings: "连接设置" };
   var stateName = {
@@ -331,11 +336,13 @@
       if (b.dataset.tab === "results") loadResults();
       if (b.dataset.tab === "targets") loadState();
       if (b.dataset.tab === "prompts") renderPrompts();
+      if (b.dataset.tab === "settings") loadSuppliers();
     });
   });
 
   // ---- state and targets ----
   function loadState() {
+    loadSuppliers();
     return api("GET", "/api/state").then(function (snap) {
       state.config = snap.config || {};
       state.provider_base = snap.provider_base || "";
@@ -1352,6 +1359,272 @@
   if (refreshResultsBtn) refreshResultsBtn.addEventListener("click", loadResults);
   var resultModelSel = document.getElementById("result-model");
   if (resultModelSel) resultModelSel.addEventListener("change", loadResults);
+
+  // ---- supplier protection ----
+  var supplierProtocolNames = {
+    chat: "Chat",
+    responses: "Responses",
+    anthropic: "Anthropic",
+    gemini: "Gemini",
+    decide: "Decide"
+  };
+
+  function supplierEl(tag, className, text) {
+    var el = document.createElement(tag);
+    if (className) el.className = className;
+    el.textContent = text == null ? "" : String(text);
+    return el;
+  }
+
+  function supplierProtocolLabel(protocol) {
+    return Object.prototype.hasOwnProperty.call(supplierProtocolNames, protocol)
+      ? supplierProtocolNames[protocol]
+      : String(protocol);
+  }
+
+  function supplierNameFor(id) {
+    var providers = (supplierData && supplierData.providers) || [];
+    for (var i = 0; i < providers.length; i++) {
+      if (providers[i] && String(providers[i].id) === String(id)) {
+        return providers[i].name || providers[i].id;
+      }
+    }
+    return id;
+  }
+
+  function setSupplierMessage(text, kind) {
+    var el = document.getElementById("supplier-msg");
+    if (!el) return;
+    el.textContent = text || "";
+    el.className = "form-message" + (kind === "error" ? " is-error" : kind === "success" ? " is-success" : kind === "warning" ? " is-warning" : "");
+  }
+
+  function applySupplierData(data) {
+    data = data || {};
+    var providers = [];
+    if (Array.isArray(data.providers)) {
+      providers = data.providers.filter(function (p) { return p && typeof p === "object"; }).map(function (p) {
+        return {
+          id: p.id == null ? "" : String(p.id),
+          name: p.name == null ? "" : String(p.name),
+          protected: !!p.protected,
+          protocols: Array.isArray(p.protocols) ? p.protocols.map(String) : [],
+          conflict: p.conflict == null ? "" : String(p.conflict)
+        };
+      });
+    }
+    supplierData = {
+      configured: data.configured !== false,
+      providers: providers,
+      error: data.error == null ? "" : String(data.error)
+    };
+    var msgEl = document.getElementById("supplier-msg");
+    if (msgEl && msgEl.textContent === "正在刷新供应商状态…") setSupplierMessage("", "");
+    renderSupplierPanel();
+  }
+
+  function loadSuppliers(force) {
+    if (supplierLoadPromise) {
+      if (force) supplierReloadQueued = true;
+      return supplierLoadPromise;
+    }
+    var seq = ++supplierLoadSeq;
+    if (!supplierData) renderSupplierPanel();
+    supplierLoadPromise = api("GET", "/api/suppliers").then(function (data) {
+      if (seq !== supplierLoadSeq) return;
+      applySupplierData(data);
+    }).catch(function (err) {
+      if (seq !== supplierLoadSeq) return;
+      supplierData = supplierData || { configured: true, providers: [], error: "" };
+      supplierData.error = err.message || "无法读取供应商状态";
+      renderSupplierPanel();
+      setSupplierMessage("读取供应商状态失败：" + supplierData.error, "error");
+    }).then(function () {
+      supplierLoadPromise = null;
+      if (supplierReloadQueued) {
+        supplierReloadQueued = false;
+        loadSuppliers();
+      }
+    });
+    return supplierLoadPromise;
+  }
+
+  function renderSupplierPanel() {
+    var listEl = document.getElementById("supplier-list");
+    if (!listEl) return;
+    var summaryEl = document.getElementById("supplier-summary");
+    var focusedSupplier = null;
+    var activeEl = document.activeElement;
+    if (activeEl && activeEl.classList && activeEl.classList.contains("supplier-action") && listEl.contains(activeEl) && activeEl.closest) {
+      var focusedRow = activeEl.closest(".supplier-row");
+      if (focusedRow) focusedSupplier = focusedRow.getAttribute("data-supplier-id");
+    }
+    listEl.textContent = "";
+
+    if (!supplierData) {
+      if (summaryEl) summaryEl.textContent = "读取中…";
+      listEl.appendChild(supplierEl("p", "supplier-empty", "正在读取供应商保护状态…"));
+      return;
+    }
+
+    var providers = supplierData.providers || [];
+    var protectedCount = providers.filter(function (p) { return p.protected; }).length;
+    if (summaryEl) {
+      if (supplierData.error && !providers.length) summaryEl.textContent = "状态不可用";
+      else if (!supplierData.configured) summaryEl.textContent = "未找到供应商配置";
+      else if (!providers.length) summaryEl.textContent = "未发现自定义供应商";
+      else summaryEl.textContent = protectedCount + " / " + providers.length + " 已保护";
+    }
+
+    if (supplierData.error) {
+      listEl.appendChild(supplierEl("p", "supplier-empty is-error", "供应商状态：" + supplierData.error));
+    }
+
+    if (providers.length) {
+      providers.forEach(function (p) {
+        listEl.appendChild(renderSupplierRow(p));
+      });
+      if (focusedSupplier != null) {
+        Array.prototype.forEach.call(listEl.querySelectorAll(".supplier-row"), function (row) {
+          if (row.getAttribute("data-supplier-id") === focusedSupplier) {
+            var action = row.querySelector(".supplier-action");
+            if (action && !action.disabled && document.activeElement !== action) action.focus();
+          }
+        });
+      }
+      return;
+    }
+
+    if (!supplierData.configured) {
+      if (!supplierData.error) {
+        listEl.appendChild(supplierEl("p", "supplier-empty", "未找到可保护的自定义供应商配置（providers.json）。请先在 Magpie 中创建自定义供应商，再点击下方刷新。"));
+      }
+      return;
+    }
+
+    if (!supplierData.error) {
+      listEl.appendChild(supplierEl("p", "supplier-empty", "暂无显式配置的自定义供应商。请在 Magpie 原生供应商编辑器中添加后点击下方刷新。"));
+    }
+  }
+
+  function renderSupplierRow(p) {
+    var row = document.createElement("div");
+    row.className = "supplier-row";
+    row.setAttribute("data-supplier-id", p.id);
+
+    var main = document.createElement("div");
+    main.className = "supplier-main";
+
+    var title = document.createElement("div");
+    title.className = "supplier-title";
+    title.appendChild(supplierEl("strong", "", p.name || p.id || "未命名供应商"));
+    title.appendChild(supplierEl("span", "supplier-badge " + (p.protected ? "is-on" : "is-off"), p.protected ? "已保护" : "未保护"));
+    if (p.conflict) title.appendChild(supplierEl("span", "supplier-badge is-warn", "冲突"));
+    main.appendChild(title);
+
+    if (p.id) main.appendChild(supplierEl("div", "supplier-id", p.id));
+
+    var protoWrap = document.createElement("div");
+    protoWrap.className = "supplier-protocols";
+    if (p.protocols.length) {
+      p.protocols.forEach(function (protocol) {
+        protoWrap.appendChild(supplierEl("span", "supplier-proto", supplierProtocolLabel(protocol)));
+      });
+    } else {
+      protoWrap.appendChild(supplierEl("span", "supplier-proto is-empty", "未配置协议地址"));
+    }
+    main.appendChild(protoWrap);
+
+    if (p.conflict) {
+      main.appendChild(supplierEl("p", "supplier-conflict", "⚠ 冲突：" + p.conflict));
+    }
+    row.appendChild(main);
+
+    var pending = Object.prototype.hasOwnProperty.call(supplierPending, p.id);
+    var anyPending = Object.keys(supplierPending).length > 0;
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "secondary-button-sm supplier-action";
+    if (pending) {
+      btn.textContent = supplierPending[p.id] ? "正在启用…" : "正在恢复…";
+      btn.setAttribute("aria-busy", "true");
+    } else {
+      btn.textContent = p.protected ? "恢复原始地址" : "启用保护";
+    }
+    btn.disabled = anyPending || !p.id;
+    btn.setAttribute("aria-label", pending ? btn.textContent : (p.protected ? "恢复原始地址：" : "启用保护：") + (p.name || p.id));
+    btn.addEventListener("click", function () {
+      setSupplierProtection(p.id, !p.protected);
+    });
+    row.appendChild(btn);
+    return row;
+  }
+
+  function focusSupplierAction(id) {
+    var active = document.activeElement;
+    if (active && active !== document.body && active !== document.documentElement) return;
+    var listEl = document.getElementById("supplier-list");
+    if (!listEl) return;
+    var rows = listEl.querySelectorAll(".supplier-row");
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].getAttribute("data-supplier-id") === String(id)) {
+        var btn = rows[i].querySelector(".supplier-action");
+        if (btn && !btn.disabled) btn.focus();
+        return;
+      }
+    }
+  }
+
+  function setSupplierProtection(id, enabled) {
+    if (!id || Object.prototype.hasOwnProperty.call(supplierPending, id)) return;
+    var actionText = enabled ? "启用保护" : "恢复原始地址";
+    supplierPending[id] = !!enabled;
+    renderSupplierPanel();
+    setSupplierMessage("正在" + actionText + "…", "");
+    var refreshBtn = document.getElementById("supplier-refresh");
+    if (refreshBtn) refreshBtn.disabled = true;
+
+    api("POST", "/api/suppliers/protection", { provider_id: id, enabled: !!enabled }).then(function (data) {
+      delete supplierPending[id];
+      supplierLoadSeq++;
+      if (data && Array.isArray(data.providers)) {
+        applySupplierData(data);
+      } else {
+        renderSupplierPanel();
+        loadSuppliers(true);
+      }
+      var name = supplierNameFor(id);
+      if (data && data.error) {
+        setSupplierMessage("操作已提交，但供应商状态报告：" + data.error, "warning");
+      } else {
+        setSupplierMessage("✓ 已" + actionText + "：" + name, "success");
+        toast("已" + actionText + "：" + name);
+      }
+      focusSupplierAction(id);
+      loadState();
+    }).catch(function (err) {
+      delete supplierPending[id];
+      renderSupplierPanel();
+      setSupplierMessage(actionText + "失败：" + err.message, "error");
+      toast(actionText + "失败：" + err.message);
+      focusSupplierAction(id);
+    }).then(function () {
+      var btn = document.getElementById("supplier-refresh");
+      if (btn && !Object.keys(supplierPending).length) btn.disabled = false;
+    });
+  }
+
+  var supplierRefreshBtn = document.getElementById("supplier-refresh");
+  if (supplierRefreshBtn) {
+    supplierRefreshBtn.addEventListener("click", function () {
+      if (supplierLoadPromise) return;
+      supplierRefreshBtn.disabled = true;
+      setSupplierMessage("正在刷新供应商状态…", "");
+      loadSuppliers(true).then(function () {
+        if (!Object.keys(supplierPending).length) supplierRefreshBtn.disabled = false;
+      });
+    });
+  }
 
   // ---- settings & real verification ----
   function markConfigDirty() {

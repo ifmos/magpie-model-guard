@@ -51,10 +51,25 @@ test('reports the real model from a chat reply', async () => {
   assert.deepEqual(got.body, {
     requested_model: 'vendor/asked',
     actual_model: 'vendor/real-model',
+    response_id: '',
     protocol: 'chat',
     agent: 'omp',
     success: true,
   });
+});
+
+test('reports a reply id from each native protocol shape', async () => {
+  const cases = [
+    [{ id: 'chatcmpl-1', model: 'vendor/real' }, 'chatcmpl-1'],
+    [{ id: 'resp_1', model: 'vendor/real' }, 'resp_1'],
+    [{ response: { id: 'resp_2', model: 'vendor/real' } }, 'resp_2'],
+    [{ message: { id: 'msg_1', model: 'vendor/real' } }, 'msg_1'],
+    [{ responseId: 'gem-1', modelVersion: 'gemini-3-flash' }, 'gem-1'],
+  ];
+  for (const [reply, expected] of cases) {
+    const got = await fixture(reply, { success: true, request: { model: 'vendor/asked' } });
+    assert.equal(got.body.response_id, expected, JSON.stringify(reply));
+  }
 });
 
 test('reads modelVersion from a gemini reply', async () => {

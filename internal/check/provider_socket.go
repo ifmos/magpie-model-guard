@@ -69,6 +69,7 @@ type providerSocket struct {
 	backendWriteMu sync.Mutex
 
 	pendingBytes atomic.Int64
+	supplier     *supplierRequest
 }
 
 // serveProviderSocket connects one front-end Responses socket to one native
@@ -83,7 +84,15 @@ func (s *Service) serveProviderSocket(w http.ResponseWriter, r *http.Request, cf
 			return
 		}
 	}
-	target, err := s.providerUpstreamTarget(cfg, r)
+	var target *url.URL
+	var err error
+	sr, _ := r.Context().Value(supplierContextKey{}).(*supplierRequest)
+	if sr != nil {
+		copyURL := *sr.target
+		target = &copyURL
+	} else {
+		target, err = s.providerUpstreamTarget(cfg, r)
+	}
 	if err != nil {
 		writeProviderError(w, matched.endpoint.proto, http.StatusBadGateway, "上游网关地址无效："+err.Error(), false)
 		return
@@ -95,9 +104,15 @@ func (s *Service) serveProviderSocket(w http.ResponseWriter, r *http.Request, cf
 		target.Scheme = "ws"
 	}
 	headers := providerSocketHeaders(r, cfg)
+	var httpClient *http.Client
+	if sr != nil {
+		headers = supplierSocketHeaders(r)
+		httpClient = &http.Client{Transport: sr.transport, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect refused") }}
+	}
 	dialCtx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	backend, resp, err := websocket.Dial(dialCtx, target.String(), &websocket.DialOptions{
 		HTTPHeader:      headers,
+		HTTPClient:      httpClient,
 		Subprotocols:    providerClientSubprotocols(r),
 		CompressionMode: websocket.CompressionNoContextTakeover,
 	})
@@ -136,6 +151,7 @@ func (s *Service) serveProviderSocket(w http.ResponseWriter, r *http.Request, cf
 		clientCh:  make(chan providerClientEvent, 64),
 		backendCh: make(chan providerBackendEvent),
 		interrupt: make(chan string, 1),
+		supplier:  sr,
 	}
 	defer cancelCtx()
 	defer ps.client.CloseNow()
@@ -478,7 +494,7 @@ func (ps *providerSocket) runTurn(ev providerClientEvent) {
 	ps.drainInterrupts()
 
 	cfg, err := ps.svc.store.LoadConfig()
-	if err != nil || !cfg.ProviderEnabled {
+	if err != nil || !ps.modeEnabled(cfg) {
 		_ = ps.client.Close(websocket.StatusPolicyViolation, "provider disabled")
 		ps.cancel()
 		return
@@ -490,6 +506,13 @@ func (ps *providerSocket) runTurn(ev providerClientEvent) {
 	}
 	model := strings.TrimSpace(ev.scan.Model)
 	target := findTargetForRequest(targets, model)
+	if ps.supplier != nil {
+		model, target, err = ps.svc.supplierModel(ps.supplier.binding.ProviderID, model)
+		if err != nil {
+			ps.failTurn(500, "model_guard_action_failed", "读取模型配置失败")
+			return
+		}
+	}
 	if target != nil && target.blockedAt(time.Now()) {
 		ps.sendSocketError(http.StatusForbidden, "model_guard_blocked", "该模型已被守卫禁用")
 		_ = ps.client.Close(websocket.StatusPolicyViolation, "model disabled")
@@ -515,7 +538,7 @@ func (ps *providerSocket) runTurn(ev providerClientEvent) {
 				ps.failTurn(http.StatusInternalServerError, "model_guard_action_failed", "读取 Provider 配置失败")
 				return
 			}
-			if !cfg.ProviderEnabled {
+			if !ps.modeEnabled(cfg) {
 				ps.failTurn(http.StatusServiceUnavailable, "model_guard_disabled", "Provider 已关闭")
 				return
 			}
@@ -658,6 +681,9 @@ func (ps *providerSocket) judgeAttempt(requested string, target *Target, rules [
 				inFrame = false
 				frame := append([]byte(nil), current...)
 				values := providerFrameValues(frame)
+				if ps.supplier != nil {
+					ps.svc.markSupplierReply(values.ResponseID)
+				}
 				if values.ResponseID != "" {
 					responseID = values.ResponseID
 				}
@@ -682,7 +708,7 @@ func (ps *providerSocket) judgeAttempt(requested string, target *Target, rules [
 					}
 					return flushOnly(nil)
 				case rule.Action == ResponseActionRecord:
-					if err := ps.svc.recordProviderResponse(requested, values.Model, target, *rule); err != nil {
+					if err := ps.record(requested, values.Model, target, *rule); err != nil {
 						ps.actionFailed(err)
 						return providerTurnDone
 					}
@@ -1033,7 +1059,7 @@ func (ps *providerSocket) failTurn(status int, code, message string) {
 }
 
 func (ps *providerSocket) blockTurn(requested, actual string, target *Target, rule ResponseModelRule, attempts int) {
-	if err := ps.svc.recordProviderResponse(requested, actual, target, rule); err != nil {
+	if err := ps.record(requested, actual, target, rule); err != nil {
 		ps.actionFailed(err)
 		return
 	}

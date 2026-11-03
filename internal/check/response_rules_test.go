@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -174,6 +175,100 @@ func TestHandleResponseModelDisablesAndReroutes(t *testing.T) {
 		if r.Source != "response" || r.ActualModel == "" {
 			t.Fatalf("bad response result: %+v", r)
 		}
+	}
+}
+
+func TestHandleResponseModelSkipsObservedSupplierReply(t *testing.T) {
+	svc, store := newRuleTestService(t)
+	cfg := mustConfig(t, store)
+	cfg.GatewayURL = "http://127.0.0.1:1"
+	cfg.GatewayKey = "gw"
+	cfg.ResponseModelMode = ResponseModelOn
+	cfg.ResponseRules = []ResponseModelRule{{
+		ID: "record-flash", Match: ResponseMatchContains, Pattern: "flash", Action: ResponseActionRecord,
+	}}
+	if err := svc.Configure(cfg); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	// The supplier inspector records the vendor-side id; Magpie's async hook
+	// reports the translated id. Prefix normalization must still correlate
+	// them even though the original request model was a group alias.
+	svc.markSupplierReply("chatcmpl-abc")
+	if err := svc.HandleResponseModel(ResponseModelEvent{
+		RequestedModel: "group/alias", ActualModel: "vendor/flash",
+		ResponseID: "resp_msg_abc", Success: true,
+	}); err != nil {
+		t.Fatalf("observed event: %v", err)
+	}
+	if results, err := store.Results("group/alias", "response-model", 10); err != nil || len(results) != 0 {
+		t.Fatalf("observed supplier reply was judged again: %d results, err=%v", len(results), err)
+	}
+
+	// An id that was never observed keeps its asynchronous judgment.
+	if err := svc.HandleResponseModel(ResponseModelEvent{
+		RequestedModel: "group/unseen", ActualModel: "vendor/flash",
+		ResponseID: "resp_other", Success: true,
+	}); err != nil {
+		t.Fatalf("unobserved event: %v", err)
+	}
+	if results, err := store.Results("group/unseen", "response-model", 10); err != nil || len(results) != 1 {
+		t.Fatalf("unobserved reply was suppressed: %d results, err=%v", len(results), err)
+	}
+
+	// Missing ids must not broadly suppress unrelated group requests.
+	if err := svc.HandleResponseModel(ResponseModelEvent{
+		RequestedModel: "group/no-id", ActualModel: "vendor/flash", Success: true,
+	}); err != nil {
+		t.Fatalf("missing-id event: %v", err)
+	}
+	if results, err := store.Results("group/no-id", "response-model", 10); err != nil || len(results) != 1 {
+		t.Fatalf("missing-id reply was suppressed: %d results, err=%v", len(results), err)
+	}
+}
+
+func TestSupplierReplyIDKeyNormalizesProtocolPrefixes(t *testing.T) {
+	cases := map[string]string{
+		"":                    "",
+		"   ":                 "",
+		"abc":                 "abc",
+		"chatcmpl-abc":        "abc",
+		"resp_chatcmpl-abc":   "abc",
+		"msg_abc":             "abc",
+		"resp_msg_chatcmpl-a": "a",
+		"message-abc":         "message-abc",
+	}
+	for in, want := range cases {
+		if got := supplierReplyIDKey(in); got != want {
+			t.Errorf("supplierReplyIDKey(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSupplierReplyRegistryBoundedAndExpires(t *testing.T) {
+	svc, _ := newRuleTestService(t)
+	for i := range supplierReplyLimit + 32 {
+		svc.markSupplierReply("id-" + strconv.Itoa(i))
+	}
+	svc.mu.Lock()
+	n := len(svc.supplierReplies)
+	svc.mu.Unlock()
+	if n > supplierReplyLimit {
+		t.Fatalf("registry kept %d ids, limit %d", n, supplierReplyLimit)
+	}
+	if !svc.supplierReplyObserved("id-" + strconv.Itoa(supplierReplyLimit+31)) {
+		t.Fatal("most recent supplier reply id was not retained")
+	}
+	if svc.supplierReplyObserved("") {
+		t.Fatal("empty id must never be treated as an observed reply")
+	}
+
+	svc.markSupplierReply("expired-id")
+	svc.mu.Lock()
+	svc.supplierReplies[supplierReplyIDKey("expired-id")] = time.Now().UTC().Add(-supplierReplyTTL - time.Second)
+	svc.mu.Unlock()
+	if svc.supplierReplyObserved("expired-id") {
+		t.Fatal("expired supplier reply id was still observed")
 	}
 }
 

@@ -179,6 +179,7 @@ func hasResponseRules(cfg GuardConfig, targets []*Target) bool {
 type ResponseModelEvent struct {
 	RequestedModel string `json:"requested_model"`
 	ActualModel    string `json:"actual_model"`
+	ResponseID     string `json:"response_id,omitempty"`
 	Protocol       string `json:"protocol,omitempty"`
 	Agent          string `json:"agent,omitempty"`
 	Success        bool   `json:"success"`

@@ -81,6 +81,9 @@ func Call(ctx context.Context, c ProbeConfig, model, prompt string, progress fun
 	}
 	req.Header.Set("Authorization", "Bearer "+c.GatewayKey)
 	req.Header.Set("Content-Type", "application/json")
+	if strings.HasPrefix(model, ProbeAliasPrefix) {
+		req.Header.Set("X-Magpie-Session", probeSession(model))
+	}
 	resp, err := probeHTTP.Do(req)
 	if err != nil {
 		return "", 0, err

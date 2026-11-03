@@ -140,6 +140,10 @@ func providerPrefixOwned(path string) bool {
 // ("GET /"), so the prefix is dispatched here instead of being registered.
 func registerProvider(mux *http.ServeMux, s *Service) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/upstream" || strings.HasPrefix(r.URL.Path, "/upstream/") {
+			s.apiSupplier(w, r)
+			return
+		}
 		if providerPrefixOwned(r.URL.Path) {
 			s.apiProvider(w, r)
 			return
@@ -505,6 +509,7 @@ type providerProxyState struct {
 	target    *Target
 	rules     []ResponseModelRule
 	attempts  int
+	supplier  *supplierRequest
 }
 
 // proxyProvider wires the standard reverse proxy for one request. Judged
@@ -735,7 +740,7 @@ func (t *providerTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			return resp, nil
 		}
 		if rule.Action == ResponseActionRecord {
-			if err := st.svc.recordProviderResponse(st.requested, actual, st.target, *rule); err != nil {
+			if err := st.record(actual, *rule); err != nil {
 				_ = resp.Body.Close()
 				return nil, providerActionError(err)
 			}
@@ -746,7 +751,7 @@ func (t *providerTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		if attempt < attempts {
 			continue
 		}
-		if err := st.svc.recordProviderResponse(st.requested, actual, st.target, *rule); err != nil {
+		if err := st.record(actual, *rule); err != nil {
 			return nil, providerActionError(err)
 		}
 		return providerLocalResponse(http.StatusServiceUnavailable, st.proto,
@@ -762,8 +767,15 @@ func (st *providerProxyState) liveCheck() error {
 	if err != nil {
 		return &providerLocalError{status: http.StatusInternalServerError, message: "读取 Provider 配置失败"}
 	}
-	if !cfg.ProviderEnabled {
+	if st.supplier != nil {
+		if err := st.supplier.live(); err != nil {
+			return &providerLocalError{status: http.StatusServiceUnavailable, message: "供应商保护已关闭或配置冲突"}
+		}
+	} else if !cfg.ProviderEnabled {
 		return &providerLocalError{status: http.StatusNotFound, message: "Provider 已关闭"}
+	}
+	if st.supplier != nil && st.supplier.probe {
+		return nil
 	}
 	if st.target != nil {
 		latest, err := st.svc.store.Target(st.target.Model)
@@ -803,6 +815,9 @@ func (st *providerProxyState) inspectResponse(resp *http.Response) (string, erro
 			return "", &providerLocalError{status: http.StatusBadGateway, message: "读取上游流式响应失败"}
 		}
 		resp.Body = &providerPrependReader{prefix: prefix, rest: rest, closer: rest}
+		if st.supplier != nil {
+			st.svc.markSupplierReply(supplierStreamReplyID(prefix, providerStreamSSE))
+		}
 		if decoded {
 			stripProviderEncoding(resp)
 		}
@@ -814,6 +829,9 @@ func (st *providerProxyState) inspectResponse(resp *http.Response) (string, erro
 			return "", &providerLocalError{status: http.StatusBadGateway, message: "读取上游流式响应失败"}
 		}
 		resp.Body = &providerPrependReader{prefix: prefix, rest: rest, closer: rest}
+		if st.supplier != nil {
+			st.svc.markSupplierReply(supplierStreamReplyID(prefix, providerStreamNDJSON))
+		}
 		if decoded {
 			stripProviderEncoding(resp)
 		}
@@ -847,6 +865,9 @@ func (st *providerProxyState) inspectResponse(resp *http.Response) (string, erro
 		if err != nil {
 			_ = spool.Close()
 			return "", &providerLocalError{status: http.StatusInternalServerError, message: "缓冲上游响应失败"}
+		}
+		if st.supplier != nil {
+			st.svc.markSupplierReply(values.ResponseID)
 		}
 		resp.Body = &providerSpoolReader{ReadCloser: delivery, spool: spool}
 		// The replay serves exactly the spooled bytes; state the true length.

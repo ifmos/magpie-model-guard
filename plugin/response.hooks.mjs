@@ -80,6 +80,24 @@ function actualModel(reply) {
   return '';
 }
 
+// replyID is the id the client reply carries. Magpie renders streams into one
+// whole reply before the hook sees it, so the translated protocol's id field
+// is the one to read; the vendor-side id is prefix-normalized by the backend.
+function replyID(reply) {
+  if (!reply || typeof reply !== 'object') return '';
+  const candidates = [
+    reply.id,
+    reply.responseId,
+    reply.response?.id,
+    reply.response?.responseId,
+    reply.message?.id,
+  ];
+  for (const value of candidates) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
 export async function onResponse(reply, ctx) {
   try {
     if (!ctx || ctx.success !== true) return;
@@ -101,6 +119,7 @@ export async function onResponse(reply, ctx) {
       body: JSON.stringify({
         requested_model: requested,
         actual_model: actual,
+        response_id: replyID(reply),
         protocol: typeof ctx.protocol === 'string' ? ctx.protocol : '',
         agent: typeof ctx.agent === 'string' ? ctx.agent : '',
         success: true,

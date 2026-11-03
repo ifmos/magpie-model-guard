@@ -232,6 +232,7 @@ type providerScanValues struct {
 	Model              string
 	Type               string
 	ResponseID         string
+	responseIDRank     int
 	PreviousResponseID string
 	Compaction         bool
 	Generate           bool
@@ -718,18 +719,33 @@ func observeProviderJSONString(path, value string, out *providerScanValues, requ
 		}
 		return
 	case "response_id":
-		if out.ResponseID == "" {
-			out.ResponseID = strings.TrimSpace(value)
-		}
+		considerProviderResponseID(out, value, 3)
 		return
 	case "response.id":
-		if out.ResponseID == "" {
-			out.ResponseID = strings.TrimSpace(value)
-		}
+		considerProviderResponseID(out, value, 3)
+		return
+	case "responseId", "response.responseId":
+		// Gemini and Code Assist name the reply's id responseId.
+		considerProviderResponseID(out, value, 3)
 		return
 	case "previous_response_id":
 		if out.PreviousResponseID == "" {
 			out.PreviousResponseID = strings.TrimSpace(value)
+		}
+		return
+	case "message.id":
+		// Anthropic stream events put the message id under message. A content
+		// block's top-level id must not outrank it.
+		if !request {
+			considerProviderResponseID(out, value, 2)
+		}
+		return
+	case "id":
+		// Chat and Anthropic whole replies carry the id at the top level.
+		// Responses stream events also have item ids there, hence the lower
+		// rank than response.id/response_id.
+		if !request {
+			considerProviderResponseID(out, value, 1)
 		}
 		return
 	}
@@ -752,6 +768,20 @@ func observeProviderJSONString(path, value string, out *providerScanValues, requ
 		"candidates.0.model", "candidates.0.modelVersion":
 		out.Model = strings.TrimSpace(value)
 	}
+}
+
+// considerProviderResponseID keeps the most authoritative reply id seen in a
+// document: an explicit response id outranks message.id, which outranks a bare
+// top-level id that can also name a Responses output item.
+func considerProviderResponseID(out *providerScanValues, value string, rank int) {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > providerModelValueLimit || rank < out.responseIDRank {
+		return
+	}
+	if rank == out.responseIDRank && out.ResponseID != "" {
+		return
+	}
+	out.ResponseID, out.responseIDRank = value, rank
 }
 
 // providerDecodeReader wraps body with a gzip or zstd decoder. The returned
@@ -970,7 +1000,34 @@ func providerStreamModel(buf []byte, format providerStreamFormat) string {
 	return ""
 }
 
+// supplierStreamReplyID returns the reply id found in complete SSE events or
+// NDJSON lines of a captured supplier response prefix. It is used only to
+// correlate that response with Magpie's async hook; an empty id means the
+// vendor (or the prefix window) did not expose one.
+func supplierStreamReplyID(prefix []byte, format providerStreamFormat) string {
+	return providerStreamScanValues(prefix, format).ResponseID
+}
+
+// providerStreamScanValues scans the complete SSE events or NDJSON lines in a
+// captured prefix and returns the first model plus the most authoritative
+// reply id. Callers use the id to correlate a synchronously judged supplier
+// response with Magpie's later async hook; incomplete trailing data is skipped.
+func providerStreamScanValues(buf []byte, format providerStreamFormat) providerScanValues {
+	switch format {
+	case providerStreamSSE:
+		return providerSSEScanValues(buf)
+	case providerStreamNDJSON:
+		return providerNDJSONScanValues(buf)
+	}
+	return providerScanValues{}
+}
+
 func providerSSEModel(buf []byte) string {
+	return providerSSEScanValues(buf).Model
+}
+
+func providerSSEScanValues(buf []byte) providerScanValues {
+	var out providerScanValues
 	offset := 0
 	for {
 		end := -1
@@ -993,19 +1050,21 @@ func providerSSEModel(buf []byte) string {
 			start = i + 1
 		}
 		if end < 0 {
-			return ""
+			return out
 		}
-		if model := providerSSEEventModel(buf[offset:end]); model != "" {
-			return model
-		}
+		mergeProviderScanValues(&out, providerSSEEventValues(buf[offset:end]))
 		offset = end
 		if offset >= len(buf) {
-			return ""
+			return out
 		}
 	}
 }
 
 func providerSSEEventModel(event []byte) string {
+	return providerSSEEventValues(event).Model
+}
+
+func providerSSEEventValues(event []byte) providerScanValues {
 	var data []string
 	for _, raw := range bytes.Split(event, []byte("\n")) {
 		line := strings.TrimSuffix(strings.TrimSuffix(string(raw), "\n"), "\r")
@@ -1016,25 +1075,30 @@ func providerSSEEventModel(event []byte) string {
 		}
 	}
 	if len(data) == 0 {
-		return ""
+		return providerScanValues{}
 	}
 	payload := strings.TrimSpace(strings.Join(data, "\n"))
 	if payload == "" || payload == "[DONE]" {
-		return ""
+		return providerScanValues{}
 	}
 	values, err := scanProviderJSON(strings.NewReader(payload), int64(len(payload))+1)
 	if err != nil {
-		return ""
+		return providerScanValues{}
 	}
-	return values.Model
+	return values
 }
 
 func providerNDJSONModel(buf []byte) string {
+	return providerNDJSONScanValues(buf).Model
+}
+
+func providerNDJSONScanValues(buf []byte) providerScanValues {
+	var out providerScanValues
 	offset := 0
 	for {
 		idx := bytes.IndexByte(buf[offset:], '\n')
 		if idx < 0 {
-			return ""
+			return out
 		}
 		line := bytes.TrimSuffix(buf[offset:offset+idx], []byte("\r"))
 		offset += idx + 1
@@ -1045,9 +1109,26 @@ func providerNDJSONModel(buf []byte) string {
 		if err != nil {
 			continue
 		}
-		if values.Model != "" {
-			return values.Model
-		}
+		mergeProviderScanValues(&out, values)
+	}
+}
+
+func mergeProviderScanValues(dst *providerScanValues, src providerScanValues) {
+	if dst.Model == "" {
+		dst.Model = src.Model
+	}
+	if dst.Type == "" {
+		dst.Type = src.Type
+	}
+	if src.ResponseID != "" && (dst.ResponseID == "" || src.responseIDRank > dst.responseIDRank) {
+		dst.ResponseID, dst.responseIDRank = src.ResponseID, src.responseIDRank
+	}
+	if dst.PreviousResponseID == "" {
+		dst.PreviousResponseID = src.PreviousResponseID
+	}
+	dst.Compaction = dst.Compaction || src.Compaction
+	if !dst.HasGenerate && src.HasGenerate {
+		dst.Generate, dst.HasGenerate = src.Generate, true
 	}
 }
 

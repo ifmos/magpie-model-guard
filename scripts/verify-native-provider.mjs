@@ -120,6 +120,7 @@ async function startFixture() {
     counts: {},
     requests: [],
     modelMode: 'alias',
+    omitReplyID: false,
     failPrimary: false,
     failAll: false,
     refuseAll: false,
@@ -151,6 +152,7 @@ async function startFixture() {
       }
       if (url.pathname === '/__control') {
         if (url.searchParams.has('modelMode')) state.modelMode = url.searchParams.get('modelMode');
+        if (url.searchParams.has('omitReplyID')) state.omitReplyID = url.searchParams.get('omitReplyID') === '1';
         if (url.searchParams.has('failPrimary')) state.failPrimary = url.searchParams.get('failPrimary') === '1';
         if (url.searchParams.has('failAll')) state.failAll = url.searchParams.get('failAll') === '1';
         if (url.searchParams.has('refuseAll')) state.refuseAll = url.searchParams.get('refuseAll') === '1';
@@ -209,13 +211,13 @@ async function startFixture() {
       if (url.pathname.endsWith('/chat/completions')) {
         if (body.stream) {
           res.writeHead(200, { 'content-type': 'text/event-stream' });
-          res.write(`data: ${JSON.stringify({ id: 'chatcmpl_fixture', object: 'chat.completion.chunk', model, choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: null }] })}\n\n`);
+          res.write(`data: ${JSON.stringify({ ...(state.omitReplyID ? {} : { id: 'chatcmpl_fixture' }), object: 'chat.completion.chunk', model, choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: null }] })}\n\n`);
           const done = () => { if (res.writableEnded) return; res.write('data: [DONE]\n\n'); res.end(); };
           if (state.holdBadMs > 0 && model === 'fixture-bad') setTimeout(done, state.holdBadMs);
           else done();
           return;
         }
-        json({ id: 'chatcmpl_fixture', object: 'chat.completion', model, choices: [{ index: 0, message: { role: 'assistant', content: tool ? 'tool-ok' : 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } });
+        json({ ...(state.omitReplyID ? {} : { id: 'chatcmpl_fixture' }), object: 'chat.completion', model, choices: [{ index: 0, message: { role: 'assistant', content: tool ? 'tool-ok' : 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } });
         return;
       }
       if (url.pathname.endsWith('/responses')) {
@@ -395,8 +397,8 @@ process.stdin.on('end', () => process.exit(0));
 }
 
 function guardAPI(info) {
-  return async function api(route, { method = 'GET', body, gatewayKey } = {}) {
-    const headers = { authorization: `Bearer ${info.control}` };
+  return async function api(route, { method = 'GET', body, gatewayKey, control = false } = {}) {
+    const headers = { authorization: `Bearer ${control ? info.hookControl : info.control}` };
     if (body !== undefined) headers['content-type'] = 'application/json';
     if (gatewayKey) headers['x-gateway-key'] = gatewayKey;
     const response = await fetch(info.origin + route, {
@@ -1050,6 +1052,142 @@ async function consoleAcceptance(ctx, api) {
   await api('/api/config', { method: 'POST', body: { ...config, provider_enabled: true } });
 }
 
+// Supplier protection keeps every client request on the Magpie gateway.
+async function supplierAcceptance(ctx, api, options) {
+  await guardConfig(ctx, api, { provider_enabled: false, response_model_mode: 'off' });
+  const file = path.join(ctx.configHome, 'magpie', 'providers.json');
+  const before = JSON.parse(await readFile(file, 'utf8'));
+  const original = before.providers.find(p => p.id === PROVIDER);
+  const list = await api('/api/suppliers');
+  assert.ok(list.configured && list.providers.some(p => p.id === PROVIDER));
+  await api('/api/suppliers/protection', { method: 'POST', body: { provider_id: PROVIDER, enabled: true } });
+  const managed = JSON.parse(await readFile(file, 'utf8')).providers.find(p => p.id === PROVIDER);
+  assert.ok(managed.chat.startsWith(ctx.info.origin + '/upstream/'));
+  assert.equal(managed.key, original.key);
+  assert.deepEqual(managed.keys, original.keys);
+  assert.deepEqual(managed.models, original.models);
+  await setTarget(ctx, api, CHAT, { id: 'supplier-disable', match: 'exact', pattern: 'fixture-bad', action: 'disable' });
+  await fixtureControl(ctx, 'modelMode=bad-then-good&resetBadFirst=1');
+  const count = await requestCount(ctx, '/chat/v1/chat/completions');
+  const response = await magpieFetch(ctx, '/v1/chat/completions', { method: 'POST', body: { model: CHAT, messages: [{ role: 'user', content: 'supplier protection' }] } });
+  const text = await response.text();
+  assert.equal(response.status, 200, text);
+  assert.equal(await requestCount(ctx, '/chat/v1/chat/completions'), count + 2, 'supplier rule did not retry before Magpie delivered the reply');
+  assert.ok(!text.includes('fixture-bad'), 'rejected vendor model leaked to the client');
+  const seen = await lastFixtureRequest(ctx, '/chat/completions');
+  assert.ok(seen.headers.authorization?.startsWith('Bearer '));
+  assert.equal(seen.headers['x-model-guard-session'], undefined, 'internal probe marker leaked');
+  assert.equal(JSON.parse(seen.body).model, 'fixture-chat');
+  assert.equal(JSON.parse(seen.body).fixture_replace, 'override');
+
+  for (const [route, body, vendorPath] of [
+    ['/v1/messages', { model: CHAT, max_tokens: 128, messages: [{ role: 'user', content: 'hello' }] }, '/anthropic/v1/messages'],
+    ['/v1/responses', { model: CHAT, input: 'hello', stream: true }, '/responses/v1/responses'],
+    [`/v1beta/models/${encodeURIComponent(CHAT)}:generateContent`, { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] }, '/gemini/v1beta/models/fixture-chat:streamGenerateContent'],
+  ]) {
+    const settingsFile = path.join(ctx.configHome, 'magpie', 'settings.json');
+    const settingsBefore = JSON.parse(await readFile(settingsFile, 'utf8').catch(error => { if (error.code === 'ENOENT') return '{}'; throw error; }));
+    if (route.startsWith('/v1beta/')) {
+      await writeFile(settingsFile, JSON.stringify({ ...settingsBefore, modelAPIs: { ...settingsBefore.modelAPIs, [CHAT]: 'gemini' } }));
+    }
+    await fixtureControl(ctx, 'modelMode=bad-then-good&resetBadFirst=1');
+    const n = await requestCount(ctx, vendorPath);
+    const reply = await magpieFetch(ctx, route, { method: 'POST', body });
+    const content = await reply.text();
+    assert.equal(reply.status, 200, `${route}: ${content}`);
+    const afterCount = await requestCount(ctx, vendorPath);
+    if (afterCount !== n + 2) {
+      const trace = await (await fetch(ctx.fixture.base + '/__state')).json();
+      throw new Error(`${route} supplier retries: expected ${n + 2}, got ${afterCount}; recent vendor paths: ${trace.requests.slice(-10).map(r => r.path).join(', ')}`);
+    }
+    assert.ok(!content.includes('fixture-bad'), `${route} leaked the blocked model`);
+    if (route.startsWith('/v1beta/')) await writeFile(settingsFile, JSON.stringify(settingsBefore));
+  }
+
+  // Install only the generated middleware, avoiding a second plugin host.
+  await magpieCLI(ctx, ['plugin', 'add', path.join(ctx.pkgDir, 'plugin', 'gate.middleware.js')]);
+  await api('/api/prompts', { method: 'POST', body: { id: 'supplier-probe', name: 'Supplier recovery', text: 'hello', grader: 'exact', expect: 'ok', automatic: false } });
+  await api('/api/targets/action', { method: 'POST', body: { model: CHAT, action: 'disable' } });
+  const blockedCount = await requestCount(ctx, '/chat/v1/chat/completions');
+  const blocked = await magpieFetch(ctx, '/v1/chat/completions', { method: 'POST', body: { model: CHAT, messages: [] } });
+  assert.equal(blocked.status, 403);
+  await blocked.text();
+  assert.equal(await requestCount(ctx, '/chat/v1/chat/completions'), blockedCount);
+  const probe = await api('/api/probe', { method: 'POST', body: { model: CHAT, prompt_id: 'supplier-probe' } });
+  assert.equal(probe.verdict, 'passed', 'protected blocked model must still receive its recovery probe');
+  assert.equal(await requestCount(ctx, '/chat/v1/chat/completions'), blockedCount + 1);
+  await api('/api/targets/action', { method: 'POST', body: { model: CHAT, action: 'enable' } });
+  await fixtureControl(ctx, 'modelMode=alias');
+  await waitFor('middleware release after enable', async () => {
+    const released = await magpieFetch(ctx, '/v1/chat/completions', { method: 'POST', body: { model: CHAT, messages: [] } });
+    await released.text();
+    return released.status === 200;
+  });
+
+  await fixtureControl(ctx, 'modelMode=bad');
+  await setTarget(ctx, api, CHAT, { id: 'supplier-record', match: 'exact', pattern: 'fixture-bad', action: 'record' });
+  const recordCount = await requestCount(ctx, '/chat/v1/chat/completions');
+  const recorded = await magpieFetch(ctx, '/v1/chat/completions', { method: 'POST', body: { model: CHAT, messages: [] } });
+  assert.equal(recorded.status, 200);
+  await recorded.text();
+  assert.equal(await requestCount(ctx, '/chat/v1/chat/completions'), recordCount + 1);
+  const records = await api('/api/results?model=' + encodeURIComponent(CHAT));
+  assert.ok(records.some(r => r.rule_id === 'supplier-record' && r.actual_model === 'fixture-bad'));
+
+  // A vendor reply without an id acquires a fresh id during native translation.
+  // The async hook must still leave ownership with supplier protection.
+  const noIDSettingsFile = path.join(ctx.configHome, 'magpie', 'settings.json');
+  const noIDSettingsBefore = JSON.parse(await readFile(noIDSettingsFile, 'utf8'));
+  await writeFile(noIDSettingsFile, JSON.stringify({ ...noIDSettingsBefore, modelAPIs: { ...noIDSettingsBefore.modelAPIs, [CHAT]: 'chat' } }));
+  await fixtureControl(ctx, 'modelMode=alias&omitReplyID=1');
+  await setTarget(ctx, api, CHAT, { id: 'direct-duplicate', match: 'exact', pattern: CHAT, action: 'disable' });
+  const noIDResponse = await magpieFetch(ctx, '/v1/responses', { method: 'POST', body: { model: CHAT, input: 'vendor reply without id' } });
+  const noIDReply = await jsonOf(noIDResponse);
+  assert.equal(noIDResponse.status, 200);
+  assert.ok(noIDReply.id, 'native translation did not generate a reply id');
+  assert.notEqual(noIDReply.id, 'chatcmpl_fixture');
+  await api('/api/response-model', { method: 'POST', body: { requested_model: CHAT, actual_model: CHAT, response_id: noIDReply.id, success: true }, control: true });
+  const noIDTarget = (await api('/api/targets')).find(t => t.model === CHAT);
+  assert.notEqual(noIDTarget.state, 'failed', 'generated id caused a duplicate async disable');
+  assert.ok(!(await api('/api/results?model=' + encodeURIComponent(CHAT))).some(r => r.rule_id === 'direct-duplicate'), 'generated id caused a duplicate async result');
+  await fixtureControl(ctx, 'omitReplyID=0');
+  await writeFile(noIDSettingsFile, JSON.stringify(noIDSettingsBefore));
+  await setTarget(ctx, api, CHAT, { id: 'supplier-record', match: 'exact', pattern: 'fixture-bad', action: 'record' });
+
+  const groupedConfig = JSON.parse(await readFile(file, 'utf8'));
+  groupedConfig.groups = [...(groupedConfig.groups || []), { id: 'supplier-check', name: 'Supplier check', members: [CHAT], routing: 'order' }];
+  await writeFile(file, JSON.stringify(groupedConfig));
+  await guardConfig(ctx, api, { provider_enabled: false, response_model_mode: 'on', response_rules: [{ id: 'group-duplicate', match: 'exact', pattern: 'group/supplier-check', action: 'record' }] });
+  const grouped = await magpieFetch(ctx, '/v1/chat/completions', { method: 'POST', body: { model: 'group/supplier-check', messages: [] } });
+  const groupedReply = await jsonOf(grouped);
+  assert.equal(grouped.status, 200);
+  await api('/api/response-model', { method: 'POST', body: { requested_model: 'group/supplier-check', actual_model: 'group/supplier-check', response_id: groupedReply.id, success: true }, control: true });
+  const duplicates = await api('/api/results?model=group%2Fsupplier-check');
+  assert.ok(!duplicates.some(r => r.rule_id === 'group-duplicate'), 'group reply was judged twice');
+  await guardConfig(ctx, api, { provider_enabled: false, response_model_mode: 'off', response_rules: [] });
+
+  const oldOrigin = ctx.info.origin;
+  await stopChild(ctx.guard);
+  ctx.guard = null;
+  const restarted = await startHost(ctx.tempRoot, ctx.pkgDir, options);
+  ctx.guard = restarted.child;
+  ctx.info = restarted.info;
+  assert.equal(ctx.info.origin, oldOrigin);
+  const restartedAPI = guardAPI(ctx.info);
+  assert.ok((await restartedAPI('/api/suppliers')).providers.find(p => p.id === PROVIDER).protected);
+  await restartedAPI('/api/suppliers/protection', { method: 'POST', body: { provider_id: PROVIDER, enabled: false } });
+  const restored = JSON.parse(await readFile(file, 'utf8')).providers.find(p => p.id === PROVIDER);
+  for (const key of ['chat', 'responses', 'anthropic', 'gemini', 'proxy', 'accountProxies', 'headers']) {
+    assert.deepEqual(restored[key], original[key], `${key} was not restored`);
+  }
+  await setTarget(ctx, restartedAPI, CHAT, null);
+  await fixtureControl(ctx, 'modelMode=alias');
+  const unprotected = await magpieFetch(ctx, '/v1/chat/completions', { method: 'POST', body: { model: CHAT, messages: [] } });
+  assert.equal(unprotected.status, 200);
+  await unprotected.text();
+  console.log('supplier protection acceptance passed (unchanged client URL/key/models; four native protocols; retry, record, restart, restore)');
+}
+
 async function restartAcceptance(ctx, pluginIndex, options) {
   const oldOrigin = ctx.info.origin;
   const oldKey = (await consoleFetch(ctx, '/api/state')).json.config.provider_key;
@@ -1126,6 +1264,7 @@ async function main() {
     await wsAcceptance(ctx, api, helper);
     await consoleAcceptance(ctx, api);
     await restartAcceptance(ctx, pluginIndex, options);
+    await supplierAcceptance(ctx, guardAPI(ctx.info), { ...options, backendAddr: new URL(ctx.info.origin).host });
 
     assert.ok(helper, 'ws helper was not built');
     console.log('native provider acceptance passed');

@@ -29,6 +29,8 @@ func registerAPI(mux *http.ServeMux, s *Service, access *Access, console *Consol
 
 	mux.Handle("GET /api/state", h(s.apiState))
 	mux.Handle("GET /api/models", h(s.apiModels))
+	mux.Handle("GET /api/suppliers", h(s.apiSuppliers))
+	mux.Handle("POST /api/suppliers/protection", h(s.apiSupplierProtection))
 	mux.Handle("POST /api/config", h(s.apiConfig))
 	mux.Handle("POST /api/config/initial", h(s.apiConfigInitial))
 	mux.Handle("GET /api/targets", h(s.apiTargets))

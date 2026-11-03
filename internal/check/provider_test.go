@@ -1458,6 +1458,66 @@ func TestProviderJSONRequestModel(t *testing.T) {
 	}
 }
 
+func TestProviderJSONResponseIDs(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		request bool
+		want    string
+	}{
+		{"chat whole", `{"id":"chatcmpl-a","model":"m"}`, false, "chatcmpl-a"},
+		{"anthropic whole", `{"id":"msg_a","model":"m"}`, false, "msg_a"},
+		{"anthropic stream message", `{"message":{"id":"msg_b","model":"m"}}`, false, "msg_b"},
+		{"message outranks bare id", `{"id":"block","message":{"id":"msg_c"}}`, false, "msg_c"},
+		{"responses whole", `{"id":"resp_a","model":"m"}`, false, "resp_a"},
+		{"responses nested", `{"response":{"id":"resp_b","model":"m"}}`, false, "resp_b"},
+		{"responses explicit", `{"response_id":"resp_c"}`, false, "resp_c"},
+		{"gemini responseId", `{"responseId":"gem_a"}`, false, "gem_a"},
+		{"gemini nested responseId", `{"response":{"responseId":"gem_b"}}`, false, "gem_b"},
+		{"response id outranks item id", `{"type":"response.output_item.added","id":"item_1","response":{"id":"resp_win"}}`, false, "resp_win"},
+		{"request top-level id ignored", `{"id":"req-id","message":{"id":"req-msg"},"model":"m"}`, true, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scan := scanProviderJSON
+			if tc.request {
+				scan = scanProviderJSONRequest
+			}
+			values, err := scan(strings.NewReader(tc.body), int64(len(tc.body))+1)
+			if err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			if values.ResponseID != tc.want {
+				t.Fatalf("response id = %q, want %q", values.ResponseID, tc.want)
+			}
+		})
+	}
+}
+
+func TestSupplierStreamReplyID(t *testing.T) {
+	cases := []struct {
+		name   string
+		body   string
+		format providerStreamFormat
+		want   string
+	}{
+		{"chat SSE", "data: {\"id\":\"chatcmpl-a\",\"model\":\"m\"}\n\n", providerStreamSSE, "chatcmpl-a"},
+		{"responses SSE", "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_a\",\"model\":\"m\"}}\n\n", providerStreamSSE, "resp_a"},
+		{"anthropic SSE", "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"model\":\"m\"}}\n\n", providerStreamSSE, "msg_a"},
+		{"gemini SSE", "data: {\"responseId\":\"gem_a\",\"modelVersion\":\"m\"}\n\n", providerStreamSSE, "gem_a"},
+		{"multiline data", "data: {\"type\":\"response.created\",\ndata: \"response\":{\"id\":\"resp_m\"}}\n\n", providerStreamSSE, "resp_m"},
+		{"NDJSON", "{\"id\":\"chatcmpl-n\",\"model\":\"m\"}\n", providerStreamNDJSON, "chatcmpl-n"},
+		{"incomplete event ignored", "data: {\"id\":\"chatcmpl-x\"", providerStreamSSE, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := supplierStreamReplyID([]byte(tc.body), tc.format); got != tc.want {
+				t.Fatalf("reply id = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 type oneByteReader struct{ data []byte }
 
 func (r *oneByteReader) Read(p []byte) (int, error) {

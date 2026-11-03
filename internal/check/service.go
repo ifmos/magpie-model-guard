@@ -65,14 +65,28 @@ type Service struct {
 	providerRoot   string
 	providerOrigin string
 	dataDir        string
+	suppliers      *supplierController
 
 	// Response-model judgment.
 	responseHits map[string]time.Time // key -> last action
-	hookMu       sync.Mutex
-	hookPath     string
-	hookOrigin   string
-	hookControl  string
+	// supplierReplies records reply ids observed on synchronously judged
+	// supplier responses, keyed by their prefix-normalized form, so the async
+	// hook does not apply the same rule twice. It is bounded by count and TTL.
+	supplierReplies map[string]time.Time
+	hookMu          sync.Mutex
+	hookPath        string
+	hookOrigin      string
+	hookControl     string
 }
+
+// Supplier reply-id correlation limits. Vendor replies are small and unique;
+// the cap keeps a hostile or broken upstream from growing the registry without
+// bound, and the TTL only has to outlive one async observation.
+const (
+	supplierReplyTTL      = 5 * time.Minute
+	supplierReplyLimit    = 1024
+	supplierReplyIDLength = 512
+)
 
 // NewService loads state, seeds builtins, publishes the gate and starts the
 // scheduler loop.
@@ -97,12 +111,13 @@ func newService(store *Store, gatePath string, scheduled bool) (*Service, error)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Service{
-		store:        store,
-		gate:         gatePath,
-		running:      map[string]*runningProbe{},
-		responseHits: map[string]time.Time{},
-		ctx:          ctx,
-		cancel:       cancel,
+		store:           store,
+		gate:            gatePath,
+		running:         map[string]*runningProbe{},
+		responseHits:    map[string]time.Time{},
+		supplierReplies: map[string]time.Time{},
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 	s.mu.Lock()
 	err = s.publishGate()
@@ -396,6 +411,12 @@ func (s *Service) disableTargetForResponse(t *Target, detail string, now time.Ti
 // Callers hold s.mu. needsSync reports that persisted reroutes must be pushed
 // to route groups; the provider path does that synchronously.
 func (s *Service) applyResponseRuleLocked(cfg GuardConfig, requested, actual string, target *Target, rule ResponseModelRule, now time.Time) (bool, error) {
+	return s.applyResponseRuleForRouteLocked(cfg, requested, actual, actual, target, rule, now)
+}
+
+// applyResponseRuleForRouteLocked keeps the vendor model in history while
+// isolating the full Magpie model id selected by the supplier request.
+func (s *Service) applyResponseRuleForRouteLocked(cfg GuardConfig, requested, actual, routeModel string, target *Target, rule ResponseModelRule, now time.Time) (bool, error) {
 	key := responseHitKey(requested, actual, rule)
 	if last, ok := s.responseHits[key]; ok && now.Sub(last) < time.Minute {
 		return false, nil
@@ -431,7 +452,7 @@ func (s *Service) applyResponseRuleLocked(cfg GuardConfig, requested, actual str
 		}
 	case ResponseActionReroute:
 		detail += "，已加入后续请求改道"
-		err = s.store.AddResponseReroute(actual, now.Add(time.Duration(cfg.ResponseRerouteMin)*time.Minute))
+		err = s.store.AddResponseReroute(routeModel, now.Add(time.Duration(cfg.ResponseRerouteMin)*time.Minute))
 		needsSync = true
 	case ResponseActionRecord:
 		detail += "，仅记录"
@@ -498,9 +519,117 @@ func responseHitKey(requested, actual string, rule ResponseModelRule) string {
 	return requested + "|" + actual + "|" + rule.ID + "|" + rule.Action + "|" + rule.Pattern
 }
 
+// supplierReplyIDPrefixes are the protocol wrappers Magpie's native renderers
+// add to an upstream reply id. A vendor reply can be translated to another
+// client protocol (chatcmpl-… becomes msg_… and so on), so both the supplier
+// inspector and the async hook normalize the id before comparison.
+var supplierReplyIDPrefixes = [...]string{"chatcmpl-", "cmpl-", "resp_", "msg_"}
+
+// supplierReplyIDKey returns the prefix-normalized reply id, or "" when the id
+// is empty or longer than any real vendor id. Prefixes are stripped repeatedly
+// because a protocol translator can stack them (resp_msg_…).
+func supplierReplyIDKey(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" || len(id) > supplierReplyIDLength {
+		return ""
+	}
+	for {
+		trimmed := false
+		for _, prefix := range supplierReplyIDPrefixes {
+			if strings.HasPrefix(id, prefix) {
+				id = id[len(prefix):]
+				trimmed = true
+				break
+			}
+		}
+		if !trimmed {
+			return id
+		}
+		if id == "" {
+			return ""
+		}
+	}
+}
+
+// markSupplierReply records a reply id seen on a response Guard judged
+// synchronously through a protected supplier. Callers must not hold s.mu.
+func (s *Service) markSupplierReply(id string) {
+	key := supplierReplyIDKey(id)
+	if key == "" {
+		return
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.supplierReplies == nil {
+		s.supplierReplies = map[string]time.Time{}
+	}
+	for k, at := range s.supplierReplies {
+		if now.Sub(at) > supplierReplyTTL {
+			delete(s.supplierReplies, k)
+		}
+	}
+	if _, exists := s.supplierReplies[key]; !exists {
+		for len(s.supplierReplies) >= supplierReplyLimit {
+			oldestKey := ""
+			var oldest time.Time
+			for k, at := range s.supplierReplies {
+				if oldestKey == "" || at.Before(oldest) {
+					oldestKey, oldest = k, at
+				}
+			}
+			if oldestKey == "" {
+				break
+			}
+			delete(s.supplierReplies, oldestKey)
+		}
+	}
+	s.supplierReplies[key] = now
+}
+
+// supplierReplyObserved reports whether a matching supplier reply was judged
+// synchronously within the registry window.
+func (s *Service) supplierReplyObserved(id string) bool {
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.supplierReplyObservedLocked(id, now)
+}
+
+// supplierReplyObservedLocked is the lookup for callers already holding s.mu,
+// so the async path can combine it with its config snapshot.
+func (s *Service) supplierReplyObservedLocked(id string, now time.Time) bool {
+	key := supplierReplyIDKey(id)
+	if key == "" {
+		return false
+	}
+	at, ok := s.supplierReplies[key]
+	if !ok {
+		return false
+	}
+	if now.Sub(at) > supplierReplyTTL {
+		delete(s.supplierReplies, key)
+		return false
+	}
+	return true
+}
+
+// supplierGroupOrAutoRequest reports whether the original request model is a
+// routing group or auto alias rather than a provider-scoped model id.
+func supplierGroupOrAutoRequest(model string) bool {
+	return strings.HasPrefix(model, "group/") || strings.HasPrefix(model, "auto/")
+}
+
 // HandleResponseModel applies business-reply rules reported by Magpie's async
 // response hook. Provider mode runs its own synchronous judgment and drops
 // late events; otherwise actions are applied off the hook's critical path.
+// A reply id already observed on a protected supplier response is a duplicate
+// of that synchronous judgment, including group requests whose original model
+// name hides the resolved vendor. While any supplier protection is active, an
+// uncorrelated group/auto reply is skipped: the hook cannot name the supplier
+// that served it, and guessing could apply a second destructive action.
+// A direct request to a protected provider also skips async judgment when its
+// id is absent or regenerated by Magpie; unprotected providers keep it.
 func (s *Service) HandleResponseModel(ev ResponseModelEvent) error {
 	requested := strings.TrimSpace(ev.RequestedModel)
 	requested = strings.TrimSpace(strings.TrimPrefix(requested, "magpie/"))
@@ -511,7 +640,7 @@ func (s *Service) HandleResponseModel(ev ResponseModelEvent) error {
 	if !ev.Success || requested == "" || actual == "" {
 		return nil
 	}
-
+	responseID := strings.TrimSpace(ev.ResponseID)
 	now := time.Now().UTC()
 	s.mu.Lock()
 	cfg, err := s.store.LoadConfig()
@@ -524,6 +653,30 @@ func (s *Service) HandleResponseModel(ev ResponseModelEvent) error {
 		// for an in-flight reply would act on a request already judged there.
 		s.mu.Unlock()
 		return nil
+	}
+	if responseID != "" {
+		if s.supplierReplyObservedLocked(responseID, now) {
+			s.mu.Unlock()
+			return nil
+		}
+	}
+	if s.suppliers != nil && supplierGroupOrAutoRequest(requested) {
+		// A group can resolve to any protected supplier. Without a matched
+		// reply id the hook does not say which one served it; suppressing the
+		// async action is safer than applying a second destructive action.
+		active, aerr := s.suppliers.active()
+		if aerr != nil || active {
+			s.mu.Unlock()
+			return aerr
+		}
+	}
+	if s.suppliers != nil {
+		provider, _, _ := strings.Cut(requested, "/")
+		protected, err := s.suppliers.protectedProvider(provider)
+		if err != nil || protected {
+			s.mu.Unlock()
+			return err
+		}
 	}
 	targets, err := s.store.Targets()
 	if err != nil {
