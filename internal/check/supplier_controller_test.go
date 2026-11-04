@@ -363,6 +363,100 @@ func TestSupplierTakeoverRestorePreservesUnrelatedEditsAndSecrets(t *testing.T) 
 	}
 }
 
+func TestSupplierReservedHeaderDriftDoesNotBlockRestore(t *testing.T) {
+	store, configDir, ctrl := newSupplierTestEnv(t)
+	ctx := context.Background()
+	supplierTestWriteProviders(t, configDir, supplierTestProvidersFile())
+	if err := ctrl.setProtection(ctx, "vendor", true); err != nil {
+		t.Fatalf("enable protection: %v", err)
+	}
+	entry := supplierTestEntry(t, store, "vendor")
+
+	data := supplierTestReadProviders(t, configDir)
+	provider := supplierTestProvider(t, data, "vendor")
+	headers := provider["headers"].(map[string]any)
+	delete(headers, supplierSessionHeader)
+	headers[strings.ToLower(supplierSessionHeader)] = "externally-edited"
+	supplierTestWriteProviders(t, configDir, data)
+
+	list, err := ctrl.list(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Providers) != 1 || list.Providers[0].Conflict != "" || !list.Providers[0].Protected {
+		t.Fatalf("reserved header drift reported as conflict: %#v", list.Providers)
+	}
+	if _, ok, err := ctrl.binding(entry.Token, "chat"); err != nil || !ok {
+		t.Fatalf("reserved header drift blocked routing: ok=%v err=%v", ok, err)
+	}
+
+	if err := ctrl.setProtection(ctx, "vendor", false); err != nil {
+		t.Fatalf("restore with reserved header drift: %v", err)
+	}
+	provider = supplierTestProvider(t, supplierTestReadProviders(t, configDir), "vendor")
+	if got := provider["chat"]; got != "https://vendor.example/v1" {
+		t.Fatalf("chat base = %v, want original", got)
+	}
+	headers = provider["headers"].(map[string]any)
+	for name := range headers {
+		if strings.EqualFold(name, supplierSessionHeader) {
+			t.Fatalf("reserved header survived restore: %#v", headers)
+		}
+	}
+	if headers["Authorization"] != "Bearer header-secret" || headers["X-Other"] != "kept" {
+		t.Fatalf("unrelated headers changed: %#v", headers)
+	}
+	if ledger := supplierTestLedger(t, store); len(ledger.Entries) != 0 || ledger.Pending != nil {
+		t.Fatalf("ledger not cleared: %#v", ledger)
+	}
+}
+
+func TestSupplierStaleLedgerCleanupRemovesReservedHeader(t *testing.T) {
+	store, configDir, ctrl := newSupplierTestEnv(t)
+	ctx := context.Background()
+	supplierTestWriteProviders(t, configDir, supplierTestProvidersFile())
+	if err := ctrl.setProtection(ctx, "vendor", true); err != nil {
+		t.Fatalf("enable protection: %v", err)
+	}
+	data := supplierTestReadProviders(t, configDir)
+	provider := supplierTestProvider(t, data, "vendor")
+	// Manual restoration of the vendor bases plus a stray reserved header:
+	// the ledger must clear and the plugin-owned header must be removed.
+	for protocol, original := range map[string]string{
+		"chat":      "https://vendor.example/v1",
+		"responses": "https://vendor.example/v1",
+		"anthropic": "https://vendor.example/v1/messages",
+		"gemini":    "https://gemini.example",
+		"decide":    "https://vendor.example/v1",
+	} {
+		provider[protocol] = original
+	}
+	headers := provider["headers"].(map[string]any)
+	delete(headers, supplierSessionHeader)
+	headers[strings.ToLower(supplierSessionHeader)] = "stale"
+	supplierTestWriteProviders(t, configDir, data)
+
+	if err := ctrl.setProtection(ctx, "vendor", false); err != nil {
+		t.Fatalf("clear stale ledger: %v", err)
+	}
+	provider = supplierTestProvider(t, supplierTestReadProviders(t, configDir), "vendor")
+	headers = provider["headers"].(map[string]any)
+	for name := range headers {
+		if strings.EqualFold(name, supplierSessionHeader) {
+			t.Fatalf("reserved header survived stale cleanup: %#v", headers)
+		}
+	}
+	if headers["Authorization"] != "Bearer header-secret" || headers["X-Other"] != "kept" {
+		t.Fatalf("unrelated headers changed: %#v", headers)
+	}
+	if got := provider["chat"]; got != "https://vendor.example/v1" {
+		t.Fatalf("chat base = %v", got)
+	}
+	if ledger := supplierTestLedger(t, store); len(ledger.Entries) != 0 || ledger.Pending != nil {
+		t.Fatalf("ledger not cleared: %#v", ledger)
+	}
+}
+
 func TestHandleResponseModelSkipsUncorrelatedProtectedDirectReplies(t *testing.T) {
 	store, configDir, ctrl := newSupplierTestEnv(t)
 	svc, err := newService(store, filepath.Join(t.TempDir(), "gate.js"), false)
@@ -564,6 +658,57 @@ func TestSupplierExternalConflictAndProviderDeletion(t *testing.T) {
 	}
 	if _, ok, err := ctrl.binding(entry.Token, "chat"); err != nil || ok {
 		t.Fatalf("deleted provider token still bound: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestSupplierWALRecoveryWithReservedHeaderDrift(t *testing.T) {
+	store, configDir, ctrl := newSupplierTestEnv(t)
+	ctx := context.Background()
+	supplierTestWriteProviders(t, configDir, supplierTestProvidersFile())
+	if err := ctrl.setProtection(ctx, "vendor", true); err != nil {
+		t.Fatalf("enable protection: %v", err)
+	}
+	entry := supplierTestEntry(t, store, "vendor")
+
+	data := supplierTestReadProviders(t, configDir)
+	provider := supplierTestProvider(t, data, "vendor")
+	headers := provider["headers"].(map[string]any)
+	delete(headers, supplierSessionHeader)
+	headers[strings.ToLower(supplierSessionHeader)] = "stale"
+	supplierTestWriteProviders(t, configDir, data)
+
+	// Staging must record the actual pre-write snapshot, which has no
+	// canonical header while the provider file holds a different casing.
+	before := supplierCloneSnapshot(entry.After)
+	delete(before, supplierHeaderSnapshotKey())
+	ledger := supplierTestLedger(t, store)
+	ledger.Pending = &supplierPendingTx{
+		ProviderID: "vendor",
+		Before:     supplierPendingSide{Entry: supplierCloneEntry(entry), Snapshot: before},
+		After:      supplierPendingSide{Snapshot: supplierCloneSnapshot(entry.Original)},
+		Timestamp:  time.Now().Unix(),
+	}
+	supplierTestSetLedger(t, store, ledger)
+
+	if err := ctrl.reconcile(ctx); err != nil {
+		t.Fatalf("reconcile with reserved header drift: %v", err)
+	}
+	ledger = supplierTestLedger(t, store)
+	if ledger.Pending != nil || ledger.Entries["vendor"] == nil {
+		t.Fatalf("recovery ledger = %#v", ledger)
+	}
+	if _, ok, err := ctrl.binding(entry.Token, "chat"); err != nil || !ok {
+		t.Fatalf("recovery lost binding: ok=%v err=%v", ok, err)
+	}
+	if err := ctrl.setProtection(ctx, "vendor", false); err != nil {
+		t.Fatalf("restore after recovery: %v", err)
+	}
+	provider = supplierTestProvider(t, supplierTestReadProviders(t, configDir), "vendor")
+	headers = provider["headers"].(map[string]any)
+	for name := range headers {
+		if strings.EqualFold(name, supplierSessionHeader) {
+			t.Fatalf("reserved header survived restore: %#v", headers)
+		}
 	}
 }
 

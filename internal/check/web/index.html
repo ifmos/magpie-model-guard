@@ -24,7 +24,7 @@
     </nav>
     <div class="sidebar-footer">
       <div class="mini-status"><i id="sidebar-status-dot"></i><span id="sidebar-status">后台连接中</span></div>
-      <span class="version-label">MAGPIE PLUGIN · 0.7.3</span>
+      <span class="version-label">MAGPIE PLUGIN · 0.7.4</span>
     </div>
   </aside>
 
@@ -364,7 +364,7 @@
   <div class="note-title">⚠ 停用或卸载前先恢复地址</div>
   <ul class="note-list">
     <li>请先在上方列表中点击「恢复原始地址」，再停用插件或停止 Guard；否则供应商协议地址会保留为指向本机 Guard，Guard 未运行时请求将失败（fail closed）。</li>
-    <li>若曾直接编辑 <code>providers.json</code> 中受保护的地址，列表会显示冲突且不会覆盖你的改动。</li>
+    <li>若曾直接编辑 <code>providers.json</code> 中受保护供应商的地址或其他受管字段，列表会显示冲突且不会覆盖你的改动；插件专用的 <code>X-Model-Guard-Session</code> 除外，漂移不影响恢复，并会在恢复时清理。</li>
     <li>存在供应商保护时，无法通过回复 ID 关联的 group / auto 回复暂停异步判断，以免重复执行动作；组内受保护供应商仍同步检查。未保护供应商的直接请求仍可异步判断。</li>
   </ul>
 </div>

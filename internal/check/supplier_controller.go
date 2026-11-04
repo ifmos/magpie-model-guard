@@ -267,8 +267,7 @@ func (c *supplierController) list(ctx context.Context) (supplierList, error) {
 				problems = append(problems, "没有可保护的协议地址")
 			}
 			live := supplierSnapshotOf(provider, supplierSnapshotKeys(entry.After))
-			if !supplierSnapshotEqual(entry.After, live) {
-				diff := supplierSnapshotDiffKeys(entry.After, live)
+			if diff := supplierConflictDiffKeys(entry.After, live); len(diff) > 0 {
 				problems = append(problems, fmt.Sprintf("受管字段 %s 被外部修改", strings.Join(diff, "、")))
 			}
 		}
@@ -351,8 +350,7 @@ func (c *supplierController) setProtection(ctx context.Context, id string, enabl
 
 		if entry != nil && entry.Protected {
 			live := supplierSnapshotOf(provider, supplierSnapshotKeys(entry.After))
-			if !supplierSnapshotEqual(entry.After, live) {
-				diff := supplierSnapshotDiffKeys(entry.After, live)
+			if diff := supplierConflictDiffKeys(entry.After, live); len(diff) > 0 {
 				return fmt.Errorf("供应商 %s 的受管字段 %s 已被外部修改，拒绝覆盖", id, strings.Join(diff, "、"))
 			}
 			if supplierOriginEqual(entry.Origin, canonicalOrigin) {
@@ -405,11 +403,14 @@ func (c *supplierController) setProtection(ctx context.Context, id string, enabl
 	}
 
 	live := supplierSnapshotOf(provider, supplierSnapshotKeys(entry.After))
-	if !supplierSnapshotEqual(entry.After, live) {
-		originalLive := supplierSnapshotOf(provider, supplierSnapshotKeys(entry.After))
-		if supplierSnapshotEqual(entry.Original, originalLive) {
+	if !supplierConflictEqual(entry.After, live) {
+		if supplierConflictEqual(entry.Original, live) {
 			// The vendor bases are already back to their originals. Drop the
-			// stale ledger row without writing the file again.
+			// stale ledger row without rewriting those bases, but still clean
+			// up the plugin-owned probe header.
+			if err := c.supplierRemoveReservedHeaderFile(ctx, providersPath, id, entry.HeaderState); err != nil {
+				return fmt.Errorf("清理供应商 %s 的保留请求头失败: %w", id, err)
+			}
 			delete(ledger.Entries, id)
 			ledger.Pending = nil
 			err := c.store.setKV(supplierLedgerKey, ledger)
@@ -418,7 +419,7 @@ func (c *supplierController) setProtection(ctx context.Context, id string, enabl
 			}
 			return err
 		}
-		diff := supplierSnapshotDiffKeys(entry.After, live)
+		diff := supplierConflictDiffKeys(entry.After, live)
 		return fmt.Errorf("供应商 %s 的受管字段 %s 已被外部修改，拒绝覆盖", id, strings.Join(diff, "、"))
 	}
 
@@ -493,8 +494,7 @@ func (c *supplierController) binding(token, protocol string) (supplierBinding, b
 		return zero, false, fmt.Errorf("供应商 %s 已不存在", entry.ProviderID)
 	}
 	live := supplierSnapshotOf(providers[idx], supplierSnapshotKeys(entry.After))
-	if !supplierSnapshotEqual(entry.After, live) {
-		diff := supplierSnapshotDiffKeys(entry.After, live)
+	if diff := supplierConflictDiffKeys(entry.After, live); len(diff) > 0 {
 		return zero, false, fmt.Errorf("供应商 %s 的受管字段 %s 与账本不一致", entry.ProviderID, strings.Join(diff, "、"))
 	}
 
@@ -559,7 +559,7 @@ func (c *supplierController) protectedProvider(id string) (bool, error) {
 		return false, nil
 	}
 	live := supplierSnapshotOf(providers[idx], supplierSnapshotKeys(entry.After))
-	if !supplierSnapshotEqual(entry.After, live) {
+	if !supplierConflictEqual(entry.After, live) {
 		return false, nil
 	}
 	return true, nil
@@ -664,8 +664,7 @@ func (c *supplierController) reconcile(ctx context.Context) error {
 			}
 			provider := providers[idx]
 			live := supplierSnapshotOf(provider, supplierSnapshotKeys(entry.After))
-			if !supplierSnapshotEqual(entry.After, live) {
-				diff := supplierSnapshotDiffKeys(entry.After, live)
+			if diff := supplierConflictDiffKeys(entry.After, live); len(diff) > 0 {
 				conflicts = append(conflicts, fmt.Sprintf("供应商 %s 的受管字段 %s 被外部修改，已停止覆盖", id, strings.Join(diff, "、")))
 				continue
 			}
@@ -730,8 +729,7 @@ func (c *supplierController) writeSupplierTransition(
 		return fmt.Errorf("供应商 %s 已不存在", id)
 	}
 	live := supplierSnapshotOf(providers[idx], supplierSnapshotKeys(beforeSnapshot))
-	if !supplierSnapshotEqual(beforeSnapshot, live) {
-		diff := supplierSnapshotDiffKeys(beforeSnapshot, live)
+	if diff := supplierConflictDiffKeys(beforeSnapshot, live); len(diff) > 0 {
 		return fmt.Errorf("供应商 %s 的受管字段 %s 在写入前被外部修改", id, strings.Join(diff, "、"))
 	}
 
@@ -740,7 +738,7 @@ func (c *supplierController) writeSupplierTransition(
 	}
 	ledger.Pending = &supplierPendingTx{
 		ProviderID: id,
-		Before:     supplierPendingSide{Entry: supplierCloneEntry(beforeEntry), Snapshot: supplierCloneSnapshot(beforeSnapshot)},
+		Before:     supplierPendingSide{Entry: supplierCloneEntry(beforeEntry), Snapshot: supplierCloneSnapshot(live)},
 		After:      supplierPendingSide{Entry: supplierCloneEntry(afterEntry), Snapshot: supplierCloneSnapshot(afterSnapshot)},
 		Timestamp:  time.Now().Unix(),
 	}
@@ -785,6 +783,65 @@ func (c *supplierController) writeSupplierTransition(
 		return fmt.Errorf("providers.json 已写入但提交供应商账本失败（重启后可恢复）: %w", err)
 	}
 	return nil
+}
+
+// supplierRemoveReservedHeaderFile removes the plugin-owned probe header from
+// one provider when the vendor bases are already back to their originals and a
+// stale ledger entry must be dropped without rewriting those bases.
+func (c *supplierController) supplierRemoveReservedHeaderFile(ctx context.Context, providersPath, id, headerState string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	origBytes, err := os.ReadFile(providersPath)
+	if err != nil {
+		return err
+	}
+	root, providers, err := supplierParseProviderBytes(origBytes)
+	if err != nil {
+		return err
+	}
+	idx := supplierFindProvider(providers, id)
+	if idx < 0 {
+		return fmt.Errorf("供应商 %s 已不存在", id)
+	}
+	provider := providers[idx]
+	headers, err := supplierHeaderObject(provider, false)
+	if err != nil {
+		return err
+	}
+	removed := false
+	for name := range headers {
+		if strings.EqualFold(name, supplierSessionHeader) {
+			delete(headers, name)
+			removed = true
+		}
+	}
+	if !removed {
+		return nil
+	}
+	if len(headers) == 0 {
+		supplierRestoreEmptyHeaders(provider, headerState)
+	} else if err := supplierStoreHeaderObject(provider, headers); err != nil {
+		return err
+	}
+	providersJSON, err := json.Marshal(providers)
+	if err != nil {
+		return err
+	}
+	root["providers"] = json.RawMessage(providersJSON)
+	newRootJSON, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	newRootJSON = append(newRootJSON, '\n')
+	freshBytes, err := os.ReadFile(providersPath)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(freshBytes, origBytes) {
+		return errors.New("providers.json 在清理保留头期间被外部修改")
+	}
+	return atomicWriteFile(providersPath, newRootJSON, 0o600)
 }
 
 func (c *supplierController) abortSupplierPending(ledger *supplierLedger, cause error) error {
@@ -1457,7 +1514,15 @@ func supplierDeleteProviderField(provider map[string]json.RawMessage, key, heade
 		if err != nil {
 			return err
 		}
-		delete(headers, name)
+		if strings.EqualFold(name, supplierSessionHeader) {
+			for existing := range headers {
+				if strings.EqualFold(existing, supplierSessionHeader) {
+					delete(headers, existing)
+				}
+			}
+		} else {
+			delete(headers, name)
+		}
 		if len(headers) == 0 {
 			// No user headers remain: restore the exact original container
 			// (absent, null, or {}) instead of always dropping the key.
@@ -1565,20 +1630,28 @@ func supplierSnapshotEqual(expected, live supplierManagedSnapshot) bool {
 	return true
 }
 
-func supplierSnapshotDiffKeys(expected, live supplierManagedSnapshot) []string {
+// supplierConflictDiffKeys reports externally changed managed fields while
+// excluding the reserved probe header. Only this plugin reads or writes that
+// header, so an edit there must not block routing or restoration; transitions
+// rewrite it (or remove every casing on restore).
+func supplierConflictDiffKeys(expected, live supplierManagedSnapshot) []string {
 	keys := supplierSnapshotUnionKeys(expected, live)
 	var diff []string
 	for _, key := range keys {
+		if key == supplierHeaderSnapshotKey() {
+			continue
+		}
 		expectedRaw, expectedOK := expected[key]
 		liveRaw, liveOK := live[key]
 		if expectedOK != liveOK || (expectedOK && !supplierRawEqual(expectedRaw, liveRaw)) {
 			diff = append(diff, key)
 		}
 	}
-	if len(diff) == 0 {
-		return []string{"未知字段"}
-	}
 	return diff
+}
+
+func supplierConflictEqual(expected, live supplierManagedSnapshot) bool {
+	return len(supplierConflictDiffKeys(expected, live)) == 0
 }
 
 func supplierRawEqual(a, b json.RawMessage) bool {
