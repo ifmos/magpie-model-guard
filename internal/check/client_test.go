@@ -40,10 +40,33 @@ func TestCallPinnedSendsAccountHeaderWithoutAliasSession(t *testing.T) {
 	if gotModel != "codex/gpt-5.4" {
 		t.Fatalf("model = %q", gotModel)
 	}
-	if gotAccount != "%E5%8C%97%E5%86%A5@example.com" {
-		t.Fatalf("account header = %q, want percent-encoded", gotAccount)
+	if gotAccount != "北冥@example.com" {
+		t.Fatalf("account header = %q, want raw account name", gotAccount)
 	}
 	if gotSession != "" {
 		t.Fatalf("account probe carried a probe session: %q", gotSession)
+	}
+}
+
+func TestCallPinnedEscapesLiteralPercentInAccount(t *testing.T) {
+	var got string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("X-Magpie-Account")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message":       map[string]string{"content": "21"},
+				"finish_reason": "stop",
+			}},
+			"usage": map[string]int{"total_tokens": 3},
+		})
+	}))
+	defer server.Close()
+	if _, _, err := CallPinned(context.Background(), ProbeConfig{
+		GatewayURL: server.URL, GatewayKey: "probe-key",
+	}, "codex/gpt-5.4", "a%2Eb@example.com · Team", "question"); err != nil {
+		t.Fatal(err)
+	}
+	if got != "a%252Eb@example.com%20%C2%B7%20Team" {
+		t.Fatalf("account header = %q, want escaped literal percent", got)
 	}
 }

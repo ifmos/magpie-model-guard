@@ -133,14 +133,13 @@ func sendProbe(ctx context.Context, c ProbeConfig, model, prompt string, progres
 	return ch.Message.Content, out.Usage.Total, nil
 }
 
-// probeAccountHeader keeps the pin header ASCII. Magpie decodes a
-// percent-encoded name, so a non-ASCII account name survives net/http's
-// header validation and still names the same login.
+// probeAccountHeader leaves ordinary UTF-8 names raw: Go sends them as
+// obs-text and Magpie matches the literal name. A name containing '%' must be
+// escaped, because Magpie also accepts a percent-decoded header and would
+// otherwise match a different login with that decoded spelling.
 func probeAccountHeader(account string) string {
-	for i := 0; i < len(account); i++ {
-		if account[i] >= 0x80 {
-			return url.PathEscape(account)
-		}
+	if strings.Contains(account, "%") {
+		return url.PathEscape(account)
 	}
 	return account
 }

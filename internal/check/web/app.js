@@ -1388,6 +1388,25 @@
     unknown: "未检测", checking: "检测中", passed: "通过",
     suspect: "待复测", isolated: "已隔离", unavailable: "检测不可用"
   };
+  var codexExpandedDetails = new Set();
+  var codexPolicyTouched = false;
+  var codexPolicyIsolation = -1;
+  var codexPolicySyncError = false;
+  document.addEventListener("click", function (ev) {
+    if (!ev.target.closest) return;
+    var toggle = ev.target.closest(".codex-detail-toggle");
+    if (toggle) {
+      var row = toggle.closest("[data-codex-id]");
+      if (!row) return;
+      var id = row.getAttribute("data-codex-id");
+      // read after the per-card click handler flips the disclosure state
+      setTimeout(function () {
+        if (toggle.getAttribute("aria-expanded") === "true") codexExpandedDetails.add(id);
+        else codexExpandedDetails.delete(id);
+      }, 0);
+    }
+    if (ev.target.closest(".codex-policy summary")) codexPolicyTouched = true;
+  });
 
   function codexStateClass(state) {
     return "codex-state" + (state && codexStateNames[state] ? " is-" + state : "");
@@ -1461,16 +1480,36 @@
         statusEl.textContent = text;
       }
     }
+    var active = document.activeElement;
+    var restoreDetailFocus = active && active.classList && active.classList.contains("codex-detail-toggle")
+      ? active.closest("[data-codex-id]")?.getAttribute("data-codex-id") : "";
+    listEl.querySelectorAll("[data-codex-id]").forEach(function (row) {
+      var id = row.getAttribute("data-codex-id");
+      var toggle = row.querySelector(".codex-detail-toggle");
+      if (toggle && toggle.getAttribute("aria-expanded") === "true") codexExpandedDetails.add(id);
+      else codexExpandedDetails.delete(id);
+    });
     listEl.textContent = "";
     var emptyEl = document.getElementById("codex-empty");
     if (emptyEl) emptyEl.classList.toggle("hidden", accounts.length > 0 || !!data.error);
+    var countEl = document.getElementById("codex-account-count");
+    if (countEl) countEl.textContent = accounts.filter(function (a) { return !a.missing; }).length + " 个账号";
+    var policy = document.querySelector(".codex-policy");
+    if (policy) {
+      var syncError = !!data.last_error;
+      if (!codexPolicyTouched || codexPolicyIsolation !== isolated || syncError !== codexPolicySyncError) {
+        policy.open = isolated > 0 || isolatedPending > 0 || syncError;
+      }
+      codexPolicyIsolation = isolated;
+      codexPolicySyncError = syncError;
+    }
     if (!accounts.length) return;
     accounts.forEach(function (a) {
       var t = a.target || null;
       var state = t ? (t.state || "unknown") : "unknown";
       if (a.missing) state = "isolated";
       var row = document.createElement("div");
-      row.className = "codex-row";
+      row.className = "codex-row is-" + state;
       row.setAttribute("data-codex-id", a.id || "");
       var main = document.createElement("div");
       main.className = "codex-main";
@@ -1507,8 +1546,28 @@
       } else {
         bits.push("设置原生 codex/ 模型后启用账号监测");
       }
-      meta.textContent = bits.join(" · ");
+      var modelSummary = bits.shift() || "设置原生 codex/ 模型后启用账号监测";
+      meta.textContent = modelSummary;
+      if (bits.length) {
+        var toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "codex-detail-toggle";
+        toggle.setAttribute("aria-expanded", String(codexExpandedDetails.has(a.id)));
+        toggle.textContent = codexExpandedDetails.has(a.id) ? "收起" : "详情";
+        var detail = document.createElement("span");
+        detail.className = "codex-detail";
+        detail.textContent = bits.join(" · ");
+        meta.appendChild(toggle);
+        meta.appendChild(detail);
+        toggle.addEventListener("click", function () {
+          var expanded = toggle.getAttribute("aria-expanded") === "true";
+          toggle.setAttribute("aria-expanded", String(!expanded));
+          toggle.textContent = expanded ? "详情" : "收起";
+        });
+      }
       main.appendChild(meta);
+      var controls = document.createElement("div");
+      controls.className = "codex-account-controls";
       if (!a.missing) {
         var modelLine = document.createElement("div");
         modelLine.className = "codex-model-line";
@@ -1519,15 +1578,24 @@
         input.placeholder = "codex/gpt-5.4";
         input.value = t ? (t.model || "") : "";
         input.setAttribute("aria-label", (a.user || a.id) + " 的检测模型");
+        var field = document.createElement("div");
+        field.className = "codex-field";
+        var label = document.createElement("label");
+        var inputID = "codex-model-" + (a.id || "account");
+        label.setAttribute("for", inputID);
+        label.textContent = "检测模型";
+        input.id = inputID;
         modelLine.appendChild(input);
-        main.appendChild(modelLine);
+        field.appendChild(label);
+        field.appendChild(modelLine);
+        controls.appendChild(field);
       }
       var actions = document.createElement("div");
       actions.className = "codex-actions";
       if (!a.missing) {
         var save = document.createElement("button");
         save.type = "button";
-        save.className = "secondary-button-sm";
+        save.className = "secondary-button-sm codex-primary-action";
         save.setAttribute("data-codex-action", t && t.enabled ? "save" : "enable");
         save.textContent = t && t.enabled ? "保存模型" : "启用监测";
         actions.appendChild(save);
@@ -1549,7 +1617,7 @@
         } else {
           var off = document.createElement("button");
           off.type = "button";
-          off.className = "secondary-button-sm";
+          off.className = "secondary-button-sm codex-danger-action";
           off.setAttribute("data-codex-action", "disable");
           off.textContent = "停用监测";
           actions.appendChild(off);
@@ -1569,9 +1637,14 @@
         missingRecover.textContent = "解除隔离";
         actions.appendChild(missingRecover);
       }
-      main.appendChild(actions);
+      controls.appendChild(actions);
       row.appendChild(main);
+      row.appendChild(controls);
       listEl.appendChild(row);
+      if (restoreDetailFocus && restoreDetailFocus === (a.id || "")) {
+        var toggleToFocus = row.querySelector(".codex-detail-toggle");
+        if (toggleToFocus) toggleToFocus.focus({ preventScroll: true });
+      }
     });
   }
 
