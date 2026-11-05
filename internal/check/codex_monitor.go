@@ -240,7 +240,7 @@ func (c *codexAccountController) runProbe(parent context.Context, accountID stri
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	answer, tokens, callErr := CallPinned(ctx, ProbeConfig{
 		GatewayURL: cfg.GatewayURL, GatewayKey: cfg.GatewayKey,
-	}, t.Model, t.User, p.Text)
+	}, t.Model, t.User, p.Text, cfg.ProbeEffort)
 	cancel()
 	if probeWasTemporary {
 		// Turn it off immediately after the response. endProbe serializes

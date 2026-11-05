@@ -60,18 +60,19 @@ type ProbeAnswer struct {
 }
 
 // Call sends one chat-completions probe. progress may be nil for a
-// non-streaming call.
-func Call(ctx context.Context, c ProbeConfig, model, prompt string, progress func(string)) (string, int, error) {
-	return sendProbe(ctx, c, model, prompt, progress, "")
+// non-streaming call; effort is the reasoning_effort to request, empty for the
+// model's own default.
+func Call(ctx context.Context, c ProbeConfig, model, prompt string, progress func(string), effort string) (string, int, error) {
+	return sendProbe(ctx, c, model, prompt, progress, "", effort)
 }
 
 // CallPinned sends one probe pinned to a Magpie subscription account. The
 // model must be the native model id; the caller owns the pin semantics.
-func CallPinned(ctx context.Context, c ProbeConfig, model, account, prompt string) (string, int, error) {
-	return sendProbe(ctx, c, model, prompt, nil, account)
+func CallPinned(ctx context.Context, c ProbeConfig, model, account, prompt, effort string) (string, int, error) {
+	return sendProbe(ctx, c, model, prompt, nil, account, effort)
 }
 
-func sendProbe(ctx context.Context, c ProbeConfig, model, prompt string, progress func(string), account string) (string, int, error) {
+func sendProbe(ctx context.Context, c ProbeConfig, model, prompt string, progress func(string), account, effort string) (string, int, error) {
 	payload := map[string]any{
 		"model":      model,
 		"stream":     progress != nil,
@@ -79,6 +80,9 @@ func sendProbe(ctx context.Context, c ProbeConfig, model, prompt string, progres
 		"messages": []any{
 			map[string]string{"role": "user", "content": prompt},
 		},
+	}
+	if effort != "" {
+		payload["reasoning_effort"] = effort
 	}
 	if progress != nil {
 		payload["stream_options"] = map[string]bool{"include_usage": true}

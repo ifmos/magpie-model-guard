@@ -20,6 +20,7 @@ type fakeGateway struct {
 	status   int
 	requests int
 	models   []string // models seen in probe bodies
+	efforts  []string // reasoning_effort values seen in probe bodies
 }
 
 func (f *fakeGateway) handler(w http.ResponseWriter, r *http.Request) {
@@ -34,10 +35,12 @@ func (f *fakeGateway) handler(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/v1/chat/completions" {
 		var body struct {
-			Model string `json:"model"`
+			Model           string `json:"model"`
+			ReasoningEffort string `json:"reasoning_effort"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.models = append(f.models, body.Model)
+		f.efforts = append(f.efforts, body.ReasoningEffort)
 		if f.status != 0 {
 			http.Error(w, "boom", f.status)
 			return

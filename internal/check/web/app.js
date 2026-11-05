@@ -389,6 +389,9 @@
     var policyLabel = effMode === "staged" ? "分阶段" : "固定间隔";
     var inheritHtml = isInherit ? "<span class='policy-sub'>继承全局</span>" : "";
     var customHtml = t.timing_policy ? "<span class='badge-custom' title='此模型使用独立的分阶段间隔'>单独配置</span>" : "";
+    if (t.probe_effort) {
+      customHtml += "<span class='badge-custom' title='此模型的检测探针使用独立思考强度'>强度 " + esc(t.probe_effort === "default" ? "模型默认" : t.probe_effort) + "</span>";
+    }
     var responseHtml = t.response_rule_mode === "custom" ? "<span class='badge-custom' title='此模型使用自定义业务回复模型规则'>响应规则</span>" : "";
     return "<div class='policy-cell'><span class='policy-badge " + policyBadgeClass + "'>" + esc(policyLabel) + "</span>" + inheritHtml + customHtml + responseHtml + "</div>";
   }
@@ -907,6 +910,7 @@
     }
 
     document.getElementById("tpf-schedule-mode").value = t.schedule_mode || "";
+    document.getElementById("tpf-effort").value = t.probe_effort || "";
     document.getElementById("tpf-interval").value = t.interval_min || 30;
     document.getElementById("tpf-failwait").value = t.fail_recheck_min != null ? t.fail_recheck_min : 0;
     document.getElementById("tpf-recalculate-schedule").checked = false;
@@ -1060,6 +1064,7 @@
         interval_min: intervalMin,
         fail_recheck_min: failRecheckMin,
         schedule_mode: scheduleMode,
+        probe_effort: document.getElementById("tpf-effort").value,
         timing_policy: timingPolicy,
         response_rule_mode: responseRuleMode,
         response_model_rules: responseRules,
@@ -2396,7 +2401,7 @@
 
   // Protect uncommitted drafts from being overwritten by 15s polling
   [
-    "cfg-url", "cfg-key", "cfg-limit", "cfg-timeout", "cfg-cool",
+    "cfg-url", "cfg-key", "cfg-limit", "cfg-timeout", "cfg-cool", "cfg-probe-effort",
     "cfg-schedule-mode", "cfg-recalculate-schedule",
     "cfg-tp-normal", "cfg-tp-retry", "cfg-tp-iso-first", "cfg-tp-iso-later", "cfg-tp-rec-confirm", "cfg-tp-unavail",
     "cfg-response-mode", "cfg-response-reroute", "cfg-response-hold",
@@ -2459,6 +2464,8 @@
     if (timeoutEl) timeoutEl.value = c.timeout_sec || 180;
     var coolEl = document.getElementById("cfg-cool");
     if (coolEl) coolEl.value = c.cool_min || 15;
+    var effortEl = document.getElementById("cfg-probe-effort");
+    if (effortEl) effortEl.value = c.probe_effort || "";
 
     var modeEl = document.getElementById("cfg-schedule-mode");
     if (modeEl) modeEl.value = c.schedule_mode || "fixed";
@@ -2534,6 +2541,7 @@
         daily_limit: parseInt(document.getElementById("cfg-limit").value, 10),
         timeout_sec: parseInt(document.getElementById("cfg-timeout").value, 10),
         cool_min: parseInt(document.getElementById("cfg-cool").value, 10),
+        probe_effort: document.getElementById("cfg-probe-effort").value,
         schedule_mode: document.getElementById("cfg-schedule-mode").value,
         timing_policy: timingPolicy,
         response_model_mode: document.getElementById("cfg-response-mode").value,

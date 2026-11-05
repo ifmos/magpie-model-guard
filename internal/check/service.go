@@ -1046,10 +1046,14 @@ func (s *Service) applyRoundResult(t *Target, verdict, detail string, cfg GuardC
 
 	startMode := EffectiveScheduleMode(t.ScheduleMode, cfg.ScheduleMode)
 	currentMode := EffectiveScheduleMode(latest.ScheduleMode, currentCfg.ScheduleMode)
+	startEffort := EffectiveProbeEffort(t.ProbeEffort, cfg.ProbeEffort)
+	currentEffort := EffectiveProbeEffort(latest.ProbeEffort, currentCfg.ProbeEffort)
 
-	if startMode != currentMode {
-		// Mode changed while probe was in flight! Discard state writeback to avoid
-		// applying mismatched mode transitions (e.g. single error in staged being treated as fixed).
+	if startMode != currentMode || startEffort != currentEffort {
+		// The probe shape changed while the request was in flight: a mode switch
+		// or a new thinking level makes the verdict belong to another setup, so
+		// discard the state writeback (e.g. a pass at "high" must not recover a
+		// target now probed at "low").
 		// Still record CheckedAt so target reflects recent probe activity without corrupting stage/state.
 		latest.CheckedAt = now
 		if err := s.store.SaveTarget(latest); err != nil {
@@ -1177,7 +1181,7 @@ func (s *Service) probeOnce(ctx context.Context, t *Target, p *Prompt, cfg Guard
 		defer s.finishRun(t.Model, standalone)
 	}
 	answer, tokens, err := Call(pctx, ProbeConfig{GatewayURL: cfg.GatewayURL, GatewayKey: cfg.GatewayKey},
-		ProbeAliasPrefix+alias+"/"+t.Model, p.Text, nil)
+		ProbeAliasPrefix+alias+"/"+t.Model, p.Text, nil, EffectiveProbeEffort(t.ProbeEffort, cfg.ProbeEffort))
 
 	res := &Result{
 		ID:        randomHex(8),
@@ -1407,6 +1411,9 @@ func (s *Service) UpsertTargetOpt(t *Target, recalculate bool) error {
 		return errors.New("无效模型 ID")
 	}
 	if err := ValidateScheduleMode(t.ScheduleMode, true); err != nil {
+		return err
+	}
+	if err := ValidateProbeEffort(t.ProbeEffort, true); err != nil {
 		return err
 	}
 	if err := ValidateTargetTimingPolicy(t.TimingPolicy); err != nil {
@@ -1678,6 +1685,9 @@ func (s *Service) configureLocked(c GuardConfig, recalculate bool) error {
 		c.ScheduleMode = ScheduleModeFixed
 	}
 	if err := ValidateScheduleMode(c.ScheduleMode, false); err != nil {
+		return err
+	}
+	if err := ValidateProbeEffort(c.ProbeEffort, false); err != nil {
 		return err
 	}
 	// Validate explicitly provided non-zero timing values BEFORE merging,

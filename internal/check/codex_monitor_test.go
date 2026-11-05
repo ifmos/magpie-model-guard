@@ -19,6 +19,7 @@ type codexFakeGateway struct {
 	status     int
 	account    string
 	model      string
+	effort     string
 	requests   int
 	onRequest  func() error
 	requestErr error
@@ -33,10 +34,11 @@ func (g *codexFakeGateway) handler(w http.ResponseWriter, r *http.Request) {
 	}
 	g.account = r.Header.Get("X-Magpie-Account")
 	var body struct {
-		Model string `json:"model"`
+		Model           string `json:"model"`
+		ReasoningEffort string `json:"reasoning_effort"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	g.model = body.Model
+	g.model, g.effort = body.Model, body.ReasoningEffort
 	if g.status != 0 {
 		http.Error(w, "boom", g.status)
 		return
@@ -65,6 +67,7 @@ func newCodexMonitorTest(t *testing.T) (*Service, *Store, *codexAccountControlle
 	cfg.GatewayURL = server.URL
 	cfg.GatewayKey = "probe-secret"
 	cfg.TimingPolicy = TimingPolicy{NormalMin: 30, ErrorRetryMin: 2, IsolationFirstMin: 360, IsolationLaterMin: 1440, RecoveryConfirmMin: 2, UnavailableMin: 30}
+	cfg.ProbeEffort = "high"
 	if err := store.SaveConfig(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -121,11 +124,14 @@ func TestCodexAccountTwoFailsIsolateAndOnePassRestores(t *testing.T) {
 		t.Fatalf("fallback account not enabled: %+v", states)
 	}
 	gw.mu.Lock()
-	gotAccount, gotModel := gw.account, gw.model
+	gotAccount, gotModel, gotEffort := gw.account, gw.model, gw.effort
 	gw.answer = "最少需要取出 21 个糖果。"
 	gw.mu.Unlock()
 	if gotAccount != "a@example.com" || gotModel != "codex/gpt-5.4" {
 		t.Fatalf("probe pin/model = %q/%q", gotAccount, gotModel)
+	}
+	if gotEffort != "high" {
+		t.Fatalf("account probe effort = %q, want the global high", gotEffort)
 	}
 	gw.mu.Lock()
 	gw.onRequest = func() error {
