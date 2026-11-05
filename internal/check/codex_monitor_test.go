@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -190,5 +191,91 @@ func TestCodexAccountUnavailableDoesNotIsolate(t *testing.T) {
 	}
 	if states["aaaaaaaaaaaaaaaa"].On || states["aaaaaaaaaaaaaaaa"].Paused || states["bbbbbbbbbbbbbbbb"].On {
 		t.Fatalf("unavailable changed accounts: %+v", states)
+	}
+}
+
+func TestCodexAccountEffortChangeDiscardsInflightVerdict(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	gw := &codexFakeGateway{answer: "最少需要取出 21 个糖果。"}
+	gw.onRequest = func() error {
+		close(entered)
+		<-release
+		return nil
+	}
+	server := httptest.NewServer(http.HandlerFunc(gw.handler))
+	t.Cleanup(server.Close)
+
+	store, ctrl, configDir := codexAccountFixtures(t, []map[string]any{
+		{"id": "aaaaaaaaaaaaaaaa", "agent": "codex", "user": "a@example.com", "on": true},
+	})
+	cfg, _ := store.LoadConfig()
+	cfg.GatewayURL, cfg.GatewayKey = server.URL, "probe-secret"
+	cfg.ProbeEffort = "high"
+	cfg.TimingPolicy = TimingPolicy{NormalMin: 30, ErrorRetryMin: 2, IsolationFirstMin: 360, IsolationLaterMin: 1440, RecoveryConfirmMin: 2, UnavailableMin: 30}
+	if err := store.SaveConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SavePrompt(&Prompt{
+		ID: "candy", Name: "糖果", Text: "需要多少糖果？", Grader: GraderNumber, Expect: "21", Automatic: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveCodexAccountTarget(&CodexAccountTarget{
+		AccountID: "aaaaaaaaaaaaaaaa", User: "a@example.com", Model: "codex/gpt-5.4",
+		Enabled: true, State: CodexStateIsolated, Isolated: true, NextCheckAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- ctrl.runProbe(context.Background(), "aaaaaaaaaaaaaaaa", true) }()
+	<-entered
+
+	updated, err := store.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated.ProbeEffort = "low"
+	if err := store.SaveConfig(updated); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	gw.mu.Lock()
+	effort := gw.effort
+	gw.mu.Unlock()
+	if effort != "high" {
+		t.Fatalf("in-flight probe effort = %q, want high", effort)
+	}
+	target, err := store.CodexAccountTarget("aaaaaaaaaaaaaaaa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !target.Isolated || target.State != CodexStateIsolated {
+		t.Fatalf("verdict from the old effort cleared isolation: %+v", target)
+	}
+	if !strings.Contains(target.Reason, "思考强度已变更") {
+		t.Fatalf("reason = %q, want the discard reason", target.Reason)
+	}
+	if target.NextCheckAt.IsZero() {
+		t.Fatal("discarded retest was not rescheduled")
+	}
+	results, _, err := store.CodexAccountResults("aaaaaaaaaaaaaaaa", 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Verdict != VerdictPassed {
+		t.Fatalf("probe history = %+v, want one passed attempt", results)
+	}
+	states, err := readCodexLoginStates(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !states["aaaaaaaaaaaaaaaa"].On {
+		t.Fatalf("discarded retest changed the account switch: %+v", states)
 	}
 }

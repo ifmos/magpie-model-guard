@@ -301,6 +301,23 @@ func (c *codexAccountController) runProbe(parent context.Context, accountID stri
 	if current.State != CodexStateChecking {
 		return nil
 	}
+	// The probe inherited the global thinking level when it started. If that
+	// level changed while the request ran, the verdict belongs to another
+	// setup: keep the isolation and arrange a fresh check instead of letting
+	// an old-effort pass clear it.
+	currentCfg, err := c.store.LoadConfig()
+	if err != nil {
+		return err
+	}
+	if EffectiveProbeEffort("", cfg.ProbeEffort) != EffectiveProbeEffort("", currentCfg.ProbeEffort) {
+		state := CodexStateUnknown
+		if current.Isolated {
+			state = CodexStateIsolated
+		}
+		_ = c.store.ResetCodexAccountChecking(current.AccountID, state,
+			"检测运行中思考强度已变更，本轮结果已丢弃，等待重试", time.Now().UTC())
+		return nil
+	}
 	now = time.Now().UTC()
 	wasIsolated := current.Isolated
 	policy := ResolveTimingPolicy(nil, cfg.TimingPolicy)
