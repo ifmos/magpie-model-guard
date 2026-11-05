@@ -3,6 +3,8 @@ package check
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
+	"strings"
 )
 
 func (s *Service) apiCodexAccounts(w http.ResponseWriter, r *http.Request) {
@@ -85,4 +87,23 @@ func (s *Service) apiCodexAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, s.codex.view())
+}
+
+// apiCodexResults returns recent probe history for one Codex account.
+func (s *Service) apiCodexResults(w http.ResponseWriter, r *http.Request) {
+	accountID := strings.TrimSpace(r.URL.Query().Get("account_id"))
+	if accountID == "" {
+		errJSON(w, http.StatusBadRequest, "缺少 account_id")
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	results, err := s.store.CodexAccountResults(accountID, limit)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if results == nil {
+		results = []*CodexAccountResult{}
+	}
+	writeJSON(w, results)
 }

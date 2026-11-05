@@ -190,7 +190,7 @@ func (c *codexAccountController) runProbe(parent context.Context, accountID stri
 		return c.finishUnavailable(t, "没有可自动判分的检测题目")
 	}
 	now := time.Now().UTC()
-	started, err := c.store.MarkCodexAccountChecking(t.AccountID, t.Model, "账号检测进行中，等待模型响应…")
+	started, err := c.store.MarkCodexAccountChecking(t.AccountID, t.Model, "账号检测进行中，等待模型响应…", t.State, t.CheckedAt)
 	if err != nil {
 		return err
 	}

@@ -1419,18 +1419,32 @@
     el.className = "form-message" + (kind === "error" ? " is-error" : kind === "success" ? " is-success" : kind === "warning" ? " is-warning" : "");
   }
 
-  function codexModelOptions() {
-    var list = document.getElementById("codex-model-list");
-    if (!list) return;
+  function codexModelIDs(current) {
+    var ids = [];
     var seen = Object.create(null);
-    list.innerHTML = (state.models || []).filter(function (m) {
+    (state.models || []).forEach(function (m) {
       var id = String(m && m.id || "");
-      if (!/^codex\//.test(id) || seen[id]) return false;
-      seen[id] = true;
-      return true;
-    }).map(function (m) {
-      return "<option value='" + esc(m.id) + "'></option>";
+      if (/^codex\//.test(id) && !seen[id]) {
+        seen[id] = true;
+        ids.push(id);
+      }
+    });
+    if (current && !seen[current]) ids.unshift(current);
+    return ids;
+  }
+
+  function fillCodexModelSelect(select, current) {
+    var ids = codexModelIDs(current);
+    select.innerHTML = "<option value=''>选择 codex 模型</option>" + ids.map(function (id) {
+      return "<option value='" + esc(id) + "'>" + esc(id) + "</option>";
     }).join("");
+    select.value = current || "";
+  }
+
+  function codexModelOptions() {
+    document.querySelectorAll(".codex-model-select").forEach(function (select) {
+      fillCodexModelSelect(select, select.value);
+    });
   }
 
   function loadCodexAccounts(force) {
@@ -1454,7 +1468,7 @@
   function renderCodexAccounts(force) {
     var listEl = document.getElementById("codex-account-list");
     if (!listEl) return;
-    if (!force && listEl.contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;
+    if (!force && listEl.contains(document.activeElement) && (document.activeElement.tagName === "INPUT" || document.activeElement.tagName === "SELECT")) return;
     var data = codexData || {};
     var accounts = data.accounts || [];
     var monitored = accounts.filter(function (a) { return a.target && a.target.enabled; }).length;
@@ -1534,50 +1548,53 @@
       idEl.textContent = a.id || "";
       identity.appendChild(idEl);
       main.appendChild(identity);
-      var meta = document.createElement("div");
-      meta.className = "codex-meta";
-      var bits = [];
+      var times = document.createElement("div");
+      times.className = "codex-times";
       if (t) {
-        bits.push("检测模型 " + (t.model || "未设置"));
-        if (t.reason) bits.push(t.reason);
-        if (t.checked_at) bits.push("上次 " + fmtTime(t.checked_at));
-        if (t.next_check_at) bits.push("下次 " + fmtTime(t.next_check_at));
-        if (t.fail_streak) bits.push("连续失败 " + t.fail_streak + " 次");
+        var last = document.createElement("span");
+        last.innerHTML = "<b>上次检测</b>" + esc(fmtTime(t.checked_at));
+        var next = document.createElement("span");
+        next.innerHTML = "<b>下次检测</b>" + esc(!t.enabled ? "已暂停" : (t.state === "checking" ? "检测中" : fmtTime(t.next_check_at)));
+        times.appendChild(last);
+        times.appendChild(next);
+        if (t.fail_streak) {
+          var streak = document.createElement("span");
+          streak.innerHTML = "<b>连续失败</b>" + esc(String(t.fail_streak) + " 次");
+          times.appendChild(streak);
+        }
       } else {
-        bits.push("设置原生 codex/ 模型后启用账号监测");
+        times.innerHTML = "<span class='codex-no-model'>设置原生 codex/ 模型后启用账号监测</span>";
       }
-      var modelSummary = bits.shift() || "设置原生 codex/ 模型后启用账号监测";
-      meta.textContent = modelSummary;
-      if (bits.length) {
+      main.appendChild(times);
+      if (t && t.reason) {
+        var meta = document.createElement("div");
+        meta.className = "codex-meta";
         var toggle = document.createElement("button");
         toggle.type = "button";
         toggle.className = "codex-detail-toggle";
         toggle.setAttribute("aria-expanded", String(codexExpandedDetails.has(a.id)));
-        toggle.textContent = codexExpandedDetails.has(a.id) ? "收起" : "详情";
+        toggle.textContent = codexExpandedDetails.has(a.id) ? "收起原因" : "查看原因";
         var detail = document.createElement("span");
         detail.className = "codex-detail";
-        detail.textContent = bits.join(" · ");
+        detail.textContent = t.reason;
         meta.appendChild(toggle);
         meta.appendChild(detail);
         toggle.addEventListener("click", function () {
           var expanded = toggle.getAttribute("aria-expanded") === "true";
           toggle.setAttribute("aria-expanded", String(!expanded));
-          toggle.textContent = expanded ? "详情" : "收起";
+          toggle.textContent = expanded ? "查看原因" : "收起原因";
         });
+        main.appendChild(meta);
       }
-      main.appendChild(meta);
       var controls = document.createElement("div");
       controls.className = "codex-account-controls";
       if (!a.missing) {
         var modelLine = document.createElement("div");
         modelLine.className = "codex-model-line";
-        var input = document.createElement("input");
-        input.className = "codex-model-input";
-        input.type = "text";
-        input.setAttribute("list", "codex-model-list");
-        input.placeholder = "codex/gpt-5.4";
-        input.value = t ? (t.model || "") : "";
+        var input = document.createElement("select");
+        input.className = "codex-model-input codex-model-select";
         input.setAttribute("aria-label", (a.user || a.id) + " 的检测模型");
+        fillCodexModelSelect(input, t ? (t.model || "") : "");
         var field = document.createElement("div");
         field.className = "codex-field";
         var label = document.createElement("label");
@@ -1592,6 +1609,14 @@
       }
       var actions = document.createElement("div");
       actions.className = "codex-actions";
+      if (t && a.id) {
+        var history = document.createElement("button");
+        history.type = "button";
+        history.className = "secondary-button-sm";
+        history.setAttribute("data-codex-action", "history");
+        history.textContent = "检测记录";
+        actions.appendChild(history);
+      }
       if (!a.missing) {
         var save = document.createElement("button");
         save.type = "button";
@@ -1648,6 +1673,38 @@
     });
   }
 
+  var codexVerdictNames = { passed: "通过", failed: "未通过", unavailable: "不可用", suspect: "待复测" };
+  var codexHistorySeq = 0;
+
+  function openCodexHistory(accountID, user) {
+    var dlg = document.getElementById("codex-history-dialog");
+    var list = document.getElementById("codex-history-list");
+    var title = document.getElementById("codex-history-title");
+    if (!dlg || !list) return;
+    var seq = ++codexHistorySeq;
+    if (title) title.textContent = (user || accountID) + " · 检测记录";
+    list.innerHTML = "<p class='codex-history-empty'>正在读取记录…</p>";
+    if (!dlg.open) dlg.showModal();
+    api("GET", "/api/codex/accounts/results?account_id=" + encodeURIComponent(accountID) + "&limit=20").then(function (results) {
+      if (seq !== codexHistorySeq) return;
+      var rows = results || [];
+      if (!rows.length) {
+        list.innerHTML = "<p class='codex-history-empty'>暂无检测记录。启用监测或点击「立即检测」后会在这里留下结果。</p>";
+        return;
+      }
+      list.innerHTML = rows.map(function (r) {
+        var verdict = codexVerdictNames[r.verdict] || r.verdict;
+        var meta = [r.model, r.prompt_id, fmtTime(r.created_at), r.tokens ? r.tokens + " tokens" : ""].filter(Boolean).join(" · ");
+        var answer = r.answer ? "<details class='codex-history-answer'><summary>查看回答</summary><pre>" + esc(r.answer) + "</pre></details>" : "";
+        return "<article class='codex-history-row'><div class='codex-history-head'><span class='status-badge status-" + esc(r.verdict) + "'><i></i>" + esc(verdict) + "</span><strong>" + esc(fmtTime(r.created_at)) + "</strong><span>" + esc(meta) + "</span></div>" +
+          (r.detail ? "<p class='codex-history-detail'>" + esc(r.detail) + "</p>" : "") + answer + "</article>";
+      }).join("");
+    }).catch(function (err) {
+      if (seq !== codexHistorySeq) return;
+      list.innerHTML = "<p class='codex-history-empty is-error'>读取失败：" + esc(err.message) + "</p>";
+    });
+  }
+
   function runCodexAction(action, accountID, model, enabled) {
     setCodexMessage("正在保存…", "");
     var body;
@@ -1684,6 +1741,10 @@
       var input = row.querySelector(".codex-model-input");
       var model = input ? input.value.trim() : "";
       var action = btn.getAttribute("data-codex-action");
+      if (action === "history") {
+        openCodexHistory(accountID, row.querySelector(".codex-user")?.textContent || accountID);
+        return;
+      }
       if ((action === "save" || action === "enable") && !model) {
         setCodexMessage("请先填写检测模型，例如 codex/gpt-5.4", "error");
         return;
@@ -1699,6 +1760,19 @@
   }
   var codexRefreshBtn = document.getElementById("codex-refresh");
   if (codexRefreshBtn) codexRefreshBtn.addEventListener("click", function () { loadCodexAccounts(true); });
+  var codexHistoryClose = document.getElementById("codex-history-close");
+  if (codexHistoryClose) codexHistoryClose.addEventListener("click", function () {
+    codexHistorySeq++;
+    var dlg = document.getElementById("codex-history-dialog");
+    if (dlg) dlg.close();
+  });
+  var codexHistoryDialog = document.getElementById("codex-history-dialog");
+  if (codexHistoryDialog) codexHistoryDialog.addEventListener("click", function (ev) {
+    if (ev.target === codexHistoryDialog) {
+      codexHistorySeq++;
+      codexHistoryDialog.close();
+    }
+  });
 
   // ---- supplier protection ----
   var supplierProtocolNames = {

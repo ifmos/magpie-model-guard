@@ -137,12 +137,16 @@ func (s *Store) UpdateCodexAccountReason(t *CodexAccountTarget, reason string) e
 }
 
 // MarkCodexAccountChecking starts a probe only if the target is still the
-// same enabled model, so a manual recovery, disable, or model change cannot be
-// overwritten by a stale probe start.
-func (s *Store) MarkCodexAccountChecking(accountID, model, reason string) (bool, error) {
+// same enabled model in the state the caller observed while preparing the
+// probe, so a manual recovery, disable, or model change made in between cannot
+// be overwritten by a stale probe start. A target the caller already saw as
+// checking is not claimed a second time.
+func (s *Store) MarkCodexAccountChecking(accountID, model, reason, expectedState string, expectedChecked time.Time) (bool, error) {
 	res, err := s.db.Exec(`UPDATE codex_account_targets SET state=?, reason=?, next_check_at=0
-	  WHERE account_id=? AND model=? AND enabled=1 AND missing=0 AND state<>?`,
-		CodexStateChecking, reason, accountID, model, CodexStateChecking)
+	  WHERE account_id=? AND model=? AND enabled=1 AND missing=0
+	    AND state=? AND checked_at=? AND state<>?`,
+		CodexStateChecking, reason, accountID, model,
+		expectedState, unixOrZero(expectedChecked), CodexStateChecking)
 	if err != nil {
 		return false, err
 	}
@@ -261,4 +265,32 @@ func (s *Store) CountCodexProbesToday(accountID string, now time.Time) (int, err
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM codex_account_results WHERE account_id=? AND created_at>=?`,
 		accountID, start.Unix()).Scan(&n)
 	return n, err
+}
+
+// CodexAccountResults lists recent probes for one account, newest first.
+func (s *Store) CodexAccountResults(accountID string, limit int) ([]*CodexAccountResult, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	rows, err := s.db.Query(`SELECT id,account_id,user,model,prompt_id,answer,verdict,detail,tokens,created_at
+	  FROM codex_account_results WHERE account_id=? ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+		accountID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*CodexAccountResult
+	for rows.Next() {
+		var r CodexAccountResult
+		var created int64
+		if err := rows.Scan(&r.ID, &r.AccountID, &r.User, &r.Model, &r.PromptID, &r.Answer, &r.Verdict, &r.Detail, &r.Tokens, &created); err != nil {
+			return nil, err
+		}
+		r.CreatedAt = unixTime(created)
+		out = append(out, &r)
+	}
+	return out, rows.Err()
 }

@@ -25,7 +25,7 @@
     </nav>
     <div class="sidebar-footer">
       <div class="mini-status"><i id="sidebar-status-dot"></i><span id="sidebar-status">后台连接中</span></div>
-      <span class="version-label">MAGPIE PLUGIN · 0.8.1</span>
+      <span class="version-label">MAGPIE PLUGIN · 0.8.2</span>
     </div>
   </aside>
 
@@ -299,11 +299,17 @@
         </details>
         <section class="panel">
           <div class="codex-account-head"><div><h2>账号与检测模型</h2><p>停用只改 Magpie 账号状态，不改 Gateway Key</p></div><span id="codex-account-count" class="codex-account-count">0 个账号</span></div>
-          <datalist id="codex-model-list"></datalist>
           <div id="codex-account-list" class="codex-account-list" aria-label="Codex 账号列表"></div>
           <div class="empty-state" id="codex-empty"><div class="empty-icon">◈</div><strong>没有可识别的 Codex 账号</strong><span>请先在 Magpie 中登录 Codex 账号并刷新。</span></div>
           <p id="codex-msg" class="form-message"></p>
         </section>
+        <dialog id="codex-history-dialog" class="modal-dialog codex-history-dialog" aria-labelledby="codex-history-title">
+          <div class="modal-head">
+            <div><span class="eyebrow">ACCOUNT HISTORY</span><h2 id="codex-history-title">检测记录</h2></div>
+            <button type="button" id="codex-history-close" class="close-button" aria-label="关闭">×</button>
+          </div>
+          <div id="codex-history-list" class="codex-history-list"></div>
+        </dialog>
       </section>
 
       <section id="page-prompts" class="page">

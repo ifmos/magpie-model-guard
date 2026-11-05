@@ -9,7 +9,7 @@ import (
 )
 
 func TestCodexAccountAPI(t *testing.T) {
-	svc, _, _, _, _ := newCodexMonitorTest(t)
+	svc, store, _, _, _ := newCodexMonitorTest(t)
 	access := NewAccess("", "")
 	token := access.SetControl()
 	mux := http.NewServeMux()
@@ -47,6 +47,23 @@ func TestCodexAccountAPI(t *testing.T) {
 	})
 	if rec.Code == http.StatusOK {
 		t.Fatal("non-codex model accepted")
+	}
+	if err := store.AppendCodexResult(&CodexAccountResult{
+		ID: "r1", AccountID: "bbbbbbbbbbbbbbbb", User: "b@example.com",
+		Model: "codex/gpt-5.4", PromptID: "candy", Verdict: "passed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rec = do(http.MethodGet, "/api/codex/accounts/results?account_id=bbbbbbbbbbbbbbbb&limit=5", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET results: %d %s", rec.Code, rec.Body.String())
+	}
+	var history []CodexAccountResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &history); err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 || history[0].Verdict != "passed" {
+		t.Fatalf("results = %+v", history)
 	}
 	rec = do(http.MethodPost, "/api/codex/accounts/delete", map[string]any{"account_id": "bbbbbbbbbbbbbbbb"})
 	if rec.Code != http.StatusOK {

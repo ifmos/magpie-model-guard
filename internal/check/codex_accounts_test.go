@@ -483,6 +483,52 @@ func TestCodexProbeResultDiscardsAfterManualRecovery(t *testing.T) {
 	}
 }
 
+func TestCodexProbeStartDiscardsAfterManualRecovery(t *testing.T) {
+	logins := []map[string]any{
+		{"id": "aaaaaaaaaaaaaaaa", "agent": "codex", "user": "a@example.com", "on": true},
+	}
+	store, _, _ := codexAccountFixtures(t, logins)
+	observed := &CodexAccountTarget{
+		AccountID: "aaaaaaaaaaaaaaaa", User: "a@example.com", Model: "codex/gpt-5.4",
+		Enabled: true, State: CodexStateIsolated, Isolated: true,
+		CheckedAt: time.Unix(1700000000, 0).UTC(),
+	}
+	if err := store.SaveCodexAccountTarget(observed); err != nil {
+		t.Fatal(err)
+	}
+	// A manual recovery saves its own state while the probe is being prepared.
+	recovered := *observed
+	recovered.State, recovered.Isolated, recovered.Reason = CodexStatePassed, false, "已手动解除隔离"
+	recovered.CheckedAt = observed.CheckedAt.Add(time.Minute)
+	if err := store.SaveCodexAccountTarget(&recovered); err != nil {
+		t.Fatal(err)
+	}
+	started, err := store.MarkCodexAccountChecking(observed.AccountID, observed.Model,
+		"账号检测进行中，等待模型响应…", observed.State, observed.CheckedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started {
+		t.Fatal("stale probe start overwrote a manual recovery")
+	}
+	got, err := store.CodexAccountTarget(observed.AccountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != CodexStatePassed || got.Isolated || got.Reason != "已手动解除隔离" {
+		t.Fatalf("manual recovery overwritten: %+v", got)
+	}
+	// The state the recovery leaves behind still claims the next probe.
+	started, err = store.MarkCodexAccountChecking(observed.AccountID, observed.Model,
+		"账号检测进行中，等待模型响应…", got.State, got.CheckedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !started {
+		t.Fatal("recovered target could not start a probe")
+	}
+}
+
 func TestCodexRecoveryWithRemovedFallbackRetiresControl(t *testing.T) {
 	logins := []map[string]any{
 		{"id": "aaaaaaaaaaaaaaaa", "agent": "codex", "user": "a@example.com", "on": true},
@@ -590,5 +636,28 @@ func TestCodexPreflightResultDoesNotOverwriteManualRecovery(t *testing.T) {
 	got, _ := store.CodexAccountTarget(original.AccountID)
 	if got.State != CodexStatePassed || got.Isolated || got.Reason != "手动解除隔离" {
 		t.Fatalf("manual recovery changed: %+v", got)
+	}
+}
+
+func TestCodexAccountResultHistory(t *testing.T) {
+	logins := []map[string]any{
+		{"id": "aaaaaaaaaaaaaaaa", "agent": "codex", "user": "a@example.com", "on": true},
+	}
+	store, _, _ := codexAccountFixtures(t, logins)
+	for i, verdict := range []string{"failed", "passed"} {
+		if err := store.AppendCodexResult(&CodexAccountResult{
+			ID: string(rune('a' + i)), AccountID: "aaaaaaaaaaaaaaaa", User: "a@example.com",
+			Model: "codex/gpt-5.4", PromptID: "candy", Verdict: verdict,
+			Detail: verdict, CreatedAt: time.Now().UTC().Add(time.Duration(i) * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := store.CodexAccountResults("aaaaaaaaaaaaaaaa", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Verdict != "passed" {
+		t.Fatalf("history = %+v", rows)
 	}
 }

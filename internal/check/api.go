@@ -36,6 +36,7 @@ func registerAPI(mux *http.ServeMux, s *Service, access *Access, console *Consol
 	mux.Handle("POST /api/codex/accounts/target", h(s.apiCodexTarget))
 	mux.Handle("POST /api/codex/accounts/delete", h(s.apiCodexDelete))
 	mux.Handle("POST /api/codex/accounts/action", h(s.apiCodexAction))
+	mux.Handle("GET /api/codex/accounts/results", h(s.apiCodexResults))
 	mux.Handle("POST /api/config", h(s.apiConfig))
 	mux.Handle("POST /api/config/initial", h(s.apiConfigInitial))
 	mux.Handle("GET /api/targets", h(s.apiTargets))
