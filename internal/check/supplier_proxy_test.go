@@ -107,7 +107,7 @@ func TestSupplierRetriesKeepVendorCredentialAndWireBody(t *testing.T) {
 	if err != nil || latest.State != StatePassed {
 		t.Fatal("successful retry disabled target")
 	}
-	logged, err := store.SupplierEvents(20)
+	logged, _, err := store.SupplierEvents(20, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestSupplierRetriesKeepVendorCredentialAndWireBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	logged, err = store.SupplierEvents(20)
+	logged, _, err = store.SupplierEvents(20, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestSupplierRerouteUsesSelectedInternalModel(t *testing.T) {
 		events[0].Action != ResponseActionReroute || events[0].Model != "relay/alias" {
 		t.Fatalf("protection log lost reroute: %#v", events)
 	}
-	if results, err := svc.Results("relay/alias", "", 10); err != nil || len(results) != 0 {
+	if results, _, err := svc.Results("relay/alias", "", 10, ""); err != nil || len(results) != 0 {
 		t.Fatalf("rule hit leaked into probe history: %v err=%v", results, err)
 	}
 }
@@ -373,10 +373,13 @@ func TestSupplierEventsAPIListsProtectionLog(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("log endpoint = %d: %s", rec.Code, rec.Body.String())
 	}
-	var events []SupplierEvent
-	if err := json.Unmarshal(rec.Body.Bytes(), &events); err != nil {
+	var page struct {
+		Items []SupplierEvent `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
 		t.Fatal(err)
 	}
+	events := page.Items
 	if len(events) != 2 || events[0].Kind != "retry" || events[1].Kind != "protect" {
 		t.Fatalf("log order = %#v", events)
 	}
@@ -392,14 +395,14 @@ func TestSupplierEventRetentionCap(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	events, err := store.SupplierEvents(0)
+	events, _, err := store.SupplierEvents(0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(events) != 100 {
 		t.Fatalf("default limit = %d, want 100", len(events))
 	}
-	all, err := store.SupplierEvents(500)
+	all, _, err := store.SupplierEvents(500, "")
 	if err != nil {
 		t.Fatal(err)
 	}

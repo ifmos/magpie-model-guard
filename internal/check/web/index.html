@@ -309,6 +309,7 @@
             <button type="button" id="codex-history-close" class="close-button" aria-label="关闭">×</button>
           </div>
           <div id="codex-history-list" class="codex-history-list"></div>
+          <div class="load-more-row hidden" id="codex-history-more-row"><button id="codex-history-more" class="secondary-button">加载更多</button></div>
         </dialog>
       </section>
 
@@ -372,14 +373,16 @@
 
       <section id="page-results" class="page">
         <div class="page-intro"><div><span class="eyebrow">AUDIT TRAIL</span><h1>检测记录</h1><p>查看探针回答、判定结果和模型状态变化。</p></div><button id="refresh-results" class="secondary-button">↻ 刷新记录</button></div>
-        <section class="panel results-panel"><div class="filter-bar"><div><span class="eyebrow">FILTER</span><strong>筛选检测结果</strong></div><select id="result-model" aria-label="按模型筛选"></select></div><div id="result-list" class="result-list"></div><div class="empty-state" id="result-empty"><div class="empty-icon">↗</div><strong>暂无检测记录</strong><span>手动测试或等待下一次定时检测。</span></div></section>
+        <section class="panel results-panel"><div class="filter-bar"><div><span class="eyebrow">FILTER</span><strong>筛选检测结果</strong></div><select id="result-model" aria-label="按模型筛选"></select></div><div id="result-list" class="result-list"></div>
+          <div class="load-more-row hidden" id="result-more-row"><button id="result-more" class="secondary-button">加载更多</button></div><div class="empty-state" id="result-empty"><div class="empty-icon">↗</div><strong>暂无检测记录</strong><span>手动测试或等待下一次定时检测。</span></div></section>
       </section>
 
       <section id="page-supplierlog" class="page">
         <div class="page-intro"><div><span class="eyebrow">PROTECTION LOG</span><h1>保护日志</h1><p>记录供应商保护的启用与恢复、业务回复规则命中、重试和提交失败，与探针检测记录相互独立。</p></div><button id="supplier-log-refresh" class="secondary-button">↻ 刷新日志</button></div>
         <section class="panel results-panel">
-          <div class="panel-heading table-heading"><div><span class="eyebrow">AUDIT TRAIL</span><h2>保护活动</h2></div><span class="panel-caption">最近 200 条 · 按时间倒序</span></div>
+          <div class="panel-heading table-heading"><div><span class="eyebrow">AUDIT TRAIL</span><h2>保护活动</h2></div><span class="panel-caption">按时间倒序 · 分批加载</span></div>
           <div id="supplier-log" class="supplier-log" aria-label="供应商保护日志"></div>
+          <div class="load-more-row hidden" id="supplier-log-more-row"><button id="supplier-log-more" class="secondary-button">加载更多</button></div>
           <div class="empty-state" id="supplier-log-empty"><div class="empty-icon">▤</div><strong>暂无保护活动</strong><span>启用供应商保护并产生业务请求后，这里会显示命中与重试。</span></div>
         </section>
       </section>

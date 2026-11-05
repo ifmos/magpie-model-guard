@@ -58,11 +58,11 @@ func TestCodexAccountAPI(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET results: %d %s", rec.Code, rec.Body.String())
 	}
-	var history []CodexAccountResult
+	var history pageResponse[CodexAccountResult]
 	if err := json.Unmarshal(rec.Body.Bytes(), &history); err != nil {
 		t.Fatal(err)
 	}
-	if len(history) != 1 || history[0].Verdict != "passed" {
+	if len(history.Items) != 1 || history.Items[0].Verdict != "passed" || history.Next != "" {
 		t.Fatalf("results = %+v", history)
 	}
 	rec = do(http.MethodPost, "/api/codex/accounts/delete", map[string]any{"account_id": "bbbbbbbbbbbbbbbb"})

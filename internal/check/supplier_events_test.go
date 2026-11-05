@@ -9,7 +9,7 @@ import (
 // supplierEvents returns the protection log newest first.
 func supplierEvents(t *testing.T, store *Store) []*SupplierEvent {
 	t.Helper()
-	events, err := store.SupplierEvents(500)
+	events, _, err := store.SupplierEvents(500, "")
 	if err != nil {
 		t.Fatalf("SupplierEvents: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestLegacyResponseResultsMigrateWithRuleID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, err := reopened.SupplierEvents(10)
+	events, _, err := reopened.SupplierEvents(10, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestLegacyResponseResultsMigrateWithRuleID(t *testing.T) {
 		events[0].ActualModel != "vendor/flash" || events[0].Action != ResponseActionDisable {
 		t.Fatalf("migrated event = %#v", events)
 	}
-	if results, err := reopened.Results("", "", 10); err != nil || len(results) != 0 {
+	if results, _, err := reopened.Results("", "", 10, ""); err != nil || len(results) != 0 {
 		t.Fatalf("legacy rows stayed in probe results: %#v err=%v", results, err)
 	}
 
@@ -120,7 +120,7 @@ func TestLegacyResponseResultsMigrateWithRuleID(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer again.Close()
-	if events, _ := again.SupplierEvents(10); len(events) != 1 {
+	if events, _, _ := again.SupplierEvents(10, ""); len(events) != 1 {
 		t.Fatalf("migration duplicated events: %#v", events)
 	}
 }

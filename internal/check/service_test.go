@@ -377,11 +377,13 @@ func TestInFlightProbeAppearsInResults(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("GET /api/results%s = %d: %s", query, rec.Code, rec.Body.String())
 		}
-		var rows []*Result
-		if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
+		var page struct {
+			Items []*Result `json:"items"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
 			t.Fatal(err)
 		}
-		return rows
+		return page.Items
 	}
 
 	inFlight := getResults("")

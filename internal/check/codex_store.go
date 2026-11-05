@@ -267,19 +267,27 @@ func (s *Store) CountCodexProbesToday(accountID string, now time.Time) (int, err
 	return n, err
 }
 
-// CodexAccountResults lists recent probes for one account, newest first.
-func (s *Store) CodexAccountResults(accountID string, limit int) ([]*CodexAccountResult, error) {
-	if limit <= 0 {
-		limit = 10
+// CodexAccountResults lists one page of probes for one account, newest first,
+// resuming after the before cursor. It returns the cursor for the next page, or
+// "" when the page is the last one.
+func (s *Store) CodexAccountResults(accountID string, limit int, before string) ([]*CodexAccountResult, string, error) {
+	limit = pageLimit(limit, 10, 50)
+	q := `SELECT id,account_id,user,model,prompt_id,answer,verdict,detail,tokens,created_at
+	  FROM codex_account_results WHERE account_id=?`
+	args := []any{accountID}
+	if before != "" {
+		cur, err := decodeKeysetCursor(before)
+		if err != nil {
+			return nil, "", err
+		}
+		q += ` AND (created_at, id) < (?, ?)`
+		args = append(args, cur.At.Unix(), cur.ID)
 	}
-	if limit > 50 {
-		limit = 50
-	}
-	rows, err := s.db.Query(`SELECT id,account_id,user,model,prompt_id,answer,verdict,detail,tokens,created_at
-	  FROM codex_account_results WHERE account_id=? ORDER BY created_at DESC, rowid DESC LIMIT ?`,
-		accountID, limit)
+	q += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer rows.Close()
 	var out []*CodexAccountResult
@@ -287,10 +295,18 @@ func (s *Store) CodexAccountResults(accountID string, limit int) ([]*CodexAccoun
 		var r CodexAccountResult
 		var created int64
 		if err := rows.Scan(&r.ID, &r.AccountID, &r.User, &r.Model, &r.PromptID, &r.Answer, &r.Verdict, &r.Detail, &r.Tokens, &created); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		r.CreatedAt = unixTime(created)
 		out = append(out, &r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+	next := ""
+	if len(out) > limit {
+		out = out[:limit]
+		next = encodeKeysetCursor(out[limit-1].CreatedAt, out[limit-1].ID)
+	}
+	return out, next, nil
 }

@@ -1245,14 +1245,14 @@ func TestSupplierUnmonitoredRequestUsesOnlyGlobalRules(t *testing.T) {
 	if monitored == nil || monitored.State == StateFailed {
 		t.Fatalf("a different monitored target must not be disabled: %+v", monitored)
 	}
-	events, err := env.store.SupplierEvents(10)
+	events, _, err := env.store.SupplierEvents(10, "")
 	if err != nil || len(events) == 0 {
 		t.Fatalf("events=%v err=%v", events, err)
 	}
 	if events[0].Kind != "action" || events[0].RuleID != "r-global" || !strings.Contains(events[0].Detail, "未找到监测目标，未阻断") {
 		t.Fatalf("event=%+v", events[0])
 	}
-	if results, err := env.store.Results("vendor/unmonitored", "", 10); err != nil || len(results) != 0 {
+	if results, _, err := env.store.Results("vendor/unmonitored", "", 10, ""); err != nil || len(results) != 0 {
 		t.Fatalf("rule hit leaked into probe history: %v err=%v", results, err)
 	}
 }
@@ -1299,11 +1299,11 @@ func TestSupplierKeepsRuleSnapshotForInFlightRequest(t *testing.T) {
 	if target == nil || target.State == StateFailed {
 		t.Fatalf("in-flight rule snapshot changed: %+v", target)
 	}
-	events, err := env.store.SupplierEvents(10)
+	events, _, err := env.store.SupplierEvents(10, "")
 	if err != nil || len(events) == 0 || events[0].RuleID != "r-record" || events[0].Action != ResponseActionRecord {
 		t.Fatalf("events=%v err=%v", events, err)
 	}
-	if results, err := env.store.Results("vendor/big", "", 10); err != nil || len(results) != 0 {
+	if results, _, err := env.store.Results("vendor/big", "", 10, ""); err != nil || len(results) != 0 {
 		t.Fatalf("rule hit leaked into probe history: %v err=%v", results, err)
 	}
 }

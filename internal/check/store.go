@@ -84,7 +84,9 @@ CREATE TABLE IF NOT EXISTS results (
   created_at   INTEGER NOT NULL,
   source       TEXT NOT NULL DEFAULT 'manual'
 );
-CREATE INDEX IF NOT EXISTS idx_results_model ON results(model, created_at DESC);
+DROP INDEX IF EXISTS idx_results_model;
+CREATE INDEX IF NOT EXISTS idx_results_model_created ON results(model, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_results_created ON results(created_at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS supplier_events (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   kind          TEXT NOT NULL,
@@ -126,7 +128,8 @@ CREATE TABLE IF NOT EXISTS codex_account_results (
   tokens     INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_codex_results_account ON codex_account_results(account_id, created_at DESC);
+DROP INDEX IF EXISTS idx_codex_results_account;
+CREATE INDEX IF NOT EXISTS idx_codex_results_account_created ON codex_account_results(account_id, created_at DESC, id DESC);
 `)
 	if err != nil {
 		return err
@@ -627,15 +630,26 @@ func (s *Store) AppendSupplierEvent(ev *SupplierEvent) error {
 	return err
 }
 
-// SupplierEvents lists recent protection events, newest first.
-func (s *Store) SupplierEvents(limit int) ([]*SupplierEvent, error) {
-	if limit <= 0 || limit > 500 {
-		limit = 100
+// SupplierEvents lists one page of protection events, newest first, resuming
+// after the before cursor. It returns the cursor for the next page, or "" when
+// the page is the last one.
+func (s *Store) SupplierEvents(limit int, before string) ([]*SupplierEvent, string, error) {
+	limit = pageLimit(limit, 100, 500)
+	q := `SELECT id,kind,provider_id,model,actual_model,action,rule_id,detail,created_at FROM supplier_events`
+	args := []any{}
+	if before != "" {
+		id, err := decodeIDCursor(before)
+		if err != nil {
+			return nil, "", err
+		}
+		q += ` WHERE id < ?`
+		args = append(args, id)
 	}
-	rows, err := s.db.Query(`SELECT id,kind,provider_id,model,actual_model,action,rule_id,detail,created_at
-	  FROM supplier_events ORDER BY id DESC LIMIT ?`, limit)
+	q += ` ORDER BY id DESC LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer rows.Close()
 	var out []*SupplierEvent
@@ -645,38 +659,54 @@ func (s *Store) SupplierEvents(limit int) ([]*SupplierEvent, error) {
 			created int64
 		)
 		if err := rows.Scan(&ev.ID, &ev.Kind, &ev.ProviderID, &ev.Model, &ev.ActualModel, &ev.Action, &ev.RuleID, &ev.Detail, &created); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		ev.CreatedAt = time.Unix(created, 0).UTC()
 		out = append(out, &ev)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+	next := ""
+	if len(out) > limit {
+		out = out[:limit]
+		next = encodeIDCursor(out[limit-1].ID)
+	}
+	return out, next, nil
 }
 
-// Results lists recent results, optionally filtered by model and prompt.
-func (s *Store) Results(model, promptID string, limit int) ([]*Result, error) {
-	if limit <= 0 || limit > 500 {
-		limit = 100
-	}
-	q := `SELECT id,model,prompt_id,answer,verdict,detail,actual_model,rule_id,tokens,created_at,source FROM results`
+// Results lists one page of probe results, newest first, optionally filtered
+// by model and prompt, resuming after the before cursor. It returns the cursor
+// for the next page, or "" when the page is the last one.
+func (s *Store) Results(model, promptID string, limit int, before string) ([]*Result, string, error) {
+	limit = pageLimit(limit, 100, 500)
+	conds := []string{}
 	args := []any{}
-	where := ""
 	if model != "" {
-		where += ` WHERE model=?`
+		conds = append(conds, `model=?`)
 		args = append(args, model)
-		if promptID != "" {
-			where += ` AND prompt_id=?`
-			args = append(args, promptID)
-		}
-	} else if promptID != "" {
-		where += ` WHERE prompt_id=?`
+	}
+	if promptID != "" {
+		conds = append(conds, `prompt_id=?`)
 		args = append(args, promptID)
 	}
-	q += where + ` ORDER BY created_at DESC LIMIT ?`
-	args = append(args, limit)
+	if before != "" {
+		cur, err := decodeKeysetCursor(before)
+		if err != nil {
+			return nil, "", err
+		}
+		conds = append(conds, `(created_at, id) < (?, ?)`)
+		args = append(args, cur.At.Unix(), cur.ID)
+	}
+	q := `SELECT id,model,prompt_id,answer,verdict,detail,actual_model,rule_id,tokens,created_at,source FROM results`
+	if len(conds) > 0 {
+		q += ` WHERE ` + strings.Join(conds, ` AND `)
+	}
+	q += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+	args = append(args, limit+1)
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer rows.Close()
 	var out []*Result
@@ -686,12 +716,20 @@ func (s *Store) Results(model, promptID string, limit int) ([]*Result, error) {
 			created int64
 		)
 		if err := rows.Scan(&r.ID, &r.Model, &r.PromptID, &r.Answer, &r.Verdict, &r.Detail, &r.ActualModel, &r.RuleID, &r.Tokens, &created, &r.Source); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		r.CreatedAt = time.Unix(created, 0).UTC()
 		out = append(out, &r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+	next := ""
+	if len(out) > limit {
+		out = out[:limit]
+		next = encodeKeysetCursor(out[limit-1].CreatedAt, out[limit-1].ID)
+	}
+	return out, next, nil
 }
 
 // CountProbesToday counts probe results for one model since UTC midnight.

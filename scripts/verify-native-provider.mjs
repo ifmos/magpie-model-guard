@@ -648,7 +648,7 @@ async function supplierAcceptance(ctx, api, options) {
   assert.equal(recorded.status, 200);
   await recorded.text();
   assert.equal(await requestCount(ctx, '/chat/v1/chat/completions'), recordCount + 1);
-  const records = await api('/api/results?model=' + encodeURIComponent(CHAT));
+  const records = (await api('/api/results?model=' + encodeURIComponent(CHAT))).items;
   assert.ok(records.some(r => r.rule_id === 'supplier-record' && r.actual_model === 'fixture-bad'));
 
   // A vendor reply without an id acquires a fresh id during native translation.
@@ -666,7 +666,7 @@ async function supplierAcceptance(ctx, api, options) {
   await api('/api/response-model', { method: 'POST', body: { requested_model: CHAT, actual_model: CHAT, response_id: noIDReply.id, success: true }, control: true });
   const noIDTarget = (await api('/api/targets')).find(t => t.model === CHAT);
   assert.notEqual(noIDTarget.state, 'failed', 'generated id caused a duplicate async disable');
-  assert.ok(!(await api('/api/results?model=' + encodeURIComponent(CHAT))).some(r => r.rule_id === 'direct-duplicate'), 'generated id caused a duplicate async result');
+  assert.ok(!(await api('/api/results?model=' + encodeURIComponent(CHAT))).items.some(r => r.rule_id === 'direct-duplicate'), 'generated id caused a duplicate async result');
   await fixtureControl(ctx, 'omitReplyID=0');
   await writeFile(noIDSettingsFile, JSON.stringify(noIDSettingsBefore));
   await setTarget(ctx, api, CHAT, { id: 'supplier-record', match: 'exact', pattern: 'fixture-bad', action: 'record' });
@@ -679,7 +679,7 @@ async function supplierAcceptance(ctx, api, options) {
   const groupedReply = await jsonOf(grouped);
   assert.equal(grouped.status, 200);
   await api('/api/response-model', { method: 'POST', body: { requested_model: 'group/supplier-check', actual_model: 'group/supplier-check', response_id: groupedReply.id, success: true }, control: true });
-  const duplicates = await api('/api/results?model=group%2Fsupplier-check');
+  const duplicates = (await api('/api/results?model=group%2Fsupplier-check')).items;
   assert.ok(!duplicates.some(r => r.rule_id === 'group-duplicate'), 'group reply was judged twice');
   await guardConfig(ctx, api, { response_model_mode: 'off', response_rules: [] });
 

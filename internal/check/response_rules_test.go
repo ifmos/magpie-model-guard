@@ -177,7 +177,7 @@ func TestHandleResponseModelDisablesAndReroutes(t *testing.T) {
 			t.Fatalf("bad protection event: %+v", ev)
 		}
 	}
-	if results, err := store.Results("vendor/big", "", 10); err != nil || len(results) != 0 {
+	if results, _, err := store.Results("vendor/big", "", 10, ""); err != nil || len(results) != 0 {
 		t.Fatalf("rule hits leaked into probe history: %v err=%v", results, err)
 	}
 }

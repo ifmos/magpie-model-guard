@@ -1341,47 +1341,170 @@
   }
 
   // ---- results ----
+  var resultsGeneration = 0;
+  var resultsState = {
+    model: null, items: [], next: "", loaded: false, generation: 0,
+    refreshPromise: null, morePromise: null
+  };
+
+  // Merge a fresh page with retained history without duplicating rows. On a
+  // results refresh, checking rows not in the new first page have finished.
+  function mergeUniqueRows(first, second, dropStaleChecking) {
+    var merged = [];
+    var seen = Object.create(null);
+    function append(rows, dropChecking) {
+      (rows || []).forEach(function (row) {
+        if (dropChecking && row && row.verdict === "checking") return;
+        var id = row && row.id != null && row.id !== "" ? String(row.id) : "";
+        if (id) {
+          if (seen[id]) return;
+          seen[id] = true;
+        }
+        merged.push(row);
+      });
+    }
+    append(first, false);
+    append(second, dropStaleChecking);
+    return merged;
+  }
+
+  function hasPersistedRowOverlap(latest, current) {
+    var ids = Object.create(null);
+    (current || []).forEach(function (row) {
+      if (!row || row.verdict === "checking" || row.id == null || row.id === "") return;
+      ids[String(row.id)] = true;
+    });
+    return (latest || []).some(function (row) {
+      return !!(row && row.verdict !== "checking" && row.id != null && row.id !== "" && ids[String(row.id)]);
+    });
+  }
+
+  function syncResultsControls() {
+    var st = resultsState;
+    var refreshBtn = document.getElementById("refresh-results");
+    var moreBtn = document.getElementById("result-more");
+    if (refreshBtn) {
+      refreshBtn.disabled = !!st.refreshPromise;
+      refreshBtn.setAttribute("aria-busy", st.refreshPromise ? "true" : "false");
+    }
+    if (moreBtn) {
+      moreBtn.disabled = !!st.refreshPromise || !!st.morePromise;
+      moreBtn.setAttribute("aria-busy", st.morePromise ? "true" : "false");
+    }
+  }
+
+  function renderResults() {
+    var box = document.getElementById("result-list");
+    if (!box) return;
+    var openIds = new Set();
+    box.querySelectorAll("details[open][data-result-id]").forEach(function (d) {
+      openIds.add(d.dataset.resultId);
+    });
+    var rows = resultsState.items;
+    hasCheckingResults = rows.some(function (r) { return r.verdict === "checking"; });
+    box.innerHTML = rows.map(function (r) {
+      var isChecking = r.verdict === "checking";
+      var openAttr = r.id && openIds.has(r.id) ? " open" : "";
+      var detailAttr = " data-result-id='" + esc(r.id || "") + "'" + (isChecking ? " class='is-checking'" : "");
+      var content = r.answer || ("(" + (r.detail || (isChecking ? "探针检测进行中，等待模型返回…" : "无回答内容")) + ")");
+      return "<details" + detailAttr + openAttr + "><summary>" +
+        "<span class='status-badge status-" + esc(r.verdict) + "'><i></i>" + esc(verdictName[r.verdict] || r.verdict) + "</span>" +
+        "<strong>" + esc(r.model) + "</strong>" +
+        "<span class='result-meta'>" + esc(r.prompt_id) + (r.actual_model ? " · 实际模型 " + esc(r.actual_model) : "") + " · " + fmtTime(r.created_at) + " · " + esc(r.source) + "</span>" +
+        "</summary><pre>" + esc(content) + "</pre></details>";
+    }).join("");
+    var emptyEl = document.getElementById("result-empty");
+    if (emptyEl) emptyEl.classList.toggle("hidden", rows.length > 0);
+    box.classList.toggle("hidden", rows.length === 0);
+    toggleLoadMore("result-more-row", resultsState.next);
+    syncResultsControls();
+  }
+
   function loadResults() {
     var modelEl = document.getElementById("result-model");
     var model = modelEl ? modelEl.value : "";
-    var refreshBtn = document.getElementById("refresh-results");
-    if (refreshBtn) refreshBtn.disabled = true;
+    if (resultsState.model !== model) {
+      // A state object per filter also invalidates every request from the old
+      // filter, even if the user changes back before that request finishes.
+      resultsState = {
+        model: model, items: [], next: "", loaded: false,
+        generation: ++resultsGeneration, refreshPromise: null, morePromise: null
+      };
+      renderResults();
+    }
+    var st = resultsState;
+    if (st.refreshPromise) return st.refreshPromise;
 
-    return api("GET", "/api/results?limit=100" + (model ? "&model=" + encodeURIComponent(model) : "")).then(function (rows) {
-      var box = document.getElementById("result-list");
-      if (!box) return;
-      var openIds = new Set();
-      box.querySelectorAll("details[open][data-result-id]").forEach(function (d) {
-        openIds.add(d.dataset.resultId);
-      });
-      hasCheckingResults = (rows || []).some(function (r) { return r.verdict === "checking"; });
-      box.innerHTML = (rows || []).map(function (r) {
-        var isChecking = r.verdict === "checking";
-        var openAttr = r.id && openIds.has(r.id) ? " open" : "";
-        var detailAttr = " data-result-id='" + esc(r.id || "") + "'" + (isChecking ? " class='is-checking'" : "");
-        var content = r.answer || ("(" + (r.detail || (isChecking ? "探针检测进行中，等待模型返回…" : "无回答内容")) + ")");
-        return "<details" + detailAttr + openAttr + "><summary>" +
-          "<span class='status-badge status-" + esc(r.verdict) + "'><i></i>" + esc(verdictName[r.verdict] || r.verdict) + "</span>" +
-          "<strong>" + esc(r.model) + "</strong>" +
-          "<span class='result-meta'>" + esc(r.prompt_id) + (r.actual_model ? " · 实际模型 " + esc(r.actual_model) : "") + " · " + fmtTime(r.created_at) + " · " + esc(r.source) + "</span>" +
-          "</summary><pre>" + esc(content) + "</pre></details>";
-      }).join("");
-
-      var emptyEl = document.getElementById("result-empty");
-      if (emptyEl) emptyEl.classList.toggle("hidden", rows && rows.length > 0);
-      box.classList.toggle("hidden", !rows || rows.length === 0);
+    // Refreshing supersedes an in-flight older-page request. Its cursor stays
+    // intact so the user can explicitly retry it after the refresh finishes.
+    var generation = ++resultsGeneration;
+    st.generation = generation;
+    st.morePromise = null;
+    var request = api("GET", "/api/results?limit=100" + (model ? "&model=" + encodeURIComponent(model) : "")).then(function (page) {
+      if (resultsState !== st || st.generation !== generation) return;
+      var rows = (page && page.items) || [];
+      if (!st.loaded || !hasPersistedRowOverlap(rows, st.items)) {
+        // Empty lists and a completely displaced first page have no safe
+        // history anchor. Reset instead of retaining a gapped cursor chain.
+        st.items = rows;
+        st.next = (page && page.next) || "";
+      } else {
+        // With a persisted overlap, retained pages still join this first page;
+        // keep their oldest cursor rather than rewinding or resurrecting next.
+        st.items = mergeUniqueRows(rows, st.items, true);
+      }
+      st.loaded = true;
+      renderResults();
       scheduleActivePoll();
     }).catch(function (e) {
+      if (resultsState !== st || st.generation !== generation) return;
       toast("获取检测记录失败：" + e.message);
     }).then(function () {
-      if (refreshBtn) refreshBtn.disabled = false;
+      if (st.refreshPromise === request) st.refreshPromise = null;
+      if (resultsState === st) syncResultsControls();
     });
+    st.refreshPromise = request;
+    syncResultsControls();
+    return request;
+  }
+
+  function loadMoreResults() {
+    var st = resultsState;
+    if (st.refreshPromise) return st.refreshPromise;
+    if (st.morePromise) return st.morePromise;
+    if (!st.next) return;
+    var generation = st.generation;
+    var cursor = st.next;
+    var model = st.model || "";
+    var url = "/api/results?limit=100&before=" + encodeURIComponent(cursor) + (model ? "&model=" + encodeURIComponent(model) : "");
+    var request = api("GET", url).then(function (page) {
+      if (resultsState !== st || st.generation !== generation) return;
+      st.items = mergeUniqueRows(st.items, (page && page.items) || [], false);
+      st.next = (page && page.next) || "";
+      renderResults();
+    }).catch(function (e) {
+      if (resultsState !== st || st.generation !== generation) return;
+      toast("加载更多检测记录失败：" + e.message);
+    }).then(function () {
+      if (st.morePromise === request) st.morePromise = null;
+      if (resultsState === st) syncResultsControls();
+    });
+    st.morePromise = request;
+    syncResultsControls();
+    return request;
+  }
+
+  function toggleLoadMore(rowId, next) {
+    var row = document.getElementById(rowId);
+    if (row) row.classList.toggle("hidden", !next);
   }
 
   var refreshResultsBtn = document.getElementById("refresh-results");
   if (refreshResultsBtn) refreshResultsBtn.addEventListener("click", loadResults);
   var resultModelSel = document.getElementById("result-model");
   if (resultModelSel) resultModelSel.addEventListener("change", loadResults);
+  var resultMoreBtn = document.getElementById("result-more");
+  if (resultMoreBtn) resultMoreBtn.addEventListener("click", loadMoreResults);
 
   // ---- Codex account monitoring ----
   var codexStateNames = {
@@ -1675,6 +1798,45 @@
 
   var codexVerdictNames = { passed: "通过", failed: "未通过", unavailable: "不可用", suspect: "待复测" };
   var codexHistorySeq = 0;
+  var codexHistoryState = {
+    accountID: "", items: [], next: "", loadPromise: null, morePromise: null
+  };
+
+  function syncCodexHistoryControls() {
+    var st = codexHistoryState;
+    var btn = document.getElementById("codex-history-more");
+    if (btn) {
+      btn.disabled = !!st.loadPromise || !!st.morePromise;
+      btn.setAttribute("aria-busy", st.morePromise ? "true" : "false");
+    }
+  }
+
+  function codexHistoryRowHtml(r, openIds) {
+    var verdict = codexVerdictNames[r.verdict] || r.verdict;
+    var meta = [r.model, r.prompt_id, fmtTime(r.created_at), r.tokens ? r.tokens + " tokens" : ""].filter(Boolean).join(" · ");
+    var openAttr = r.id && openIds.has(String(r.id)) ? " open" : "";
+    var answer = r.answer ? "<details class='codex-history-answer' data-result-id='" + esc(r.id || "") + "'" + openAttr + "><summary>查看回答</summary><pre>" + esc(r.answer) + "</pre></details>" : "";
+    return "<article class='codex-history-row'><div class='codex-history-head'><span class='status-badge status-" + esc(r.verdict) + "'><i></i>" + esc(verdict) + "</span><strong>" + esc(fmtTime(r.created_at)) + "</strong><span>" + esc(meta) + "</span></div>" +
+      (r.detail ? "<p class='codex-history-detail'>" + esc(r.detail) + "</p>" : "") + answer + "</article>";
+  }
+
+  function renderCodexHistory() {
+    var list = document.getElementById("codex-history-list");
+    if (!list) return;
+    var openIds = new Set();
+    list.querySelectorAll(".codex-history-answer[open][data-result-id]").forEach(function (el) {
+      openIds.add(el.dataset.resultId);
+    });
+    if (!codexHistoryState.items.length) {
+      list.innerHTML = "<p class='codex-history-empty'>暂无检测记录。启用监测或点击「立即检测」后会在这里留下结果。</p>";
+    } else {
+      list.innerHTML = codexHistoryState.items.map(function (r) {
+        return codexHistoryRowHtml(r, openIds);
+      }).join("");
+    }
+    toggleLoadMore("codex-history-more-row", codexHistoryState.next);
+    syncCodexHistoryControls();
+  }
 
   function openCodexHistory(accountID, user) {
     var dlg = document.getElementById("codex-history-dialog");
@@ -1682,28 +1844,58 @@
     var title = document.getElementById("codex-history-title");
     if (!dlg || !list) return;
     var seq = ++codexHistorySeq;
+    var st = {
+      accountID: accountID, items: [], next: "", loadPromise: null, morePromise: null
+    };
+    codexHistoryState = st;
     if (title) title.textContent = (user || accountID) + " · 检测记录";
     list.innerHTML = "<p class='codex-history-empty'>正在读取记录…</p>";
+    toggleLoadMore("codex-history-more-row", "");
     if (!dlg.open) dlg.showModal();
-    api("GET", "/api/codex/accounts/results?account_id=" + encodeURIComponent(accountID) + "&limit=20").then(function (results) {
-      if (seq !== codexHistorySeq) return;
-      var rows = results || [];
-      if (!rows.length) {
-        list.innerHTML = "<p class='codex-history-empty'>暂无检测记录。启用监测或点击「立即检测」后会在这里留下结果。</p>";
-        return;
-      }
-      list.innerHTML = rows.map(function (r) {
-        var verdict = codexVerdictNames[r.verdict] || r.verdict;
-        var meta = [r.model, r.prompt_id, fmtTime(r.created_at), r.tokens ? r.tokens + " tokens" : ""].filter(Boolean).join(" · ");
-        var answer = r.answer ? "<details class='codex-history-answer'><summary>查看回答</summary><pre>" + esc(r.answer) + "</pre></details>" : "";
-        return "<article class='codex-history-row'><div class='codex-history-head'><span class='status-badge status-" + esc(r.verdict) + "'><i></i>" + esc(verdict) + "</span><strong>" + esc(fmtTime(r.created_at)) + "</strong><span>" + esc(meta) + "</span></div>" +
-          (r.detail ? "<p class='codex-history-detail'>" + esc(r.detail) + "</p>" : "") + answer + "</article>";
-      }).join("");
+    var request = api("GET", "/api/codex/accounts/results?account_id=" + encodeURIComponent(accountID) + "&limit=20").then(function (page) {
+      if (seq !== codexHistorySeq || codexHistoryState !== st) return;
+      st.items = (page && page.items) || [];
+      st.next = (page && page.next) || "";
+      renderCodexHistory();
     }).catch(function (err) {
-      if (seq !== codexHistorySeq) return;
+      if (seq !== codexHistorySeq || codexHistoryState !== st) return;
       list.innerHTML = "<p class='codex-history-empty is-error'>读取失败：" + esc(err.message) + "</p>";
+    }).then(function () {
+      if (st.loadPromise === request) st.loadPromise = null;
+      if (seq === codexHistorySeq && codexHistoryState === st) syncCodexHistoryControls();
     });
+    st.loadPromise = request;
+    syncCodexHistoryControls();
+    return request;
   }
+
+  function loadMoreCodexHistory() {
+    var st = codexHistoryState;
+    if (st.morePromise) return st.morePromise;
+    if (st.loadPromise || !st.next) return;
+    var seq = codexHistorySeq;
+    var accountID = st.accountID;
+    var cursor = st.next;
+    var url = "/api/codex/accounts/results?account_id=" + encodeURIComponent(accountID) + "&limit=20&before=" + encodeURIComponent(cursor);
+    var request = api("GET", url).then(function (page) {
+      if (seq !== codexHistorySeq || codexHistoryState !== st) return;
+      st.items = mergeUniqueRows(st.items, (page && page.items) || [], false);
+      st.next = (page && page.next) || "";
+      renderCodexHistory();
+    }).catch(function (err) {
+      if (seq !== codexHistorySeq || codexHistoryState !== st) return;
+      toast("加载更多检测记录失败：" + err.message);
+    }).then(function () {
+      if (st.morePromise === request) st.morePromise = null;
+      if (seq === codexHistorySeq && codexHistoryState === st) syncCodexHistoryControls();
+    });
+    st.morePromise = request;
+    syncCodexHistoryControls();
+    return request;
+  }
+
+  var codexHistoryMoreBtn = document.getElementById("codex-history-more");
+  if (codexHistoryMoreBtn) codexHistoryMoreBtn.addEventListener("click", loadMoreCodexHistory);
 
   function runCodexAction(action, accountID, model, enabled) {
     setCodexMessage("正在保存…", "");
@@ -1767,12 +1959,17 @@
     if (dlg) dlg.close();
   });
   var codexHistoryDialog = document.getElementById("codex-history-dialog");
-  if (codexHistoryDialog) codexHistoryDialog.addEventListener("click", function (ev) {
-    if (ev.target === codexHistoryDialog) {
+  if (codexHistoryDialog) {
+    codexHistoryDialog.addEventListener("cancel", function () {
       codexHistorySeq++;
-      codexHistoryDialog.close();
-    }
-  });
+    });
+    codexHistoryDialog.addEventListener("click", function (ev) {
+      if (ev.target === codexHistoryDialog) {
+        codexHistorySeq++;
+        codexHistoryDialog.close();
+      }
+    });
+  }
 
   // ---- supplier protection ----
   var supplierProtocolNames = {
@@ -2106,24 +2303,86 @@
     if (emptyEl) emptyEl.classList.toggle("hidden", rows.length > 0);
   }
 
-  var supplierLogPromise = null;
+  var supplierLogGeneration = 0;
+  var supplierLogState = {
+    items: [], next: "", loaded: false, generation: 0,
+    refreshPromise: null, morePromise: null
+  };
+
+  function syncSupplierLogControls() {
+    var st = supplierLogState;
+    var refreshBtn = document.getElementById("supplier-log-refresh");
+    var moreBtn = document.getElementById("supplier-log-more");
+    if (refreshBtn) {
+      refreshBtn.disabled = !!st.refreshPromise;
+      refreshBtn.setAttribute("aria-busy", st.refreshPromise ? "true" : "false");
+    }
+    if (moreBtn) {
+      moreBtn.disabled = !!st.refreshPromise || !!st.morePromise;
+      moreBtn.setAttribute("aria-busy", st.morePromise ? "true" : "false");
+    }
+  }
+
   function loadSupplierLog() {
-    if (supplierLogPromise) return supplierLogPromise;
-    var btn = document.getElementById("supplier-log-refresh");
-    if (btn) btn.disabled = true;
-    supplierLogPromise = api("GET", "/api/supplier-events?limit=200").then(function (rows) {
-      renderSupplierLog(rows);
+    var st = supplierLogState;
+    if (st.refreshPromise) return st.refreshPromise;
+    var generation = ++supplierLogGeneration;
+    st.generation = generation;
+    st.morePromise = null;
+    var request = api("GET", "/api/supplier-events?limit=100").then(function (page) {
+      if (supplierLogState !== st || st.generation !== generation) return;
+      var rows = (page && page.items) || [];
+      if (!st.loaded || !hasPersistedRowOverlap(rows, st.items)) {
+        st.items = rows;
+        st.next = (page && page.next) || "";
+      } else {
+        st.items = mergeUniqueRows(rows, st.items, false);
+      }
+      st.loaded = true;
+      renderSupplierLog(st.items);
+      toggleLoadMore("supplier-log-more-row", st.next);
     }).catch(function (err) {
+      if (supplierLogState !== st || st.generation !== generation) return;
       toast("获取保护日志失败：" + err.message);
     }).then(function () {
-      supplierLogPromise = null;
-      if (btn) btn.disabled = false;
+      if (st.refreshPromise === request) st.refreshPromise = null;
+      if (supplierLogState === st) syncSupplierLogControls();
     });
-    return supplierLogPromise;
+    st.refreshPromise = request;
+    syncSupplierLogControls();
+    return request;
+  }
+
+  function loadMoreSupplierLog() {
+    var st = supplierLogState;
+    if (st.refreshPromise) return st.refreshPromise;
+    if (st.morePromise) return st.morePromise;
+    if (!st.next) return;
+    var generation = st.generation;
+    var cursor = st.next;
+    var url = "/api/supplier-events?limit=100&before=" + encodeURIComponent(cursor);
+    var request = api("GET", url).then(function (page) {
+      if (supplierLogState !== st || st.generation !== generation) return;
+      st.items = mergeUniqueRows(st.items, (page && page.items) || [], false);
+      st.next = (page && page.next) || "";
+      renderSupplierLog(st.items);
+      toggleLoadMore("supplier-log-more-row", st.next);
+    }).catch(function (err) {
+      if (supplierLogState !== st || st.generation !== generation) return;
+      toast("加载更多保护日志失败：" + err.message);
+    }).then(function () {
+      if (st.morePromise === request) st.morePromise = null;
+      if (supplierLogState === st) syncSupplierLogControls();
+    });
+    st.morePromise = request;
+    syncSupplierLogControls();
+    return request;
   }
 
   var supplierLogRefreshBtn = document.getElementById("supplier-log-refresh");
   if (supplierLogRefreshBtn) supplierLogRefreshBtn.addEventListener("click", loadSupplierLog);
+  var supplierLogMoreBtn = document.getElementById("supplier-log-more");
+  if (supplierLogMoreBtn) supplierLogMoreBtn.addEventListener("click", loadMoreSupplierLog);
 
   // ---- settings & real verification ----
   function markConfigDirty() {

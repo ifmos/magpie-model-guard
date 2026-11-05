@@ -1280,56 +1280,70 @@ func (s *Service) Snapshot() (map[string]any, error) {
 	}, nil
 }
 
-// Results lists active in-flight probes followed by persisted probe results,
-// optionally filtered by model and prompt.
-func (s *Service) Results(model, promptID string, limit int) ([]*Result, error) {
-	if limit <= 0 || limit > 500 {
-		limit = 100
-	}
-	s.mu.Lock()
-	active := make([]*Result, 0, len(s.running))
-	for _, rp := range s.running {
-		if rp == nil || !rp.active {
-			continue
+// Results lists one page of probe results: active in-flight probes (first page
+// only) followed by persisted results, optionally filtered by model and prompt,
+// resuming after the before cursor. It returns the cursor for the next page, or
+// "" when the list has no more rows.
+func (s *Service) Results(model, promptID string, limit int, before string) ([]*Result, string, error) {
+	limit = pageLimit(limit, 100, 500)
+	var active []*Result
+	if before == "" {
+		s.mu.Lock()
+		for _, rp := range s.running {
+			if rp == nil || !rp.active {
+				continue
+			}
+			if model != "" && rp.model != model {
+				continue
+			}
+			if promptID != "" && rp.promptID != promptID {
+				continue
+			}
+			active = append(active, &Result{
+				ID:        rp.id,
+				Model:     rp.model,
+				PromptID:  rp.promptID,
+				Answer:    "",
+				Verdict:   StateChecking,
+				Detail:    rp.detail,
+				Tokens:    0,
+				CreatedAt: rp.startedAt,
+				Source:    rp.source,
+			})
 		}
-		if model != "" && rp.model != model {
-			continue
-		}
-		if promptID != "" && rp.promptID != promptID {
-			continue
-		}
-		active = append(active, &Result{
-			ID:        rp.id,
-			Model:     rp.model,
-			PromptID:  rp.promptID,
-			Answer:    "",
-			Verdict:   StateChecking,
-			Detail:    rp.detail,
-			Tokens:    0,
-			CreatedAt: rp.startedAt,
-			Source:    rp.source,
+		s.mu.Unlock()
+
+		sort.Slice(active, func(i, j int) bool {
+			if !active[i].CreatedAt.Equal(active[j].CreatedAt) {
+				return active[i].CreatedAt.After(active[j].CreatedAt)
+			}
+			return active[i].Model < active[j].Model
 		})
-	}
-	s.mu.Unlock()
-
-	sort.Slice(active, func(i, j int) bool {
-		if !active[i].CreatedAt.Equal(active[j].CreatedAt) {
-			return active[i].CreatedAt.After(active[j].CreatedAt)
+		if len(active) >= limit {
+			stored, _, err := s.store.Results(model, promptID, 1, "")
+			if err != nil {
+				return nil, "", err
+			}
+			next := ""
+			if len(stored) > 0 {
+				next = "history"
+			}
+			return active[:limit], next, nil
 		}
-		return active[i].Model < active[j].Model
-	})
-	if len(active) >= limit {
-		return active[:limit], nil
+	}
+	// A page filled by in-flight probes has not consumed any stored rows.
+	if before == "history" {
+		before = ""
 	}
 
-	stored, err := s.store.Results(model, promptID, limit-len(active))
+	stored, next, err := s.store.Results(model, promptID, limit-len(active), before)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	out := make([]*Result, 0, len(active)+len(stored))
 	out = append(out, active...)
 	out = append(out, stored...)
-	return out, nil
+	return out, next, nil
 }
 
 // targetIntervalMin calculates the scheduled interval in minutes.

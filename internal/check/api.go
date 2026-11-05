@@ -2,6 +2,7 @@ package check
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -56,13 +57,21 @@ func registerAPI(mux *http.ServeMux, s *Service, access *Access, console *Consol
 
 // apiSupplierEvents returns the recent supplier protection log.
 func (s *Service) apiSupplierEvents(w http.ResponseWriter, r *http.Request) {
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	events, err := s.store.SupplierEvents(limit)
+	q := r.URL.Query()
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	events, next, err := s.store.SupplierEvents(limit, q.Get("before"))
+	if errors.Is(err, errBadCursor) {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err != nil {
 		errJSON(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, events)
+	if events == nil {
+		events = []*SupplierEvent{}
+	}
+	writeJSON(w, pageResponse[*SupplierEvent]{Items: events, Next: next})
 }
 
 func (s *Service) apiState(w http.ResponseWriter, r *http.Request) {
@@ -206,12 +215,19 @@ func (s *Service) apiProbe(w http.ResponseWriter, r *http.Request) {
 func (s *Service) apiResults(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
-	results, err := s.Results(q.Get("model"), q.Get("prompt"), limit)
+	results, next, err := s.Results(q.Get("model"), q.Get("prompt"), limit, q.Get("before"))
+	if errors.Is(err, errBadCursor) {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err != nil {
 		errJSON(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, results)
+	if results == nil {
+		results = []*Result{}
+	}
+	writeJSON(w, pageResponse[*Result]{Items: results, Next: next})
 }
 
 func (s *Service) apiPrompts(w http.ResponseWriter, r *http.Request) {

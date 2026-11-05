@@ -2,6 +2,7 @@ package check
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -97,7 +98,11 @@ func (s *Service) apiCodexResults(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	results, err := s.store.CodexAccountResults(accountID, limit)
+	results, next, err := s.store.CodexAccountResults(accountID, limit, r.URL.Query().Get("before"))
+	if errors.Is(err, errBadCursor) {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -105,5 +110,5 @@ func (s *Service) apiCodexResults(w http.ResponseWriter, r *http.Request) {
 	if results == nil {
 		results = []*CodexAccountResult{}
 	}
-	writeJSON(w, results)
+	writeJSON(w, pageResponse[*CodexAccountResult]{Items: results, Next: next})
 }

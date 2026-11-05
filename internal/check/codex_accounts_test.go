@@ -653,7 +653,7 @@ func TestCodexAccountResultHistory(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	rows, err := store.CodexAccountResults("aaaaaaaaaaaaaaaa", 1)
+	rows, _, err := store.CodexAccountResults("aaaaaaaaaaaaaaaa", 1, "")
 	if err != nil {
 		t.Fatal(err)
 	}
