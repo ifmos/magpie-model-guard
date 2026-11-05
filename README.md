@@ -2,7 +2,7 @@
 
 Magpie 插件：**模型级与账号级的降智检测**、业务回复模型判断与供应商侧保护。探针经 Magpie 网关的 Chat Completions 接口发出，不绑定供应商或账号体系，任意 `provider/model` 可用；检测不通过或业务回复命中规则时，通过请求门禁、路由组同步和供应商侧接管限制后续请求。
 
-当前版本 `0.9.0`，遵循 SemVer；逐版本变更见 [GitHub Releases](https://github.com/ifmos/magpie-model-guard/releases)。
+当前版本 `0.10.0`，遵循 SemVer；逐版本变更见 [GitHub Releases](https://github.com/ifmos/magpie-model-guard/releases)。
 
 ## 功能总览
 
