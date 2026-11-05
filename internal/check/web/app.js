@@ -18,8 +18,11 @@
   var supplierReloadQueued = false;
   var supplierLoadSeq = 0;
   var supplierPending = Object.create(null);
+  var codexData = null;
+  var codexLoadPromise = null;
+  var codexLoadSeq = 0;
 
-  var sectionName = { targets: "监测目标", prompts: "检测题库", results: "检测记录", supplierlog: "保护日志", settings: "连接设置" };
+  var sectionName = { targets: "监测目标", codex: "账号监测", prompts: "检测题库", results: "检测记录", supplierlog: "保护日志", settings: "连接设置" };
   var stateName = {
     unknown: "未检测", checking: "检测中", passed: "通过",
     failed: "已禁用(降智)", unavailable: "检测不可用", review: "人工暂停",
@@ -341,6 +344,7 @@
       if (currentSection) currentSection.textContent = sectionName[b.dataset.tab] || b.dataset.tab;
       if (b.dataset.tab === "results") loadResults();
       if (b.dataset.tab === "targets") loadState();
+      if (b.dataset.tab === "codex") loadCodexAccounts();
       if (b.dataset.tab === "prompts") renderPrompts();
       if (b.dataset.tab === "supplierlog") loadSupplierLog();
       if (b.dataset.tab === "settings") loadSuppliers();
@@ -362,6 +366,10 @@
       renderSettings();
       renderModelFilter();
       updateOverview();
+      var ca = snap.codex_accounts || {};
+      var codexCount = document.getElementById("nav-codex-count");
+      if (codexCount) codexCount.textContent = String(ca.monitored || 0);
+      if (isPageActive("codex")) loadCodexAccounts();
       if (isPageActive("results")) {
         loadResults();
       }
@@ -1375,6 +1383,250 @@
   var resultModelSel = document.getElementById("result-model");
   if (resultModelSel) resultModelSel.addEventListener("change", loadResults);
 
+  // ---- Codex account monitoring ----
+  var codexStateNames = {
+    unknown: "未检测", checking: "检测中", passed: "通过",
+    suspect: "待复测", isolated: "已隔离", unavailable: "检测不可用"
+  };
+
+  function codexStateClass(state) {
+    return "codex-state" + (state && codexStateNames[state] ? " is-" + state : "");
+  }
+
+  function setCodexMessage(text, kind) {
+    var el = document.getElementById("codex-msg");
+    if (!el) return;
+    el.textContent = text || "";
+    el.className = "form-message" + (kind === "error" ? " is-error" : kind === "success" ? " is-success" : kind === "warning" ? " is-warning" : "");
+  }
+
+  function codexModelOptions() {
+    var list = document.getElementById("codex-model-list");
+    if (!list) return;
+    var seen = Object.create(null);
+    list.innerHTML = (state.models || []).filter(function (m) {
+      var id = String(m && m.id || "");
+      if (!/^codex\//.test(id) || seen[id]) return false;
+      seen[id] = true;
+      return true;
+    }).map(function (m) {
+      return "<option value='" + esc(m.id) + "'></option>";
+    }).join("");
+  }
+
+  function loadCodexAccounts(force) {
+    if (codexLoadPromise) return codexLoadPromise;
+    var seq = ++codexLoadSeq;
+    codexLoadPromise = api("GET", "/api/codex/accounts").then(function (data) {
+      if (seq !== codexLoadSeq) return;
+      codexData = data || {};
+      renderCodexAccounts(force);
+    }).catch(function (err) {
+      if (seq !== codexLoadSeq) return;
+      codexData = { configured: false, accounts: [], error: err.message || "无法读取 Codex 账号" };
+      renderCodexAccounts(true);
+      setCodexMessage("读取 Codex 账号失败：" + codexData.error, "error");
+    }).then(function () {
+      codexLoadPromise = null;
+    });
+    return codexLoadPromise;
+  }
+
+  function renderCodexAccounts(force) {
+    var listEl = document.getElementById("codex-account-list");
+    if (!listEl) return;
+    if (!force && listEl.contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;
+    var data = codexData || {};
+    var accounts = data.accounts || [];
+    var monitored = accounts.filter(function (a) { return a.target && a.target.enabled; }).length;
+    var isolated = accounts.filter(function (a) { return a.target && a.target.isolated && a.paused; }).length;
+    var isolatedPending = accounts.filter(function (a) { return a.target && a.target.isolated && !a.paused; }).length;
+    var totalEl = document.getElementById("codex-stat-total");
+    if (totalEl) totalEl.textContent = String(accounts.filter(function (a) { return !a.missing; }).length);
+    var monEl = document.getElementById("codex-stat-monitored");
+    if (monEl) monEl.textContent = String(monitored);
+    var isoEl = document.getElementById("codex-stat-isolated");
+    if (isoEl) isoEl.textContent = String(isolated);
+    var nav = document.getElementById("nav-codex-count");
+    if (nav) nav.textContent = String(monitored);
+    var statusEl = document.getElementById("codex-status");
+    if (statusEl) {
+      if (data.error) {
+        statusEl.textContent = "账号保护暂不可用：" + data.error;
+      } else {
+        var text = "已停用 " + isolated + " 个账号";
+        if (isolatedPending) text += " · " + isolatedPending + " 个隔离未生效";
+        text += " · 复测时短暂启用，通过后恢复";
+        if (data.last_error) text += " · 最近同步失败：" + data.last_error;
+        statusEl.textContent = text;
+      }
+    }
+    listEl.textContent = "";
+    var emptyEl = document.getElementById("codex-empty");
+    if (emptyEl) emptyEl.classList.toggle("hidden", accounts.length > 0 || !!data.error);
+    if (!accounts.length) return;
+    accounts.forEach(function (a) {
+      var t = a.target || null;
+      var state = t ? (t.state || "unknown") : "unknown";
+      if (a.missing) state = "isolated";
+      var row = document.createElement("div");
+      row.className = "codex-row";
+      row.setAttribute("data-codex-id", a.id || "");
+      var main = document.createElement("div");
+      main.className = "codex-main";
+      var identity = document.createElement("div");
+      identity.className = "codex-identity";
+      var user = document.createElement("span");
+      user.className = "codex-user";
+      user.textContent = a.user || a.id;
+      identity.appendChild(user);
+      var badge = document.createElement("span");
+      badge.className = codexStateClass(state);
+      badge.textContent = a.missing ? "账号已消失" : (codexStateNames[state] || state);
+      identity.appendChild(badge);
+      if (a.plan) {
+        var plan = document.createElement("span");
+        plan.className = "supplier-badge is-off";
+        plan.textContent = a.plan;
+        identity.appendChild(plan);
+      }
+      var idEl = document.createElement("span");
+      idEl.className = "codex-id";
+      idEl.textContent = a.id || "";
+      identity.appendChild(idEl);
+      main.appendChild(identity);
+      var meta = document.createElement("div");
+      meta.className = "codex-meta";
+      var bits = [];
+      if (t) {
+        bits.push("检测模型 " + (t.model || "未设置"));
+        if (t.reason) bits.push(t.reason);
+        if (t.checked_at) bits.push("上次 " + fmtTime(t.checked_at));
+        if (t.next_check_at) bits.push("下次 " + fmtTime(t.next_check_at));
+        if (t.fail_streak) bits.push("连续失败 " + t.fail_streak + " 次");
+      } else {
+        bits.push("设置原生 codex/ 模型后启用账号监测");
+      }
+      meta.textContent = bits.join(" · ");
+      main.appendChild(meta);
+      if (!a.missing) {
+        var modelLine = document.createElement("div");
+        modelLine.className = "codex-model-line";
+        var input = document.createElement("input");
+        input.className = "codex-model-input";
+        input.type = "text";
+        input.setAttribute("list", "codex-model-list");
+        input.placeholder = "codex/gpt-5.4";
+        input.value = t ? (t.model || "") : "";
+        input.setAttribute("aria-label", (a.user || a.id) + " 的检测模型");
+        modelLine.appendChild(input);
+        main.appendChild(modelLine);
+      }
+      var actions = document.createElement("div");
+      actions.className = "codex-actions";
+      if (!a.missing) {
+        var save = document.createElement("button");
+        save.type = "button";
+        save.className = "secondary-button-sm";
+        save.setAttribute("data-codex-action", t && t.enabled ? "save" : "enable");
+        save.textContent = t && t.enabled ? "保存模型" : "启用监测";
+        actions.appendChild(save);
+      }
+      if (t && t.enabled && !a.missing) {
+        var probe = document.createElement("button");
+        probe.type = "button";
+        probe.className = "secondary-button-sm";
+        probe.setAttribute("data-codex-action", "probe");
+        probe.textContent = "立即检测";
+        actions.appendChild(probe);
+        if (t.isolated) {
+          var recover = document.createElement("button");
+          recover.type = "button";
+          recover.className = "secondary-button-sm";
+          recover.setAttribute("data-codex-action", "recover");
+          recover.textContent = "解除隔离";
+          actions.appendChild(recover);
+        } else {
+          var off = document.createElement("button");
+          off.type = "button";
+          off.className = "secondary-button-sm";
+          off.setAttribute("data-codex-action", "disable");
+          off.textContent = "停用监测";
+          actions.appendChild(off);
+        }
+      } else if (t && !t.isolated) {
+        var del = document.createElement("button");
+        del.type = "button";
+        del.className = "secondary-button-sm";
+        del.setAttribute("data-codex-action", "delete");
+        del.textContent = "删除监测";
+        actions.appendChild(del);
+      } else if (t && t.isolated) {
+        var missingRecover = document.createElement("button");
+        missingRecover.type = "button";
+        missingRecover.className = "secondary-button-sm";
+        missingRecover.setAttribute("data-codex-action", "recover");
+        missingRecover.textContent = "解除隔离";
+        actions.appendChild(missingRecover);
+      }
+      main.appendChild(actions);
+      row.appendChild(main);
+      listEl.appendChild(row);
+    });
+  }
+
+  function runCodexAction(action, accountID, model, enabled) {
+    setCodexMessage("正在保存…", "");
+    var body;
+    var method = "POST";
+    var path = "/api/codex/accounts/target";
+    if (action === "save" || action === "enable" || action === "disable") {
+      body = { account_id: accountID, model: model, enabled: !!enabled };
+    } else if (action === "delete") {
+      path = "/api/codex/accounts/delete";
+      body = { account_id: accountID };
+    } else {
+      path = "/api/codex/accounts/action";
+      body = { account_id: accountID, action: action };
+    }
+    return api(method, path, body).then(function (data) {
+      codexData = data || {};
+      renderCodexAccounts(true);
+      setCodexMessage(action === "probe" ? "检测已启动，稍后刷新查看结果。" : "已保存。", "success");
+      loadState();
+    }).catch(function (err) {
+      setCodexMessage("操作失败：" + err.message, "error");
+      toast("账号操作失败：" + err.message);
+    });
+  }
+
+  var codexList = document.getElementById("codex-account-list");
+  if (codexList) {
+    codexList.addEventListener("click", function (ev) {
+      var btn = ev.target.closest("[data-codex-action]");
+      if (!btn) return;
+      var row = btn.closest("[data-codex-id]");
+      if (!row) return;
+      var accountID = row.getAttribute("data-codex-id");
+      var input = row.querySelector(".codex-model-input");
+      var model = input ? input.value.trim() : "";
+      var action = btn.getAttribute("data-codex-action");
+      if ((action === "save" || action === "enable") && !model) {
+        setCodexMessage("请先填写检测模型，例如 codex/gpt-5.4", "error");
+        return;
+      }
+      if (action === "recover" && !window.confirm("解除隔离会立即在 Magpie 中启用该账号。确认继续？")) return;
+      if (action === "disable" && !window.confirm("停用监测后不再自动检测该账号，当前隔离状态不会解除。确认停用？")) return;
+      if (action === "delete" && !window.confirm("删除该账号的监测目标？已隔离账号必须先解除隔离。确认删除？")) return;
+      btn.disabled = true;
+      var done = action === "disable" ? runCodexAction(action, accountID, model, false)
+        : runCodexAction(action, accountID, model, true);
+      Promise.resolve(done).then(function () { btn.disabled = false; });
+    });
+  }
+  var codexRefreshBtn = document.getElementById("codex-refresh");
+  if (codexRefreshBtn) codexRefreshBtn.addEventListener("click", function () { loadCodexAccounts(true); });
+
   // ---- supplier protection ----
   var supplierProtocolNames = {
     chat: "Chat",
@@ -1932,6 +2184,7 @@
         api("GET", "/api/models").then(function (models) {
           state.models = models || [];
           renderModelPicker();
+          codexModelOptions();
         }).catch(function () {});
       });
       setInterval(loadState, 15000);
@@ -1947,6 +2200,7 @@
     api("GET", "/api/models").then(function (models) {
       state.models = models || [];
       renderModelPicker();
+      codexModelOptions();
     }).catch(function () {
       var statusEl = document.getElementById("model-picker-status");
       if (statusEl) statusEl.textContent = "内部列表未加载，请点击刷新";

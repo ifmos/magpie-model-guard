@@ -63,6 +63,8 @@ type Service struct {
 	routing   GroupRoutingStatus
 	dataDir   string
 	suppliers *supplierController
+	codex     *codexAccountController
+	codexBusy bool
 
 	// Response-model judgment.
 	responseHits map[string]time.Time // key -> last action
@@ -133,7 +135,11 @@ func (s *Service) Close() {
 func (s *Service) Health() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return strings.TrimSpace(strings.Join([]string{s.health, s.routing.Error}, " "))
+	parts := []string{s.health, s.routing.Error}
+	if s.codex != nil {
+		parts = append(parts, s.codex.errorText())
+	}
+	return strings.TrimSpace(strings.Join(parts, " "))
 }
 
 // loop is the scheduler tick: every 10s it launches due checks.
@@ -147,6 +153,7 @@ func (s *Service) loop() {
 			return
 		case <-t.C:
 			s.schedule()
+			s.scheduleCodexAccounts()
 		}
 	}
 }
@@ -1243,13 +1250,33 @@ func (s *Service) Snapshot() (map[string]any, error) {
 	}
 	s.mu.Unlock()
 	sort.Strings(checking)
+	codexSummary := map[string]any{}
+	if s.codex != nil {
+		if ct, err := s.store.CodexAccountTargets(); err == nil {
+			monitored, isolated := 0, 0
+			for _, t := range ct {
+				if t.Enabled {
+					monitored++
+				}
+				if t.Isolated {
+					isolated++
+				}
+			}
+			codexSummary = map[string]any{
+				"monitored": monitored,
+				"isolated":  isolated,
+				"error":     s.codex.errorText(),
+			}
+		}
+	}
 	return map[string]any{
-		"config":   cfg,
-		"targets":  targets,
-		"prompts":  prompts,
-		"checking": checking,
-		"health":   s.Health(),
-		"routing":  routing,
+		"config":         cfg,
+		"targets":        targets,
+		"prompts":        prompts,
+		"checking":       checking,
+		"health":         s.Health(),
+		"routing":        routing,
+		"codex_accounts": codexSummary,
 	}, nil
 }
 

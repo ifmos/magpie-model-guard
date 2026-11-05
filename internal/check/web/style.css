@@ -278,3 +278,20 @@ html,body{overflow-x:clip}
 .model-tag{gap:5px;padding:2px 5px 2px 7px}
 .model-tag-del{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--muted);font-size:12px;line-height:1;cursor:pointer}
 .model-tag-del:hover{background:color-mix(in srgb,var(--bad) 12%,transparent);color:var(--bad)}
+.codex-row{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(280px,1fr);gap:14px;align-items:start;padding:14px;border:1px solid var(--border);border-radius:9px;background:var(--soft)}
+.codex-main{min-width:0}
+.codex-identity{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.codex-user{font-size:13px;font-weight:600;overflow-wrap:anywhere}
+.codex-id{font-size:10px;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.codex-meta{font-size:11px;color:var(--muted);line-height:1.6;overflow-wrap:anywhere}
+.codex-model-line{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.codex-model-line input{flex:1 1 220px;min-width:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.codex-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.codex-actions button{white-space:nowrap}
+.codex-state{display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:600;padding:3px 7px;border-radius:4px;border:1px solid var(--border);color:var(--muted);background:var(--surface)}
+.codex-state.is-passed{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 28%,transparent);background:var(--accent-soft)}
+.codex-state.is-isolated{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 30%,transparent);background:color-mix(in srgb,var(--bad) 10%,var(--surface))}
+.codex-state.is-suspect,.codex-state.is-unavailable{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 30%,transparent);background:color-mix(in srgb,var(--warn) 10%,var(--surface))}
+.codex-state.is-checking{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 30%,transparent);background:var(--accent-soft)}
+.codex-empty-row{font-size:12px;color:var(--muted);padding:10px 2px}
+@media(max-width:860px){.codex-row{grid-template-columns:minmax(0,1fr)}}

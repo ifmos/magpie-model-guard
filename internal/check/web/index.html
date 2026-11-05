@@ -17,6 +17,7 @@
     <div class="sidebar-label">工作区</div>
     <nav id="tabs" class="side-nav" aria-label="控制台导航">
       <button data-tab="targets" class="active"><span class="nav-icon">⌁</span><span>监测目标</span><span class="nav-count" id="nav-target-count">0</span></button>
+      <button data-tab="codex"><span class="nav-icon">◈</span><span>账号监测</span><span class="nav-count" id="nav-codex-count">0</span></button>
       <button data-tab="prompts"><span class="nav-icon">✦</span><span>检测题库</span></button>
       <button data-tab="results"><span class="nav-icon">↗</span><span>检测记录</span></button>
       <button data-tab="supplierlog"><span class="nav-icon">▤</span><span>保护日志</span></button>
@@ -24,7 +25,7 @@
     </nav>
     <div class="sidebar-footer">
       <div class="mini-status"><i id="sidebar-status-dot"></i><span id="sidebar-status">后台连接中</span></div>
-      <span class="version-label">MAGPIE PLUGIN · 0.7.4</span>
+      <span class="version-label">MAGPIE PLUGIN · 0.8.0</span>
     </div>
   </aside>
 
@@ -272,6 +273,35 @@
             </div>
           </form>
         </dialog>
+      </section>
+
+      <section id="page-codex" class="page">
+        <div class="page-intro">
+          <div><span class="eyebrow">CODEX ACCOUNTS</span><h1>Codex 账号监测</h1><p>为每个 Codex 账号单独指定检测模型。账号降智时，Guard 在 Magpie 供应商账户中停用它；复测时短暂启用，通过后保留启用，失败则再次停用。</p></div>
+          <button id="codex-refresh" class="secondary-button">↻ 刷新账号</button>
+        </div>
+        <p id="codex-status" class="routing-status" role="status">正在读取 Codex 账号…</p>
+        <div class="summary-grid" aria-label="Codex 账号摘要">
+          <div class="summary-card"><span class="summary-label">已登录账号</span><strong id="codex-stat-total">0</strong><small>来自本机 Magpie</small></div>
+          <div class="summary-card is-good"><span class="summary-label">监测中</span><strong id="codex-stat-monitored">0</strong><small>独立模型检测</small></div>
+          <div class="summary-card is-danger"><span class="summary-label">已隔离</span><strong id="codex-stat-isolated">0</strong><small>已在供应商中停用</small></div>
+        </div>
+        <section class="panel">
+          <div class="panel-heading"><div><span class="eyebrow">ACCOUNT MONITORING</span><h2>Codex 账号列表</h2></div><span class="panel-caption">停用只改 Magpie 账号状态，不改 Gateway Key</span></div>
+          <div class="policy-note-box">
+            <div class="note-title">⚠ 隔离方式与复测窗口</div>
+            <ul class="note-list">
+              <li>检测使用 Magpie 原生模型 ID，并通过 <code>X-Magpie-Account</code> 固定到指定账号，不会回退到其他账号。</li>
+              <li>连续两次检测失败后，Guard 在 Magpie 的 <code>logins.json</code> 中停用该账号（关闭 <code>on</code>，必要时暂停当前账号）。不读写 <code>caller-keys.json</code>。</li>
+              <li>到期复测会先把该账号短暂启用（通常数秒），再按 <code>X-Magpie-Account</code> 固定检测；失败立即再次停用，通过则保留启用并恢复备用账号。不可用或 HTTP 错误只重试，不判为降智。</li>
+              <li>至少要有一个其他 Codex 账号承接流量；最后一个可用账号无法停用。复测窗口内业务请求仍可能命中该账号。</li>
+            </ul>
+          </div>
+          <datalist id="codex-model-list"></datalist>
+          <div id="codex-account-list" class="supplier-list" aria-label="Codex 账号列表"></div>
+          <div class="empty-state" id="codex-empty"><div class="empty-icon">◈</div><strong>没有可识别的 Codex 账号</strong><span>请先在 Magpie 中登录 Codex 账号并刷新。</span></div>
+          <p id="codex-msg" class="form-message"></p>
+        </section>
       </section>
 
       <section id="page-prompts" class="page">

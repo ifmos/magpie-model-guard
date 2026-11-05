@@ -150,6 +150,16 @@ func Run(o Options) error {
 		svc.suppliers = newSupplierController(store, o.MagpieConfig, origin)
 		// Conflicts stay visible in the console; never overwrite external edits.
 		_ = svc.suppliers.reconcile(ownerCtx)
+		svc.mu.Lock()
+		svc.codex = newCodexAccountController(svc, store, o.MagpieConfig)
+		codex := svc.codex
+		svc.mu.Unlock()
+		_ = codex.recoverInterrupted()
+		// A previous crash may have left production keys isolated; resolve or
+		// report the conflict without blocking console startup.
+		if err := codex.syncAccountIsolation(ownerCtx); err != nil {
+			codex.setError(err)
+		}
 	}
 
 	var info StartupInfo

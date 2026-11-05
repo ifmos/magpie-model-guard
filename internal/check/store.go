@@ -97,6 +97,36 @@ CREATE TABLE IF NOT EXISTS supplier_events (
   created_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_supplier_events_created ON supplier_events(created_at DESC);
+CREATE TABLE IF NOT EXISTS codex_account_targets (
+  account_id      TEXT PRIMARY KEY,
+  user            TEXT NOT NULL DEFAULT '',
+  model           TEXT NOT NULL DEFAULT '',
+  enabled         INTEGER NOT NULL DEFAULT 0,
+  state           TEXT NOT NULL DEFAULT 'unknown',
+  reason          TEXT NOT NULL DEFAULT '',
+  checked_at      INTEGER NOT NULL DEFAULT 0,
+  next_check_at   INTEGER NOT NULL DEFAULT 0,
+  fail_streak     INTEGER NOT NULL DEFAULT 0,
+  isolated        INTEGER NOT NULL DEFAULT 0,
+  isolation_until INTEGER NOT NULL DEFAULT 0,
+  last_prompt_id  TEXT NOT NULL DEFAULT '',
+  last_answer     TEXT NOT NULL DEFAULT '',
+  last_tokens     INTEGER NOT NULL DEFAULT 0,
+  missing         INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS codex_account_results (
+  id         TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  user       TEXT NOT NULL DEFAULT '',
+  model      TEXT NOT NULL DEFAULT '',
+  prompt_id  TEXT NOT NULL DEFAULT '',
+  answer     TEXT NOT NULL DEFAULT '',
+  verdict    TEXT NOT NULL,
+  detail     TEXT NOT NULL DEFAULT '',
+  tokens     INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_codex_results_account ON codex_account_results(account_id, created_at DESC);
 `)
 	if err != nil {
 		return err

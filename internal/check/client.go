@@ -62,6 +62,16 @@ type ProbeAnswer struct {
 // Call sends one chat-completions probe. progress may be nil for a
 // non-streaming call.
 func Call(ctx context.Context, c ProbeConfig, model, prompt string, progress func(string)) (string, int, error) {
+	return sendProbe(ctx, c, model, prompt, progress, "")
+}
+
+// CallPinned sends one probe pinned to a Magpie subscription account. The
+// model must be the native model id; the caller owns the pin semantics.
+func CallPinned(ctx context.Context, c ProbeConfig, model, account, prompt string) (string, int, error) {
+	return sendProbe(ctx, c, model, prompt, nil, account)
+}
+
+func sendProbe(ctx context.Context, c ProbeConfig, model, prompt string, progress func(string), account string) (string, int, error) {
 	payload := map[string]any{
 		"model":      model,
 		"stream":     progress != nil,
@@ -81,6 +91,9 @@ func Call(ctx context.Context, c ProbeConfig, model, prompt string, progress fun
 	}
 	req.Header.Set("Authorization", "Bearer "+c.GatewayKey)
 	req.Header.Set("Content-Type", "application/json")
+	if account != "" {
+		req.Header.Set("X-Magpie-Account", probeAccountHeader(account))
+	}
 	if strings.HasPrefix(model, ProbeAliasPrefix) {
 		req.Header.Set("X-Magpie-Session", probeSession(model))
 	}
@@ -118,6 +131,18 @@ func Call(ctx context.Context, c ProbeConfig, model, prompt string, progress fun
 		return "", out.Usage.Total, errors.New("空回答")
 	}
 	return ch.Message.Content, out.Usage.Total, nil
+}
+
+// probeAccountHeader keeps the pin header ASCII. Magpie decodes a
+// percent-encoded name, so a non-ASCII account name survives net/http's
+// header validation and still names the same login.
+func probeAccountHeader(account string) string {
+	for i := 0; i < len(account); i++ {
+		if account[i] >= 0x80 {
+			return url.PathEscape(account)
+		}
+	}
+	return account
 }
 
 type chatResponse struct {
